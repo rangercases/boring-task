@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.spec
+
+# Corporate & Internal Data Files (Bảo mật: Không đẩy dữ liệu công ty lên GitHub)
+*.xlsx
+*.xls
+*.csv
+*.json
+!metadata.json
+
+# Logs & Temp
+*.log
+scratch/
+.system_generated/
