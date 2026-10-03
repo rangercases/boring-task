@@ -4,6 +4,7 @@ import re
 import datetime
 import threading
 import pickle
+import json
 import subprocess
 from copy import copy
 
@@ -18,9 +19,13 @@ ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 
 CACHE_FILE_NAME = ".overview_cache.pkl"
+STATE_FILE_NAME = ".app_state.json"
 
 def get_cache_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), CACHE_FILE_NAME)
+
+def get_state_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE_NAME)
 
 def parse_drop_paths(data_str):
     """Parse dropped file paths handling curly braces and spaces."""
@@ -72,20 +77,67 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.last_created_files = [] # list of created output files
         self.is_processing = False
 
-        # Auto-detect Overview in current directory
         curr_dir = os.path.abspath(os.path.dirname(__file__))
-        for f in os.listdir(curr_dir):
-            if f.lower().startswith("overview") and f.endswith(".xlsx") and not f.startswith("~$"):
-                self.overview_path = os.path.join(curr_dir, f)
-                break
+        saved_state = self.load_saved_state()
 
-        # Auto-detect initial versus files in current directory (skip already filled files)
-        for f in os.listdir(curr_dir):
-            if "versus" in f.lower() and f.endswith(".xlsx") and not f.endswith("_backup.xlsx") and not f.endswith("_filled.xlsx") and not f.startswith("~$"):
-                self.claim_files.append(os.path.join(curr_dir, f))
+        if saved_state is not None:
+            # Restore saved overview path if it still exists
+            saved_ov = saved_state.get("overview_path", "")
+            if saved_ov and os.path.exists(saved_ov):
+                self.overview_path = saved_ov
+            
+            # Restore saved claim files (keep only existing files)
+            saved_claims = saved_state.get("claim_files", [])
+            self.claim_files = [p for p in saved_claims if os.path.exists(p)]
+        else:
+            # First launch: Auto-detect Overview in current directory
+            for f in os.listdir(curr_dir):
+                if f.lower().startswith("overview") and f.endswith(".xlsx") and not f.startswith("~$"):
+                    self.overview_path = os.path.join(curr_dir, f)
+                    break
+
+            # First launch: Auto-detect initial versus files in current directory
+            for f in os.listdir(curr_dir):
+                if "versus" in f.lower() and f.endswith(".xlsx") and not f.endswith("_backup.xlsx") and not f.endswith("_filled.xlsx") and not f.startswith("~$"):
+                    self.claim_files.append(os.path.join(curr_dir, f))
+            
+            self.save_state()
+
+        # If overview not found in saved state, fallback to auto-detecting in current dir
+        if not self.overview_path:
+            for f in os.listdir(curr_dir):
+                if f.lower().startswith("overview") and f.endswith(".xlsx") and not f.startswith("~$"):
+                    self.overview_path = os.path.join(curr_dir, f)
+                    break
 
         self.setup_ui()
         self.setup_drag_and_drop()
+
+    def load_saved_state(self):
+        """Loads persistent session state if available."""
+        s_path = get_state_path()
+        if not os.path.exists(s_path):
+            return None
+        try:
+            with open(s_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data
+        except Exception as e:
+            print(f"Error loading state: {e}")
+            return None
+
+    def save_state(self):
+        """Saves current state to persistent storage."""
+        s_path = get_state_path()
+        try:
+            data = {
+                "overview_path": self.overview_path,
+                "claim_files": self.claim_files
+            }
+            with open(s_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error saving state: {e}")
 
     def setup_ui(self):
         # 1. Header Frame
@@ -418,6 +470,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def clear_overview(self):
         self.overview_path = ""
+        self.save_state()
         self.render_overview_display()
 
     def render_file_list(self):
@@ -506,6 +559,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def remove_claim_file(self, fpath):
         if fpath in self.claim_files:
             self.claim_files.remove(fpath)
+            self.save_state()
             self.render_file_list()
 
     def clear_all_claims(self):
@@ -513,6 +567,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             return
         if messagebox.askyesno("Xác nhận", "Bạn có chắc muốn xóa tất cả file khỏi danh sách không?"):
             self.claim_files.clear()
+            self.save_state()
             self.render_file_list()
 
     # ----------------------------------------------------
@@ -549,6 +604,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         for p in paths:
             if os.path.isfile(p) and p.endswith(".xlsx"):
                 self.overview_path = p
+                self.save_state()
                 self.render_overview_display()
                 return
 
@@ -570,6 +626,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 fname = os.path.basename(p).lower()
                 if "overview" in fname:
                     self.overview_path = p
+                    self.save_state()
                     self.render_overview_display()
                 else:
                     claims_to_add.append(p)
@@ -594,6 +651,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                             self.claim_files.append(fp)
                             added += 1
         if added > 0:
+            self.save_state()
             self.render_file_list()
 
     # ----------------------------------------------------
@@ -606,6 +664,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         )
         if f:
             self.overview_path = os.path.abspath(f)
+            self.save_state()
             self.render_overview_display()
 
     def browse_claim_files(self):
