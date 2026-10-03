@@ -6,6 +6,10 @@ import threading
 import pickle
 import json
 import subprocess
+import urllib.request
+import urllib.error
+import tempfile
+import time
 from copy import copy
 
 import customtkinter as ctk
@@ -18,8 +22,23 @@ from openpyxl.utils import get_column_letter
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 
+APP_VERSION = "v1.0.0"
+GITHUB_REPO = "rangercases/claim-helper"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
+
+def parse_version(v_str):
+    clean = re.sub(r'[^0-9.]', '', str(v_str))
+    parts = []
+    for p in clean.split('.'):
+        if p.isdigit():
+            parts.append(int(p))
+    return parts
+
+def is_newer_version(latest_tag, current_tag):
+    v_latest = parse_version(latest_tag)
+    v_curr = parse_version(current_tag)
+    return v_latest > v_curr
 
 def get_cache_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), CACHE_FILE_NAME)
@@ -113,6 +132,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.setup_ui()
         self.setup_drag_and_drop()
 
+        # Check for remote updates silently in background
+        threading.Thread(target=self.check_for_updates, daemon=True).start()
+
     def load_saved_state(self):
         """Loads persistent session state if available."""
         s_path = get_state_path()
@@ -139,18 +161,162 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         except Exception as e:
             print(f"Error saving state: {e}")
 
+    # ----------------------------------------------------
+    # GitHub Auto-Updater (Non-blocking & Seamless)
+    # ----------------------------------------------------
+    def check_for_updates(self):
+        """Silently checks GitHub Releases for new versions."""
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "ClaimHelper-App"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    latest_tag = data.get("tag_name", "")
+                    if latest_tag and is_newer_version(latest_tag, APP_VERSION):
+                        assets = data.get("assets", [])
+                        exe_url = None
+                        for a in assets:
+                            if a.get("name", "").lower().endswith(".exe"):
+                                exe_url = a.get("browser_download_url")
+                                break
+                        if exe_url:
+                            self.after(0, self.show_update_banner, latest_tag, exe_url)
+        except Exception:
+            # Offline or GitHub rate limit - keep user experience uninterrupted
+            pass
+
+    def show_update_banner(self, latest_tag, exe_url):
+        for child in self.update_banner_container.winfo_children():
+            child.destroy()
+
+        banner = ctk.CTkFrame(
+            self.update_banner_container,
+            fg_color="#EBF3FE",
+            corner_radius=10,
+            border_width=1,
+            border_color="#C7DEFF"
+        )
+        banner.pack(fill="x")
+
+        left = ctk.CTkFrame(banner, fg_color="transparent")
+        left.pack(side="left", padx=14, pady=10, fill="x", expand=True)
+
+        ctk.CTkLabel(
+            left,
+            text=f"🚀 Đã có phiên bản mới ({latest_tag})!",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color="#0071E3"
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            left,
+            text=f"Phiên bản hiện tại: {APP_VERSION}. Bấm cập nhật để nâng cấp tự động.",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            text_color="#515154"
+        ).pack(anchor="w", pady=(2, 0))
+
+        btn_box = ctk.CTkFrame(banner, fg_color="transparent")
+        btn_box.pack(side="right", padx=14, pady=10)
+
+        self.btn_update = ctk.CTkButton(
+            btn_box,
+            text="Cập Nhật Ngay",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#0071E3",
+            hover_color="#0077ED",
+            text_color="#FFFFFF",
+            corner_radius=8,
+            width=120,
+            height=30,
+            command=lambda: self.start_download_update(exe_url, latest_tag)
+        )
+        self.btn_update.pack(side="right")
+
+    def start_download_update(self, exe_url, latest_tag):
+        self.btn_update.configure(state="disabled", text="Đang tải 0%...")
+        threading.Thread(
+            target=self._download_and_install_update,
+            args=(exe_url, latest_tag),
+            daemon=True
+        ).start()
+
+    def _download_and_install_update(self, exe_url, latest_tag):
+        try:
+            temp_dir = tempfile.gettempdir()
+            target_exe_name = f"ClaimHelper_update_{int(time.time())}.exe"
+            temp_file = os.path.join(temp_dir, target_exe_name)
+
+            req = urllib.request.Request(exe_url, headers={"User-Agent": "ClaimHelper-App"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                total_size = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                chunk_size = 64 * 1024
+                with open(temp_file, "wb") as f:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            pct = int(downloaded / total_size * 100)
+                            self.after(0, self.btn_update.configure, {"text": f"Đang tải {pct}%..."})
+
+            self.after(0, self.btn_update.configure, {"text": "Đang khởi động..."})
+
+            # Determine destination path
+            is_frozen = getattr(sys, "frozen", False)
+            if is_frozen:
+                current_exe = os.path.abspath(sys.executable)
+            else:
+                current_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ClaimHelper.exe")
+
+            updater_bat = os.path.join(temp_dir, f"claim_update_{int(time.time())}.bat")
+            bat_script = f"""@echo off
+timeout /t 1 /nobreak > nul
+move /y "{temp_file}" "{current_exe}" > nul
+start "" "{current_exe}"
+del "%~f0"
+exit
+"""
+            with open(updater_bat, "w", encoding="utf-8") as bf:
+                bf.write(bat_script)
+
+            subprocess.Popen(["cmd.exe", "/c", updater_bat], creationflags=0x08000000)
+            self.after(100, self.destroy)
+        except Exception as e:
+            self.after(0, self.on_update_failed, str(e))
+
+    def on_update_failed(self, err):
+        if hasattr(self, 'btn_update'):
+            self.btn_update.configure(state="normal", text="Thử lại")
+        messagebox.showerror("Cập nhật thất bại", f"Không thể tải bản cập nhật: {err}")
+
     def setup_ui(self):
         # 1. Header Frame
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=32, pady=(25, 12))
+        header.pack(fill="x", padx=32, pady=(25, 6))
+
+        title_row = ctk.CTkFrame(header, fg_color="transparent")
+        title_row.pack(anchor="w")
 
         title_lbl = ctk.CTkLabel(
-            header,
+            title_row,
             text="Claim Helper",
             font=ctk.CTkFont(family="Segoe UI", size=26, weight="bold"),
             text_color="#1D1D1F"
         )
-        title_lbl.pack(anchor="w")
+        title_lbl.pack(side="left")
+
+        ctk.CTkLabel(
+            title_row,
+            text=f"  {APP_VERSION}  ",
+            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+            fg_color="#EBF3FE",
+            text_color="#0071E3",
+            corner_radius=6
+        ).pack(side="left", padx=(10, 0), pady=(6, 0))
 
         sub_lbl = ctk.CTkLabel(
             header,
@@ -159,6 +325,10 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             text_color="#86868B"
         )
         sub_lbl.pack(anchor="w", pady=(2, 0))
+
+        # Dynamic Update Banner Container (shows up if new version is found on GitHub)
+        self.update_banner_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.update_banner_container.pack(fill="x", padx=32, pady=(0, 6))
 
         # 2. Main Scrollable Container
         self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")

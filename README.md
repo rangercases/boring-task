@@ -23,26 +23,20 @@
 
 ## 🚀 Hướng Dẫn Sử Dụng
 
-### Cách 1: Khởi chạy trực tiếp (Không có cửa sổ đen CMD)
-- **Cách đơn giản nhất:** Click đúp trực tiếp vào file **`claim_helper.pyw`** hoặc file **`Mo_Claim_Helper.vbs`**.
-- Giao diện Apple Design sẽ mở lên lập tức mà **hoàn toàn không bật bất kỳ cửa sổ CMD đen nào**.
+### Cách 1: Sử dụng file `ClaimHelper.exe` duy nhất (Khuyên Dùng - Tự Động Cập Nhật)
+- **Dành cho mọi máy Windows (Không cần cài Python, không cần cài Git):**
+  - Chỉ cần mở trực tiếp file **`ClaimHelper.exe`**.
+  - **Tích hợp Auto-Updater:** Mỗi khi bạn phát hành bản mới trên GitHub Releases, ứng dụng trên máy người dùng sẽ tự động hiển thị thông báo và nâng cấp lên bản mới chỉ với 1 click!
 
-### Cách 2: Khởi chạy qua dòng lệnh Python
-```bash
-# Cài đặt thư viện phụ thuộc
-pip install -r requirements.txt
+### Cách 2: Khởi chạy bằng mã nguồn Python
+- Click đúp vào file **`claim_helper.pyw`** để mở app trực tiếp (không bật cửa sổ đen CMD).
+- Hoặc chạy qua dòng lệnh:
+  ```bash
+  pythonw claim_helper.pyw
+  ```
 
-# Khởi chạy ứng dụng (chế độ không console)
-pythonw claim_helper.pyw
-```
-
-### Cách 3: Đóng gói thành file `.exe` cho máy khác dùng độc lập (Không cần cài Python)
-1. Click đúp vào file **`build_exe.bat`**.
-2. Sau khi biên dịch xong, ứng dụng thực thi sẽ nằm tại:
-   ```
-   dist\ClaimHelper\ClaimHelper.exe
-   ```
-3. Bạn có thể nén cả thư mục `dist\ClaimHelper` thành file `.zip` và gửi cho bất kỳ đồng nghiệp nào mở lên dùng ngay (không cần cài Python).
+### Cách 3: Tự đóng gói lại file .exe khi sửa code
+- Click đúp vào file **`build_exe.bat`** để tự động biên dịch lại file `ClaimHelper.exe`.
 
 ---
 
