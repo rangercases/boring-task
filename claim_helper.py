@@ -98,7 +98,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.main_scroll.pack(fill="both", expand=True, padx=32, pady=(0, 15))
 
         # ========================================================
-        # CARD 1: Master Overview (Dedicated Drop, Cache & Clear)
+        # CARD 1: Master Overview (Dedicated Drop & Clear Target)
         # ========================================================
         self.card_ov = ctk.CTkFrame(
             self.main_scroll,
@@ -119,22 +119,12 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             text_color="#0071E3"
         ).pack(side="left")
 
-        self.ov_cache_badge = ctk.CTkLabel(
-            ov_top,
-            text="",
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-            fg_color="#EBF8F2",
-            text_color="#16A34A",
-            corner_radius=6
-        )
-        # Packed dynamically if cache exists
-
         ov_btn_box = ctk.CTkFrame(ov_top, fg_color="transparent")
         ov_btn_box.pack(side="right")
 
         self.btn_refresh_cache = ctk.CTkButton(
             ov_btn_box,
-            text="⚡ Đọc Lại Master",
+            text="Đọc Lại Master",
             font=ctk.CTkFont(family="Segoe UI", size=11),
             fg_color="#F2F2F7",
             text_color="#1D1D1F",
@@ -270,169 +260,60 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             corner_radius=2
         )
         self.prog_bar.set(0)
-        self.prog_bar.pack(fill="x", pady=(0, 10))
+        self.prog_bar.pack(fill="x", pady=(0, 12))
 
         # ========================================================
-        # CARD 3: Live Activity Console
+        # CARD 3: Apple-Style Live Activity & Results Card
         # ========================================================
-        card_log = ctk.CTkFrame(
+        self.card_results = ctk.CTkFrame(
             self.main_scroll,
-            fg_color="#1C1C1E",
-            corner_radius=14
+            fg_color="#FFFFFF",
+            corner_radius=14,
+            border_width=1,
+            border_color="#E5E5EA"
         )
-        card_log.pack(fill="both", expand=True, pady=(0, 6))
+        self.card_results.pack(fill="both", expand=True, pady=(0, 6))
 
-        log_head = ctk.CTkFrame(card_log, fg_color="transparent")
-        log_head.pack(fill="x", padx=16, pady=(10, 4))
+        results_head = ctk.CTkFrame(self.card_results, fg_color="transparent")
+        results_head.pack(fill="x", padx=18, pady=(14, 8))
 
         ctk.CTkLabel(
-            log_head,
-            text="NHẬT KÝ XỬ LÝ (LIVE ACTIVITY)",
-            font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
-            text_color="#8E8E93"
+            results_head,
+            text="⚡  TIẾN ĐỘ & KẾT QUẢ",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            text_color="#0071E3"
         ).pack(side="left")
 
-        self.btn_open_folder = ctk.CTkButton(
-            log_head,
-            text="📂 Mở Thư Mục Chứa File",
+        self.status_badge = ctk.CTkLabel(
+            results_head,
+            text="Sẵn sàng",
             font=ctk.CTkFont(family="Segoe UI", size=11),
-            fg_color="#2C2C2E",
-            text_color="#FFFFFF",
-            hover_color="#3A3A3C",
-            corner_radius=6,
-            height=24,
-            command=self.open_current_folder
+            text_color="#86868B"
         )
-        self.btn_open_folder.pack(side="right")
+        self.status_badge.pack(side="right")
 
-        self.log_text = ctk.CTkTextbox(
-            card_log,
-            fg_color="transparent",
-            text_color="#E5E5EA",
-            font=ctk.CTkFont(family="Consolas", size=11),
-            height=160
-        )
-        self.log_text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        # Container for concise result items
+        self.results_feed = ctk.CTkFrame(self.card_results, fg_color="#F9F9FB", corner_radius=10)
+        self.results_feed.pack(fill="both", expand=True, padx=16, pady=(0, 14))
 
-        self.log("Claim Helper sẵn sàng.")
-        self.check_initial_cache_status()
-
-    # ----------------------------------------------------
-    # Smart Cache Logic
-    # ----------------------------------------------------
-    def check_initial_cache_status(self):
-        c_path = get_cache_path()
-        if os.path.exists(c_path) and self.overview_path and os.path.exists(self.overview_path):
-            try:
-                with open(c_path, 'rb') as f:
-                    meta = pickle.load(f)
-                if (meta.get('file_path') == os.path.abspath(self.overview_path) and
-                    meta.get('file_size') == os.path.getsize(self.overview_path) and
-                    abs(meta.get('file_mtime', 0) - os.path.getmtime(self.overview_path)) < 2):
-                    self.log(f"⚡ Đã nhận diện Smart Cache của Master Overview (Thời gian lưu: {meta.get('cached_at', 'gần đây')}).")
-                    self.log("-> Lần chạy này sẽ nạp tức thì trong 0.1 giây mà không cần quét lại file 40MB!")
-                    return True
-            except Exception:
-                pass
-        return False
-
-    def load_master_with_cache(self, force_reload=False):
-        c_path = get_cache_path()
-        ov_abs = os.path.abspath(self.overview_path)
-        cur_size = os.path.getsize(ov_abs)
-        cur_mtime = os.path.getmtime(ov_abs)
-
-        if not force_reload and os.path.exists(c_path):
-            try:
-                with open(c_path, 'rb') as f:
-                    cache_obj = pickle.load(f)
-                if (cache_obj.get('file_path') == ov_abs and
-                    cache_obj.get('file_size') == cur_size and
-                    abs(cache_obj.get('file_mtime', 0) - cur_mtime) < 2):
-                    
-                    self.log(f"⚡ SỬ DỤNG SMART CACHE (0.1 giây): Không cần đọc lại file 40MB!")
-                    cs_records = cache_obj['cs_records']
-                    nh_records = cache_obj['nh_records']
-                    self.log(f"✓ Đã nạp thành công: {len(cs_records)} bản ghi Casa (CS) | {len(nh_records)} bản ghi Nhan Hoang (NH).")
-                    return cs_records, nh_records
-            except Exception as e:
-                self.log(f"Cache không tương thích hoặc bị lỗi ({e}), sẽ nạp lại từ file gốc...")
-
-        # Full Load from Excel
-        self.log(f"Đang đọc dữ liệu Master Overview từ file Excel ({format_file_size(cur_size)} - vui lòng đợi vài giây)...")
-        wb_o = openpyxl.load_workbook(self.overview_path, read_only=True, data_only=True)
-        s_o = wb_o['Overview'] if 'Overview' in wb_o.sheetnames else wb_o.active
-        headers_o = next(s_o.iter_rows(max_row=1, values_only=True))
-        col_idx = {h: i for i, h in enumerate(headers_o)}
-
-        cs_records = []
-        nh_records = []
-
-        for r in s_o.iter_rows(min_row=2, values_only=True):
-            man = str(r[col_idx.get('Manufacturer', 0)] or '').strip().upper()
-            sup = str(r[col_idx.get('Supplier', 0)] or '').strip().upper()
-            cost = r[col_idx.get('Purchase cost', 0)]
-            note_p = str(r[col_idx.get('Item PO note', 0)] or '').lower()
-            note_s = str(r[col_idx.get('Note (sales)', 0)] or '').lower()
-
-            # Filter out partial boxes
-            if 'box 1 of 2' in note_p or 'box 2 of 2' in note_p or 'box 1 of' in note_s:
-                continue
-            if cost is None or float(cost) <= 0:
-                continue
-
-            rec = {
-                'art': str(r[col_idx.get('Customer art No', 0)] or '').strip(),
-                'item_name': str(r[col_idx.get('Customer item name', 0)] or '').strip(),
-                'fabric': str(r[col_idx.get('Fabric type', 0)] or '').strip(),
-                'cost': float(cost),
-                'po_date': r[col_idx.get('P.O issued date', 0)],
-                'model': str(r[col_idx.get('Model', 0)] or '').strip()
-            }
-
-            if man in ['CS', 'WORKSHOP'] or 'CASA' in man or 'CASA' in sup:
-                cs_records.append(rec)
-            elif man in ['NH', 'NHF', 'NH FSC', 'NHAN HOANG'] or 'NHAN HOANG' in sup or 'NH ' in sup:
-                nh_records.append(rec)
-
-        wb_o.close()
-
-        # Save to Cache
-        try:
-            cache_obj = {
-                'file_path': ov_abs,
-                'file_size': cur_size,
-                'file_mtime': cur_mtime,
-                'cached_at': datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                'cs_records': cs_records,
-                'nh_records': nh_records
-            }
-            with open(c_path, 'wb') as f:
-                pickle.dump(cache_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-            self.log(f"💾 Đã lưu Smart Cache mới ({len(cs_records)} Casa, {len(nh_records)} NH) để dùng siêu tốc cho các lần sau.")
-        except Exception as e:
-            self.log(f"Lỗi khi lưu cache: {e}")
-
-        return cs_records, nh_records
-
-    def force_reload_master(self):
-        if not self.overview_path or not os.path.exists(self.overview_path):
-            messagebox.showwarning("Cảnh báo", "Vui lòng chọn file Master Overview trước!")
-            return
-        
-        c_path = get_cache_path()
-        if os.path.exists(c_path):
-            try:
-                os.remove(c_path)
-            except Exception:
-                pass
-        self.render_overview_display()
-        self.log("Đã xóa Cache cũ. Khi chạy, ứng dụng sẽ quét lại trực tiếp từ file Master.")
-        messagebox.showinfo("Thông báo", "Đã đặt lại Cache! Lần chạy tới sẽ đọc trực tiếp từ file Master và tạo Cache mới.")
+        self.render_initial_feed()
 
     # ----------------------------------------------------
     # UI Renderers
     # ----------------------------------------------------
+    def render_initial_feed(self):
+        for child in self.results_feed.winfo_children():
+            child.destroy()
+        
+        hint = ctk.CTkLabel(
+            self.results_feed,
+            text="Kết quả xử lý sẽ hiển thị tại đây một cách ngắn gọn, rõ ràng.",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color="#86868B",
+            pady=20
+        )
+        hint.pack(fill="both", expand=True)
+
     def render_overview_display(self):
         for child in self.ov_display_container.winfo_children():
             child.destroy()
@@ -480,7 +361,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             if has_cache:
                 ctk.CTkLabel(
                     title_row,
-                    text="  ⚡ ĐÃ CACHE SIÊU TỐC  ",
+                    text="  ✓ ĐÃ GHI NHỚ  ",
                     font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
                     fg_color="#EBF8F2",
                     text_color="#16A34A",
@@ -523,7 +404,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def clear_overview(self):
         self.overview_path = ""
         self.render_overview_display()
-        self.log("Đã gỡ file Master Overview khỏi ứng dụng.")
 
     def render_file_list(self):
         for child in self.file_list_frame.winfo_children():
@@ -550,7 +430,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             tag_color = "#EBF3FE" if is_casa else "#EBF8F2"
             tag_text_color = "#0071E3" if is_casa else "#16A34A"
 
-            # Output name preview
             base, ext = os.path.splitext(fname)
             out_preview = f"{base}_filled{ext}" if not base.endswith("_filled") else fname
 
@@ -630,8 +509,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             try:
                 t.drop_target_register(tkdnd.DND_FILES)
                 t.dnd_bind('<<Drop>>', self.on_drop_generic)
-                t.dnd_bind('<<DropEnter>>', self.on_drop_enter_generic)
-                t.dnd_bind('<<DropLeave>>', self.on_drop_leave_generic)
             except Exception:
                 pass
 
@@ -651,13 +528,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         except Exception:
             pass
 
-    def on_drop_enter_generic(self, event):
-        pass
-
-    def on_drop_leave_generic(self, event):
-        self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
-        self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
-
     def on_drop_overview(self, event):
         self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
         paths = parse_drop_paths(event.data)
@@ -665,7 +535,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             if os.path.isfile(p) and p.endswith(".xlsx"):
                 self.overview_path = p
                 self.render_overview_display()
-                self.log(f"Đã nạp file Master Overview: {os.path.basename(p)}")
                 return
 
     def on_drop_claims(self, event):
@@ -674,7 +543,8 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.add_claim_paths(paths)
 
     def on_drop_generic(self, event):
-        self.on_drop_leave_generic(event)
+        self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
+        self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
         paths = parse_drop_paths(event.data)
         if not paths:
             return
@@ -686,7 +556,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 if "overview" in fname:
                     self.overview_path = p
                     self.render_overview_display()
-                    self.log(f"Đã nạp file Master Overview: {os.path.basename(p)}")
                 else:
                     claims_to_add.append(p)
             elif os.path.isdir(p):
@@ -711,7 +580,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                             added += 1
         if added > 0:
             self.render_file_list()
-            self.log(f"Đã thêm {added} file Claim Versus vào danh sách.")
 
     # ----------------------------------------------------
     # File Dialogs
@@ -724,7 +592,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if f:
             self.overview_path = os.path.abspath(f)
             self.render_overview_display()
-            self.log(f"Đã chọn Master Overview: {os.path.basename(f)}")
 
     def browse_claim_files(self):
         files = filedialog.askopenfilenames(
@@ -739,6 +606,20 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if d:
             self.add_claim_paths([d])
 
+    def force_reload_master(self):
+        if not self.overview_path or not os.path.exists(self.overview_path):
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn file Master Overview trước!")
+            return
+        
+        c_path = get_cache_path()
+        if os.path.exists(c_path):
+            try:
+                os.remove(c_path)
+            except Exception:
+                pass
+        self.render_overview_display()
+        messagebox.showinfo("Thông báo", "Đã xóa bộ nhớ ghi nhớ! Lần chạy tới sẽ đọc lại file Master từ đầu.")
+
     def open_current_folder(self):
         if self.claim_files:
             folder = os.path.dirname(self.claim_files[0])
@@ -749,13 +630,39 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         else:
             os.startfile(os.path.abspath(os.path.dirname(__file__)))
 
-    def log(self, text):
-        t_str = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{t_str}] {text}\n")
-        self.log_text.see("end")
+    # ----------------------------------------------------
+    # Thread-Safe Apple Results Feed Updates
+    # ----------------------------------------------------
+    def append_feed_item(self, filename, matched, total, rate_str):
+        row = ctk.CTkFrame(self.results_feed, fg_color="#FFFFFF", corner_radius=8)
+        row.pack(fill="x", padx=8, pady=3)
+
+        ctk.CTkLabel(
+            row,
+            text="✓",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color="#16A34A"
+        ).pack(side="left", padx=(10, 8), pady=6)
+
+        ctk.CTkLabel(
+            row,
+            text=filename,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color="#1D1D1F"
+        ).pack(side="left", pady=6)
+
+        ctk.CTkLabel(
+            row,
+            text=f"•  Khớp {matched}/{total} dòng ({rate_str})",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#86868B"
+        ).pack(side="left", padx=8, pady=6)
+
+    def set_status_text(self, text, color="#86868B"):
+        self.status_badge.configure(text=text, text_color=color)
 
     # ----------------------------------------------------
-    # Core Engine Processing
+    # Core Engine Processing (Thread-Safe & Lag-Free)
     # ----------------------------------------------------
     def start_processing(self):
         if not self.overview_path or not os.path.isfile(self.overview_path):
@@ -766,9 +673,12 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             return
 
         self.btn_run.configure(state="disabled", text="Đang xử lý dữ liệu...")
-        self.prog_bar.set(0.1)
-        self.log("="*60)
-        self.log(f"BẮT ĐẦU XỬ LÝ {len(self.claim_files)} FILE CLAIM VERSUS")
+        self.prog_bar.set(0.05)
+        self.set_status_text("● Đang xử lý...", "#0071E3")
+
+        # Clear feed
+        for child in self.results_feed.winfo_children():
+            child.destroy()
 
         # Run background thread
         thread = threading.Thread(target=self.run_engine, daemon=True)
@@ -776,21 +686,90 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def run_engine(self):
         try:
-            # 1. Load Master Overview with Smart Cache
-            cs_records, nh_records = self.load_master_with_cache()
-            self.render_overview_display()
+            # 1. Load Master Overview with Cache
+            c_path = get_cache_path()
+            ov_abs = os.path.abspath(self.overview_path)
+            cur_size = os.path.getsize(ov_abs)
+            cur_mtime = os.path.getmtime(ov_abs)
+
+            loaded_from_cache = False
+            cs_records = []
+            nh_records = []
+
+            if os.path.exists(c_path):
+                try:
+                    with open(c_path, 'rb') as f:
+                        cache_obj = pickle.load(f)
+                    if (cache_obj.get('file_path') == ov_abs and
+                        cache_obj.get('file_size') == cur_size and
+                        abs(cache_obj.get('file_mtime', 0) - cur_mtime) < 2):
+                        cs_records = cache_obj['cs_records']
+                        nh_records = cache_obj['nh_records']
+                        loaded_from_cache = True
+                except Exception:
+                    pass
+
+            if not loaded_from_cache:
+                self.after(0, self.set_status_text, "● Đang đọc file Master...", "#0071E3")
+                wb_o = openpyxl.load_workbook(self.overview_path, read_only=True, data_only=True)
+                s_o = wb_o['Overview'] if 'Overview' in wb_o.sheetnames else wb_o.active
+                headers_o = next(s_o.iter_rows(max_row=1, values_only=True))
+                col_idx = {h: i for i, h in enumerate(headers_o)}
+
+                for r in s_o.iter_rows(min_row=2, values_only=True):
+                    man = str(r[col_idx.get('Manufacturer', 0)] or '').strip().upper()
+                    sup = str(r[col_idx.get('Supplier', 0)] or '').strip().upper()
+                    cost = r[col_idx.get('Purchase cost', 0)]
+                    note_p = str(r[col_idx.get('Item PO note', 0)] or '').lower()
+                    note_s = str(r[col_idx.get('Note (sales)', 0)] or '').lower()
+
+                    if 'box 1 of 2' in note_p or 'box 2 of 2' in note_p or 'box 1 of' in note_s:
+                        continue
+                    if cost is None or float(cost) <= 0:
+                        continue
+
+                    rec = {
+                        'art': str(r[col_idx.get('Customer art No', 0)] or '').strip(),
+                        'item_name': str(r[col_idx.get('Customer item name', 0)] or '').strip(),
+                        'fabric': str(r[col_idx.get('Fabric type', 0)] or '').strip(),
+                        'cost': float(cost),
+                        'po_date': r[col_idx.get('P.O issued date', 0)],
+                        'model': str(r[col_idx.get('Model', 0)] or '').strip()
+                    }
+
+                    if man in ['CS', 'WORKSHOP'] or 'CASA' in man or 'CASA' in sup:
+                        cs_records.append(rec)
+                    elif man in ['NH', 'NHF', 'NH FSC', 'NHAN HOANG'] or 'NHAN HOANG' in sup or 'NH ' in sup:
+                        nh_records.append(rec)
+
+                wb_o.close()
+
+                # Save cache
+                try:
+                    cache_obj = {
+                        'file_path': ov_abs,
+                        'file_size': cur_size,
+                        'file_mtime': cur_mtime,
+                        'cached_at': datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                        'cs_records': cs_records,
+                        'nh_records': nh_records
+                    }
+                    with open(c_path, 'wb') as f:
+                        pickle.dump(cache_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+                except Exception:
+                    pass
+
+            self.after(0, self.render_overview_display)
 
             # 2. Process Files
             total_files = len(self.claim_files)
             grand_claims = 0
             grand_matched = 0
-            created_files = []
 
             for i, fpath in enumerate(self.claim_files, start=1):
                 fname = os.path.basename(fpath)
                 is_casa = "casa" in fname.lower()
                 ref_db = cs_records if is_casa else nh_records
-                supp_name = "Casa (CS)" if is_casa else "Nhan Hoang (NH)"
 
                 wb = openpyxl.load_workbook(fpath)
                 s = wb['Export'] if 'Export' in wb.sheetnames else wb.active
@@ -832,7 +811,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 data_end = max_row - 1 if last_is_total else max_row
                 data_count = data_end - 1
 
-                # Median exchange rate
                 rate_samples = []
                 if unit_cost_col_idx:
                     for r_idx in range(2, data_end + 1):
@@ -944,30 +922,70 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 wb.close()
 
                 rate_str = f"{(file_matched / data_count * 100):.1f}%" if data_count > 0 else "100%"
-                self.log(f"[{i}/{total_files}] ✓ Đã tạo file: {os.path.basename(out_fpath)} | Khớp {file_matched}/{data_count} dòng ({rate_str})")
+                out_name = os.path.basename(out_fpath)
+                self.after(0, self.append_feed_item, out_name, file_matched, data_count, rate_str)
+
                 grand_claims += data_count
                 grand_matched += file_matched
-                created_files.append(os.path.basename(out_fpath))
 
-                self.prog_bar.set(0.1 + 0.9 * (i / total_files))
+                progress_val = 0.1 + 0.9 * (i / total_files)
+                self.after(0, self.prog_bar.set, progress_val)
 
-            self.log("="*60)
-            self.log(f"🎉 HOÀN TẤT XỬ LÝ TOÀN BỘ {total_files} FILE!")
-            self.log(f"Đã tạo {len(created_files)} file kết quả liền kề (hậu tố _filled). File gốc giữ nguyên 100%.")
-            self.log(f"Tổng cộng: {grand_matched}/{grand_claims} lượt claim đã được điền chi phí chuẩn xác.")
-            self.after(0, self.finish_processing, True, f"Xử lý thành công {total_files} file!\nĐã tạo các file kết quả '*_filled.xlsx' liền kề.")
+            # Completion
+            self.after(0, self.finish_processing_apple, True, total_files, grand_matched, grand_claims)
 
         except Exception as e:
-            self.log(f"❌ Lỗi: {str(e)}")
-            self.after(0, self.finish_processing, False, str(e))
+            self.after(0, self.finish_processing_apple, False, 0, 0, 0, str(e))
 
-    def finish_processing(self, success, msg):
+    def finish_processing_apple(self, success, total_files, grand_matched, grand_claims, err_msg=""):
         self.prog_bar.set(1.0 if success else 0)
         self.btn_run.configure(state="normal", text="Bắt Đầu Đối Chiếu & Điền Giá (Tạo File _filled)")
+
         if success:
-            messagebox.showinfo("Thành công", msg)
+            self.set_status_text("✓ Hoàn tất", "#16A34A")
+            # Render completion banner smoothly without blocking modal
+            banner = ctk.CTkFrame(self.results_feed, fg_color="#EBF8F2", corner_radius=10)
+            banner.pack(fill="x", padx=8, pady=(8, 4))
+
+            b_left = ctk.CTkFrame(banner, fg_color="transparent")
+            b_left.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+
+            ctk.CTkLabel(
+                b_left,
+                text=f"🎉 Hoàn tất xuất sắc {total_files} file kết quả!",
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                text_color="#16A34A"
+            ).pack(anchor="w")
+
+            ctk.CTkLabel(
+                b_left,
+                text=f"Đã tạo các file '*_filled.xlsx' liền kề  •  {grand_matched}/{grand_claims} lượt claim khớp chính xác.",
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+                text_color="#1F2937"
+            ).pack(anchor="w", pady=(2, 0))
+
+            ctk.CTkButton(
+                banner,
+                text="📂 Xem File",
+                font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                fg_color="#16A34A",
+                text_color="#FFFFFF",
+                hover_color="#15803D",
+                corner_radius=8,
+                height=30,
+                command=self.open_current_folder
+            ).pack(side="right", padx=12, pady=10)
+
         else:
-            messagebox.showerror("Thông báo lỗi", msg)
+            self.set_status_text("❌ Lỗi", "#FF3B30")
+            err_box = ctk.CTkFrame(self.results_feed, fg_color="#FFECEB", corner_radius=8)
+            err_box.pack(fill="x", padx=8, pady=6)
+            ctk.CTkLabel(
+                err_box,
+                text=f"Đã xảy ra lỗi: {err_msg}",
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+                text_color="#FF3B30"
+            ).pack(padx=10, pady=8)
 
 if __name__ == "__main__":
     app = ClaimHelperAppleApp()
