@@ -4,6 +4,7 @@ import re
 import datetime
 import threading
 import pickle
+import subprocess
 from copy import copy
 
 import customtkinter as ctk
@@ -42,6 +43,19 @@ def format_file_size(size_bytes):
     else:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
 
+def reveal_in_explorer(filepath):
+    """Opens Windows Explorer with the specific file selected/highlighted."""
+    try:
+        norm_path = os.path.normpath(filepath)
+        if os.path.exists(norm_path):
+            subprocess.Popen(f'explorer /select,"{norm_path}"')
+        else:
+            folder = os.path.dirname(norm_path)
+            if os.path.exists(folder):
+                subprocess.Popen(f'explorer "{folder}"')
+    except Exception as e:
+        print(f"Error revealing in explorer: {e}")
+
 class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
@@ -55,6 +69,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         # State Variables
         self.overview_path = ""
         self.claim_files = [] # list of absolute paths
+        self.last_created_files = [] # list of created output files
         self.is_processing = False
 
         # Auto-detect Overview in current directory
@@ -621,7 +636,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         messagebox.showinfo("Thông báo", "Đã xóa bộ nhớ ghi nhớ! Lần chạy tới sẽ đọc lại file Master từ đầu.")
 
     def open_current_folder(self):
-        if self.claim_files:
+        if self.last_created_files:
+            reveal_in_explorer(self.last_created_files[0])
+        elif self.claim_files:
             folder = os.path.dirname(self.claim_files[0])
             os.startfile(folder)
         elif self.overview_path:
@@ -633,7 +650,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     # ----------------------------------------------------
     # Thread-Safe Apple Results Feed Updates
     # ----------------------------------------------------
-    def append_feed_item(self, filename, matched, total, rate_str):
+    def append_feed_item(self, filename, matched, total, rate_str, full_fpath=None):
         row = ctk.CTkFrame(self.results_feed, fg_color="#FFFFFF", corner_radius=8)
         row.pack(fill="x", padx=8, pady=3)
 
@@ -658,6 +675,20 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             text_color="#86868B"
         ).pack(side="left", padx=8, pady=6)
 
+        if full_fpath and os.path.exists(full_fpath):
+            ctk.CTkButton(
+                row,
+                text="📂 Xem",
+                font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                fg_color="#F2F2F7",
+                hover_color="#E5E5EA",
+                text_color="#0071E3",
+                corner_radius=6,
+                width=52,
+                height=22,
+                command=lambda p=full_fpath: reveal_in_explorer(p)
+            ).pack(side="right", padx=(4, 8), pady=6)
+
     def set_status_text(self, text, color="#86868B"):
         self.status_badge.configure(text=text, text_color=color)
 
@@ -675,6 +706,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.btn_run.configure(state="disabled", text="Đang xử lý dữ liệu...")
         self.prog_bar.set(0.05)
         self.set_status_text("● Đang xử lý...", "#0071E3")
+        self.last_created_files = []
 
         # Clear feed
         for child in self.results_feed.winfo_children():
@@ -763,8 +795,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
             # 2. Process Files
             total_files = len(self.claim_files)
-            grand_claims = 0
-            grand_matched = 0
+            created_files = []
 
             for i, fpath in enumerate(self.claim_files, start=1):
                 fname = os.path.basename(fpath)
@@ -921,34 +952,45 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 wb.save(out_fpath)
                 wb.close()
 
+                out_abs = os.path.abspath(out_fpath)
+                created_files.append(out_abs)
+
                 rate_str = f"{(file_matched / data_count * 100):.1f}%" if data_count > 0 else "100%"
                 out_name = os.path.basename(out_fpath)
-                self.after(0, self.append_feed_item, out_name, file_matched, data_count, rate_str)
-
-                grand_claims += data_count
-                grand_matched += file_matched
+                self.after(0, self.append_feed_item, out_name, file_matched, data_count, rate_str, out_abs)
 
                 progress_val = 0.1 + 0.9 * (i / total_files)
                 self.after(0, self.prog_bar.set, progress_val)
 
             # Completion
-            self.after(0, self.finish_processing_apple, True, total_files, grand_matched, grand_claims)
+            self.last_created_files = created_files
+            self.after(0, self.finish_processing_apple, True, total_files, created_files)
 
         except Exception as e:
-            self.after(0, self.finish_processing_apple, False, 0, 0, 0, str(e))
+            self.after(0, self.finish_processing_apple, False, 0, [], str(e))
 
-    def finish_processing_apple(self, success, total_files, grand_matched, grand_claims, err_msg=""):
+    def finish_processing_apple(self, success, total_files, created_files, err_msg=""):
         self.prog_bar.set(1.0 if success else 0)
         self.btn_run.configure(state="normal", text="Bắt Đầu Đối Chiếu & Điền Giá (Tạo File _filled)")
 
         if success:
             self.set_status_text("✓ Hoàn tất", "#16A34A")
+
+            # Determine subtitle message with full path
+            if len(created_files) == 1:
+                sub_text = f"Đã tạo file: {created_files[0]}"
+                target_file_to_reveal = created_files[0]
+            else:
+                lines = [f"• {p}" for p in created_files]
+                sub_text = f"Đã tạo {len(created_files)} file:\n" + "\n".join(lines)
+                target_file_to_reveal = created_files[0] if created_files else ""
+
             # Render completion banner smoothly without blocking modal
             banner = ctk.CTkFrame(self.results_feed, fg_color="#EBF8F2", corner_radius=10)
             banner.pack(fill="x", padx=8, pady=(8, 4))
 
             b_left = ctk.CTkFrame(banner, fg_color="transparent")
-            b_left.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+            b_left.pack(side="left", fill="x", expand=True, padx=14, pady=12)
 
             ctk.CTkLabel(
                 b_left,
@@ -959,10 +1001,12 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
             ctk.CTkLabel(
                 b_left,
-                text=f"Đã tạo các file '*_filled.xlsx' liền kề  •  {grand_matched}/{grand_claims} lượt claim khớp chính xác.",
+                text=sub_text,
                 font=ctk.CTkFont(family="Segoe UI", size=11),
-                text_color="#1F2937"
-            ).pack(anchor="w", pady=(2, 0))
+                text_color="#1F2937",
+                wraplength=520,
+                justify="left"
+            ).pack(anchor="w", pady=(3, 0))
 
             ctk.CTkButton(
                 banner,
@@ -972,9 +1016,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 text_color="#FFFFFF",
                 hover_color="#15803D",
                 corner_radius=8,
-                height=30,
-                command=self.open_current_folder
-            ).pack(side="right", padx=12, pady=10)
+                height=32,
+                command=lambda p=target_file_to_reveal: reveal_in_explorer(p)
+            ).pack(side="right", padx=14, pady=12)
 
         else:
             self.set_status_text("❌ Lỗi", "#FF3B30")
