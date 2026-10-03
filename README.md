@@ -23,22 +23,26 @@
 
 ## 🚀 Hướng Dẫn Sử Dụng
 
-### Cách 1: Chạy trực tiếp từ mã nguồn Python
+### Cách 1: Khởi chạy trực tiếp (Không có cửa sổ đen CMD)
+- **Cách đơn giản nhất:** Click đúp trực tiếp vào file **`claim_helper.pyw`** hoặc file **`Mo_Claim_Helper.vbs`**.
+- Giao diện Apple Design sẽ mở lên lập tức mà **hoàn toàn không bật bất kỳ cửa sổ CMD đen nào**.
+
+### Cách 2: Khởi chạy qua dòng lệnh Python
 ```bash
 # Cài đặt thư viện phụ thuộc
 pip install -r requirements.txt
 
-# Khởi chạy ứng dụng
-python claim_helper.py
+# Khởi chạy ứng dụng (chế độ không console)
+pythonw claim_helper.pyw
 ```
 
-### Cách 2: Đóng gói thành file `.exe` cho máy khác dùng độc lập (Không cần cài Python)
+### Cách 3: Đóng gói thành file `.exe` cho máy khác dùng độc lập (Không cần cài Python)
 1. Click đúp vào file **`build_exe.bat`**.
 2. Sau khi biên dịch xong, ứng dụng thực thi sẽ nằm tại:
    ```
    dist\ClaimHelper\ClaimHelper.exe
    ```
-3. Bạn có thể nén cả thư mục `dist\ClaimHelper` thành file `.zip` và gửi cho bất kỳ đồng nghiệp nào mở lên dùng ngay.
+3. Bạn có thể nén cả thư mục `dist\ClaimHelper` thành file `.zip` và gửi cho bất kỳ đồng nghiệp nào mở lên dùng ngay (không cần cài Python).
 
 ---
 
