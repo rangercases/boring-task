@@ -367,6 +367,7 @@ exit
             text_color="#0071E3",
             hover_color="#E5E5EA",
             corner_radius=8,
+            width=165,
             height=26,
             command=self.browse_overview
         )
@@ -380,9 +381,11 @@ exit
             text_color="#1D1D1F",
             hover_color="#E5E5EA",
             corner_radius=8,
+            width=120,
             height=26,
             command=self.force_reload_master
         )
+        self.btn_refresh_cache.pack(side="left", padx=4)
 
         self.btn_clear_ov = ctk.CTkButton(
             ov_btn_box,
@@ -392,9 +395,11 @@ exit
             text_color="#FF3B30",
             hover_color="#FFECEB",
             corner_radius=8,
+            width=80,
             height=26,
             command=self.clear_overview
         )
+        self.btn_clear_ov.pack(side="left", padx=4)
 
         # Container for Master file display or Drop hint
         self.ov_display_container = ctk.CTkFrame(self.card_ov, fg_color="#F9F9FB", corner_radius=10)
@@ -436,6 +441,7 @@ exit
             text_color="#0071E3",
             hover_color="#E5E5EA",
             corner_radius=8,
+            width=165,
             height=26,
             command=self.browse_claim_files
         ).pack(side="left", padx=4)
@@ -448,6 +454,7 @@ exit
             text_color="#1D1D1F",
             hover_color="#E5E5EA",
             corner_radius=8,
+            width=120,
             height=26,
             command=self.browse_claim_folder
         ).pack(side="left", padx=4)
@@ -460,6 +467,7 @@ exit
             text_color="#FF3B30",
             hover_color="#FFECEB",
             corner_radius=8,
+            width=80,
             height=26,
             command=self.clear_all_claims
         ).pack(side="left", padx=4)
@@ -567,8 +575,8 @@ exit
             child.destroy()
 
         if self.overview_path and os.path.exists(self.overview_path):
-            self.btn_refresh_cache.pack(side="left", padx=4)
-            self.btn_clear_ov.pack(side="left", padx=4)
+            self.btn_refresh_cache.configure(state="normal", text_color="#1D1D1F")
+            self.btn_clear_ov.configure(state="normal", text_color="#FF3B30")
             size_str = format_file_size(os.path.getsize(self.overview_path))
             
             # Check cache status
@@ -638,8 +646,8 @@ exit
                 command=self.clear_overview
             ).pack(side="right", padx=(4, 10), pady=8)
         else:
-            self.btn_clear_ov.pack_forget()
-            self.btn_refresh_cache.pack_forget()
+            self.btn_refresh_cache.configure(state="disabled", text_color="#C7C7CC")
+            self.btn_clear_ov.configure(state="disabled", text_color="#C7C7CC")
             drop_hint = ctk.CTkLabel(
                 self.ov_display_container,
                 text="📥  Kéo thả file Master Overview (.xlsx) vào đây\nhoặc bấm nút 'Chọn File Overview...' ở góc trên",
