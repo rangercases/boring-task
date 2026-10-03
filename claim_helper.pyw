@@ -86,8 +86,8 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.TkdndVersion = tkdnd.TkinterDnD._require(self)
 
         self.title("Claim Helper")
-        self.geometry("840x820")
-        self.minsize(800, 720)
+        self.geometry("840x760")
+        self.minsize(800, 680)
         self.configure(fg_color="#F5F5F7")  # Signature Apple off-white
 
         # State Variables
@@ -187,6 +187,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             pass
 
     def show_update_banner(self, latest_tag, exe_url):
+        self.update_banner_container.pack(fill="x", padx=32, pady=(0, 10))
         for child in self.update_banner_container.winfo_children():
             child.destroy()
 
@@ -296,7 +297,7 @@ exit
     def setup_ui(self):
         # 1. Header Frame
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=32, pady=(25, 6))
+        header.pack(fill="x", padx=32, pady=(16, 4))
 
         title_row = ctk.CTkFrame(header, fg_color="transparent")
         title_row.pack(anchor="w")
@@ -304,7 +305,7 @@ exit
         title_lbl = ctk.CTkLabel(
             title_row,
             text="Claim Helper",
-            font=ctk.CTkFont(family="Segoe UI", size=26, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
             text_color="#1D1D1F"
         )
         title_lbl.pack(side="left")
@@ -316,7 +317,7 @@ exit
             fg_color="#EBF3FE",
             text_color="#0071E3",
             corner_radius=6
-        ).pack(side="left", padx=(10, 0), pady=(6, 0))
+        ).pack(side="left", padx=(10, 0), pady=(4, 0))
 
         sub_lbl = ctk.CTkLabel(
             header,
@@ -326,13 +327,12 @@ exit
         )
         sub_lbl.pack(anchor="w", pady=(2, 0))
 
-        # Dynamic Update Banner Container (shows up if new version is found on GitHub)
+        # Dynamic Update Banner Container (only packed when an update exists)
         self.update_banner_container = ctk.CTkFrame(self, fg_color="transparent")
-        self.update_banner_container.pack(fill="x", padx=32, pady=(0, 6))
 
         # 2. Main Scrollable Container
         self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.main_scroll.pack(fill="both", expand=True, padx=32, pady=(0, 15))
+        self.main_scroll.pack(fill="both", expand=True, padx=32, pady=(6, 15))
 
         # ========================================================
         # CARD 1: Master Overview (Dedicated Drop & Clear Target)
