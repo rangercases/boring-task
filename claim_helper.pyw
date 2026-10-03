@@ -535,6 +535,17 @@ exit
 
         self.render_initial_feed()
 
+        # 3. Bottom Footer
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=32, pady=(0, 10))
+
+        ctk.CTkLabel(
+            footer,
+            text="Powered by Quoc Hung",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            text_color="#A1A1A6"
+        ).pack(side="left")
+
     # ----------------------------------------------------
     # UI Renderers
     # ----------------------------------------------------
