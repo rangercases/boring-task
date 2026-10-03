@@ -28,14 +28,22 @@ def parse_drop_paths(data_str):
             paths.append(os.path.abspath(p))
     return paths
 
+def format_file_size(size_bytes):
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
 class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
         self.TkdndVersion = tkdnd.TkinterDnD._require(self)
 
         self.title("Claim Helper")
-        self.geometry("820x780")
-        self.minsize(780, 680)
+        self.geometry("840x800")
+        self.minsize(800, 700)
         self.configure(fg_color="#F5F5F7")  # Signature Apple off-white
 
         # State Variables
@@ -61,7 +69,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def setup_ui(self):
         # 1. Header Frame
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=30, pady=(25, 12))
+        header.pack(fill="x", padx=32, pady=(25, 12))
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -81,9 +89,11 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         # 2. Main Scrollable Container
         self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.main_scroll.pack(fill="both", expand=True, padx=30, pady=(0, 15))
+        self.main_scroll.pack(fill="both", expand=True, padx=32, pady=(0, 15))
 
-        # CARD 1: Master Overview
+        # ========================================================
+        # CARD 1: Master Overview (Dedicated Drop & Clear Target)
+        # ========================================================
         self.card_ov = ctk.CTkFrame(
             self.main_scroll,
             fg_color="#FFFFFF",
@@ -94,7 +104,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.card_ov.pack(fill="x", pady=(0, 14))
 
         ov_top = ctk.CTkFrame(self.card_ov, fg_color="transparent")
-        ov_top.pack(fill="x", padx=18, pady=(14, 6))
+        ov_top.pack(fill="x", padx=18, pady=(14, 8))
 
         ctk.CTkLabel(
             ov_top,
@@ -103,29 +113,44 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             text_color="#0071E3"
         ).pack(side="left")
 
-        btn_pick_ov = ctk.CTkButton(
-            ov_top,
+        ov_btn_box = ctk.CTkFrame(ov_top, fg_color="transparent")
+        ov_btn_box.pack(side="right")
+
+        self.btn_clear_ov = ctk.CTkButton(
+            ov_btn_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            fg_color="transparent",
+            text_color="#FF3B30",
+            hover_color="#FFECEB",
+            corner_radius=8,
+            height=26,
+            command=self.clear_overview
+        )
+        # Only packed if overview exists
+
+        self.btn_pick_ov = ctk.CTkButton(
+            ov_btn_box,
             text="Chọn File Overview...",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             fg_color="#F2F2F7",
             text_color="#0071E3",
             hover_color="#E5E5EA",
             corner_radius=8,
-            height=28,
+            height=26,
             command=self.browse_overview
         )
-        btn_pick_ov.pack(side="right")
+        self.btn_pick_ov.pack(side="right", padx=(6, 0))
 
-        self.ov_path_lbl = ctk.CTkLabel(
-            self.card_ov,
-            text=self.get_ov_display_text(),
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color="#1D1D1F" if self.overview_path else "#86868B",
-            anchor="w"
-        )
-        self.ov_path_lbl.pack(fill="x", padx=18, pady=(0, 14))
+        # Container for Master file display or Drop hint
+        self.ov_display_container = ctk.CTkFrame(self.card_ov, fg_color="#F9F9FB", corner_radius=10)
+        self.ov_display_container.pack(fill="x", padx=16, pady=(0, 14))
 
-        # CARD 2: Claim Versus Files (Multi-file select & Drag Drop)
+        self.render_overview_display()
+
+        # ========================================================
+        # CARD 2: Claim Versus Files (Multi-file select & Drop Target)
+        # ========================================================
         self.card_claims = ctk.CTkFrame(
             self.main_scroll,
             fg_color="#FFFFFF",
@@ -191,7 +216,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         self.render_file_list()
 
-        # CARD 3: Action & Progress
+        # ========================================================
+        # ACTION: Start Processing Button & Progress Bar
+        # ========================================================
         act_box = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         act_box.pack(fill="x", pady=(4, 12))
 
@@ -218,7 +245,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.prog_bar.set(0)
         self.prog_bar.pack(fill="x", pady=(0, 10))
 
-        # CARD 4: Live Activity Console
+        # ========================================================
+        # CARD 3: Live Activity Console
+        # ========================================================
         card_log = ctk.CTkFrame(
             self.main_scroll,
             fg_color="#1C1C1E",
@@ -259,15 +288,77 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.log_text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
         self.log("Claim Helper sẵn sàng.")
-        self.log("Kéo thả file vào giao diện hoặc bấm 'Bắt Đầu Đối Chiếu & Điền Giá' để chạy.")
+        self.log("Kéo thả file vào khung tương ứng hoặc bấm 'Bắt Đầu Đối Chiếu & Điền Giá' để chạy.")
 
-    def get_ov_display_text(self):
-        if self.overview_path:
-            return f"✓ {os.path.basename(self.overview_path)}  ({self.overview_path})"
-        return "Chưa chọn file (Kéo thả file Master Overview vào đây hoặc bấm Chọn File...)"
+    # ----------------------------------------------------
+    # UI Renderers
+    # ----------------------------------------------------
+    def render_overview_display(self):
+        for child in self.ov_display_container.winfo_children():
+            child.destroy()
+
+        if self.overview_path and os.path.exists(self.overview_path):
+            self.btn_clear_ov.pack(side="right", padx=(0, 4))
+            size_str = format_file_size(os.path.getsize(self.overview_path))
+            
+            row = ctk.CTkFrame(self.ov_display_container, fg_color="#FFFFFF", corner_radius=8)
+            row.pack(fill="x", padx=8, pady=8)
+
+            ctk.CTkLabel(
+                row,
+                text="📊",
+                font=ctk.CTkFont(size=14)
+            ).pack(side="left", padx=(10, 8), pady=8)
+
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="x", expand=True, pady=6)
+
+            ctk.CTkLabel(
+                info_box,
+                text=os.path.basename(self.overview_path),
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                text_color="#1D1D1F",
+                anchor="w"
+            ).pack(anchor="w")
+
+            ctk.CTkLabel(
+                info_box,
+                text=f"{self.overview_path}  •  {size_str}",
+                font=ctk.CTkFont(family="Segoe UI", size=10),
+                text_color="#86868B",
+                anchor="w"
+            ).pack(anchor="w")
+
+            # Inline Delete Button
+            ctk.CTkButton(
+                row,
+                text="✕",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="transparent",
+                text_color="#86868B",
+                hover_color="#FFECEB",
+                corner_radius=6,
+                width=24,
+                height=24,
+                command=self.clear_overview
+            ).pack(side="right", padx=(4, 10), pady=8)
+        else:
+            self.btn_clear_ov.pack_forget()
+            drop_hint = ctk.CTkLabel(
+                self.ov_display_container,
+                text="📥  Kéo thả file Master Overview (.xlsx) vào đây\nhoặc bấm nút 'Chọn File Overview...' ở góc trên",
+                font=ctk.CTkFont(family="Segoe UI", size=12),
+                text_color="#86868B",
+                pady=18
+            )
+            drop_hint.pack(fill="both", expand=True)
+
+    def clear_overview(self):
+        self.overview_path = ""
+        self.render_overview_display()
+        self.log("Đã gỡ file Master Overview khỏi ứng dụng.")
 
     def render_file_list(self):
-        # Clear existing items
         for child in self.file_list_frame.winfo_children():
             child.destroy()
 
@@ -277,7 +368,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 text="📥  Kéo thả một hoặc nhiều file Claim Versus (.xlsx) vào đây\nhoặc bấm nút '+ Chọn File(s)...' ở góc trên",
                 font=ctk.CTkFont(family="Segoe UI", size=12),
                 text_color="#86868B",
-                pady=24
+                pady=22
             )
             empty_lbl.pack(fill="both", expand=True)
             self.claim_count_lbl.configure(text="📋  DANH SÁCH FILE CLAIM VERSUS (0)")
@@ -293,9 +384,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             tag_text_color = "#0071E3" if is_casa else "#16A34A"
 
             row = ctk.CTkFrame(self.file_list_frame, fg_color="#FFFFFF", corner_radius=8)
-            row.pack(fill="x", padx=10, pady=4)
+            row.pack(fill="x", padx=8, pady=4)
 
-            # File icon & name
+            # Icon & Name
             ctk.CTkLabel(
                 row,
                 text="📄",
@@ -348,50 +439,105 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             self.claim_files.clear()
             self.render_file_list()
 
+    # ----------------------------------------------------
+    # Drag & Drop Handlers
+    # ----------------------------------------------------
     def setup_drag_and_drop(self):
-        # Register targets
-        self.drop_target_register(tkdnd.DND_FILES)
-        self.dnd_bind('<<Drop>>', self.on_drop)
-        self.dnd_bind('<<DropEnter>>', self.on_drop_enter)
-        self.dnd_bind('<<DropLeave>>', self.on_drop_leave)
+        # Register both cards and entire window
+        targets = [self.card_ov, self.ov_display_container, self.card_claims, self.file_list_frame, self]
+        for t in targets:
+            try:
+                t.drop_target_register(tkdnd.DND_FILES)
+                t.dnd_bind('<<Drop>>', self.on_drop_generic)
+                t.dnd_bind('<<DropEnter>>', self.on_drop_enter_generic)
+                t.dnd_bind('<<DropLeave>>', self.on_drop_leave_generic)
+            except Exception:
+                pass
 
-    def on_drop_enter(self, event):
-        self.card_claims.configure(border_color="#0071E3", fg_color="#F0F8FF")
+        # Specific drop on Overview card
+        try:
+            self.card_ov.dnd_bind('<<Drop>>', self.on_drop_overview)
+            self.ov_display_container.dnd_bind('<<Drop>>', self.on_drop_overview)
+            self.card_ov.dnd_bind('<<DropEnter>>', lambda e: self.card_ov.configure(border_color="#0071E3", fg_color="#F0F8FF"))
+            self.card_ov.dnd_bind('<<DropLeave>>', lambda e: self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF"))
+        except Exception:
+            pass
 
-    def on_drop_leave(self, event):
+        # Specific drop on Claim files card
+        try:
+            self.card_claims.dnd_bind('<<Drop>>', self.on_drop_claims)
+            self.file_list_frame.dnd_bind('<<Drop>>', self.on_drop_claims)
+            self.card_claims.dnd_bind('<<DropEnter>>', lambda e: self.card_claims.configure(border_color="#0071E3", fg_color="#F0F8FF"))
+            self.card_claims.dnd_bind('<<DropLeave>>', lambda e: self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF"))
+        except Exception:
+            pass
+
+    def on_drop_enter_generic(self, event):
+        pass
+
+    def on_drop_leave_generic(self, event):
+        self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
         self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
 
-    def on_drop(self, event):
-        self.on_drop_leave(event)
+    def on_drop_overview(self, event):
+        self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if os.path.isfile(p) and p.endswith(".xlsx"):
+                self.overview_path = p
+                self.render_overview_display()
+                self.log(f"Đã nạp file Master Overview: {os.path.basename(p)}")
+                return
+
+    def on_drop_claims(self, event):
+        self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
+        paths = parse_drop_paths(event.data)
+        self.add_claim_paths(paths)
+
+    def on_drop_generic(self, event):
+        self.on_drop_leave_generic(event)
         paths = parse_drop_paths(event.data)
         if not paths:
             return
 
-        added_claims = 0
+        # If dropped on general window: classify by file name
+        claims_to_add = []
         for p in paths:
             if os.path.isfile(p) and p.endswith(".xlsx"):
                 fname = os.path.basename(p).lower()
                 if "overview" in fname:
                     self.overview_path = p
-                    self.ov_path_lbl.configure(text=self.get_ov_display_text(), text_color="#1D1D1F")
+                    self.render_overview_display()
                     self.log(f"Đã nạp file Master Overview: {os.path.basename(p)}")
                 else:
-                    if p not in self.claim_files:
-                        self.claim_files.append(p)
-                        added_claims += 1
+                    claims_to_add.append(p)
             elif os.path.isdir(p):
-                # Dropped a directory: scan for versus files
+                claims_to_add.append(p)
+
+        if claims_to_add:
+            self.add_claim_paths(claims_to_add)
+
+    def add_claim_paths(self, paths):
+        added = 0
+        for p in paths:
+            if os.path.isfile(p) and p.endswith(".xlsx") and not p.endswith("_backup.xlsx") and not p.startswith("~$"):
+                if p not in self.claim_files:
+                    self.claim_files.append(p)
+                    added += 1
+            elif os.path.isdir(p):
                 for f in os.listdir(p):
                     if "versus" in f.lower() and f.endswith(".xlsx") and not f.endswith("_backup.xlsx") and not f.startswith("~$"):
-                        full_p = os.path.join(p, f)
-                        if full_p not in self.claim_files:
-                            self.claim_files.append(full_p)
-                            added_claims += 1
-
-        if added_claims > 0:
+                        fp = os.path.join(p, f)
+                        if fp not in self.claim_files:
+                            self.claim_files.append(fp)
+                            added += 1
+        if added > 0:
             self.render_file_list()
-            self.log(f"Đã thêm {added_claims} file Claim Versus vào danh sách.")
+            self.log(f"Đã thêm {added} file Claim Versus vào danh sách.")
 
+    # ----------------------------------------------------
+    # File Dialogs
+    # ----------------------------------------------------
     def browse_overview(self):
         f = filedialog.askopenfilename(
             title="Chọn file Master Overview",
@@ -399,7 +545,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         )
         if f:
             self.overview_path = os.path.abspath(f)
-            self.ov_path_lbl.configure(text=self.get_ov_display_text(), text_color="#1D1D1F")
+            self.render_overview_display()
             self.log(f"Đã chọn Master Overview: {os.path.basename(f)}")
 
     def browse_claim_files(self):
@@ -408,31 +554,12 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")]
         )
         if files:
-            added = 0
-            for f in files:
-                p = os.path.abspath(f)
-                if p not in self.claim_files:
-                    self.claim_files.append(p)
-                    added += 1
-            if added > 0:
-                self.render_file_list()
-                self.log(f"Đã chọn thêm {added} file Claim Versus.")
+            self.add_claim_paths([os.path.abspath(f) for f in files])
 
     def browse_claim_folder(self):
         d = filedialog.askdirectory(title="Chọn thư mục chứa các file Claim Versus")
         if d:
-            added = 0
-            for f in os.listdir(d):
-                if "versus" in f.lower() and f.endswith(".xlsx") and not f.endswith("_backup.xlsx") and not f.startswith("~$"):
-                    p = os.path.join(d, f)
-                    if p not in self.claim_files:
-                        self.claim_files.append(p)
-                        added += 1
-            if added > 0:
-                self.render_file_list()
-                self.log(f"Đã quét và thêm {added} file từ thư mục {os.path.basename(d)}.")
-            else:
-                self.log("Không tìm thấy file Excel 'versus' nào mới trong thư mục này.")
+            self.add_claim_paths([d])
 
     def open_current_folder(self):
         if self.claim_files:
@@ -449,6 +576,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.log_text.insert("end", f"[{t_str}] {text}\n")
         self.log_text.see("end")
 
+    # ----------------------------------------------------
+    # Core Engine Processing
+    # ----------------------------------------------------
     def start_processing(self):
         if not self.overview_path or not os.path.isfile(self.overview_path):
             messagebox.showerror("Thiếu thông tin", "Vui lòng chọn hoặc kéo thả file Master Overview (.xlsx)!")
