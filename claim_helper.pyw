@@ -359,6 +359,19 @@ exit
         ov_btn_box = ctk.CTkFrame(ov_top, fg_color="transparent")
         ov_btn_box.pack(side="right")
 
+        self.btn_pick_ov = ctk.CTkButton(
+            ov_btn_box,
+            text="+ Chọn File Overview...",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#F2F2F7",
+            text_color="#0071E3",
+            hover_color="#E5E5EA",
+            corner_radius=8,
+            height=26,
+            command=self.browse_overview
+        )
+        self.btn_pick_ov.pack(side="left", padx=4)
+
         self.btn_refresh_cache = ctk.CTkButton(
             ov_btn_box,
             text="Đọc Lại Master",
@@ -382,19 +395,6 @@ exit
             height=26,
             command=self.clear_overview
         )
-
-        self.btn_pick_ov = ctk.CTkButton(
-            ov_btn_box,
-            text="Chọn File Overview...",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            fg_color="#F2F2F7",
-            text_color="#0071E3",
-            hover_color="#E5E5EA",
-            corner_radius=8,
-            height=26,
-            command=self.browse_overview
-        )
-        self.btn_pick_ov.pack(side="right", padx=(6, 0))
 
         # Container for Master file display or Drop hint
         self.ov_display_container = ctk.CTkFrame(self.card_ov, fg_color="#F9F9FB", corner_radius=10)
@@ -555,7 +555,7 @@ exit
         
         hint = ctk.CTkLabel(
             self.results_feed,
-            text="Kết quả xử lý sẽ hiển thị tại đây một cách ngắn gọn, rõ ràng.",
+            text="Kết quả sẽ hiển thị tại đây.",
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color="#86868B",
             pady=20
@@ -567,8 +567,8 @@ exit
             child.destroy()
 
         if self.overview_path and os.path.exists(self.overview_path):
-            self.btn_clear_ov.pack(side="right", padx=(4, 0))
-            self.btn_refresh_cache.pack(side="right", padx=(4, 0))
+            self.btn_refresh_cache.pack(side="left", padx=4)
+            self.btn_clear_ov.pack(side="left", padx=4)
             size_str = format_file_size(os.path.getsize(self.overview_path))
             
             # Check cache status
