@@ -11,6 +11,7 @@ import urllib.error
 import tempfile
 import time
 from copy import copy
+import ctypes
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -18,14 +19,31 @@ import tkinterdnd2 as tkdnd
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-# Set Apple-inspired Light Mode
+# Set Light Mode
 ctk.set_appearance_mode("Light")
-ctk.set_default_color_theme("blue")
 
 APP_VERSION = "v1.0.0"
 GITHUB_REPO = "rangercases/claim-helper"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
+
+# ----------------------------------------------------
+# THEME: "Soft Ivory Bakery" (Japanese Cafe Style)
+# ----------------------------------------------------
+IVORY = "#f7f2e8"        # nền cửa sổ kem ngà
+CARD = "#fffdf8"         # nền card trắng ấm nhẹ
+LINE = "#e8e0d0"         # viền mảnh tao nhã
+SAND = "#f1eadb"         # vùng kéo thả, ô kết quả
+ROAST = "#2b211c"        # nâu rang rất đậm: chữ chính, nút chính
+BROWN = "#6f5d50"        # chữ phụ ấm áp
+FAINT = "#b3a898"        # chữ mờ, disabled, footer
+MOSS = "#6b7a5a"         # xanh rêu: nhấn chính (progress, focus, thành công)
+MOSS_SOFT = "#e4e8d8"    # nền nhạt của trạng thái thành công, dragover
+CARAMEL = "#c8855a"      # nhấn phụ rất hạn chế (icon nhỏ)
+DANGER = "#a8503a"       # đỏ gạch dịu cho Xóa/lỗi
+
+FONT_SERIF = "Cambria"   # Font Serif chuẩn Windows, hỗ trợ 100% tiếng Việt
+FONT_SANS = "Segoe UI"   # Font Sans-serif chuẩn Windows, sắc nét, không lỗi dấu
 
 def parse_version(v_str):
     clean = re.sub(r'[^0-9.]', '', str(v_str))
@@ -86,9 +104,9 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.TkdndVersion = tkdnd.TkinterDnD._require(self)
 
         self.title("Claim Helper")
-        self.geometry("840x760")
-        self.minsize(800, 680)
-        self.configure(fg_color="#F5F5F7")  # Signature Apple off-white
+        self.geometry("860x780")
+        self.minsize(800, 700)
+        self.configure(fg_color=IVORY)  # Soft Ivory Bakery background
 
         # State Variables
         self.overview_path = ""
@@ -131,9 +149,42 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         self.setup_ui()
         self.setup_drag_and_drop()
+        self.apply_windows_titlebar_theme()
 
         # Check for remote updates silently in background
         threading.Thread(target=self.check_for_updates, daemon=True).start()
+
+    def apply_windows_titlebar_theme(self):
+        """Customizes Windows title bar color to match IVORY & ROAST theme."""
+        try:
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd:
+                hwnd = self.winfo_id()
+
+            # DWM attributes for Windows 10 (20H1+) and Windows 11
+            DWMWA_CAPTION_COLOR = 35
+            DWMWA_TEXT_COLOR = 36
+
+            # IVORY is #f7f2e8 -> BGR is 0x00E8F2F7
+            caption_color = ctypes.c_int(0x00E8F2F7)
+            # ROAST is #2b211c -> BGR is 0x001C212B
+            text_color = ctypes.c_int(0x001C212B)
+
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR,
+                ctypes.byref(caption_color),
+                ctypes.sizeof(caption_color)
+            )
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TEXT_COLOR,
+                ctypes.byref(text_color),
+                ctypes.sizeof(text_color)
+            )
+        except Exception:
+            pass
 
     def load_saved_state(self):
         """Loads persistent session state if available."""
@@ -183,53 +234,52 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                         if exe_url:
                             self.after(0, self.show_update_banner, latest_tag, exe_url)
         except Exception:
-            # Offline or GitHub rate limit - keep user experience uninterrupted
             pass
 
     def show_update_banner(self, latest_tag, exe_url):
-        self.update_banner_container.pack(fill="x", padx=32, pady=(0, 10))
+        self.update_banner_container.pack(fill="x", padx=32, pady=(0, 16))
         for child in self.update_banner_container.winfo_children():
             child.destroy()
 
         banner = ctk.CTkFrame(
             self.update_banner_container,
-            fg_color="#EBF3FE",
-            corner_radius=10,
+            fg_color=CARD,
+            corner_radius=14,
             border_width=1,
-            border_color="#C7DEFF"
+            border_color=LINE
         )
         banner.pack(fill="x")
 
         left = ctk.CTkFrame(banner, fg_color="transparent")
-        left.pack(side="left", padx=14, pady=10, fill="x", expand=True)
+        left.pack(side="left", padx=20, pady=12, fill="x", expand=True)
 
         ctk.CTkLabel(
             left,
-            text=f"🚀 Đã có phiên bản mới ({latest_tag})!",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            text_color="#0071E3"
+            text=f"✦ Đã có phiên bản mới ({latest_tag})",
+            font=ctk.CTkFont(family=FONT_SERIF, size=13, weight="bold"),
+            text_color=ROAST
         ).pack(anchor="w")
 
         ctk.CTkLabel(
             left,
-            text=f"Phiên bản hiện tại: {APP_VERSION}. Bấm cập nhật để nâng cấp tự động.",
-            font=ctk.CTkFont(family="Segoe UI", size=10),
-            text_color="#515154"
+            text=f"Phiên bản hiện tại: {APP_VERSION}. Nhấn để nâng cấp tự động.",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN
         ).pack(anchor="w", pady=(2, 0))
 
         btn_box = ctk.CTkFrame(banner, fg_color="transparent")
-        btn_box.pack(side="right", padx=14, pady=10)
+        btn_box.pack(side="right", padx=20, pady=12)
 
         self.btn_update = ctk.CTkButton(
             btn_box,
             text="Cập Nhật Ngay",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            fg_color="#0071E3",
-            hover_color="#0077ED",
-            text_color="#FFFFFF",
-            corner_radius=8,
-            width=120,
-            height=30,
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            fg_color=ROAST,
+            hover_color=MOSS,
+            text_color=IVORY,
+            corner_radius=16,
+            width=125,
+            height=32,
             command=lambda: self.start_download_update(exe_url, latest_tag)
         )
         self.btn_update.pack(side="right")
@@ -266,7 +316,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
             self.after(0, self.btn_update.configure, {"text": "Đang khởi động..."})
 
-            # Determine destination path
             is_frozen = getattr(sys, "frozen", False)
             if is_frozen:
                 current_exe = os.path.abspath(sys.executable)
@@ -295,9 +344,9 @@ exit
         messagebox.showerror("Cập nhật thất bại", f"Không thể tải bản cập nhật: {err}")
 
     def setup_ui(self):
-        # 1. Header Frame
+        # 1. Header Frame (Japanese Cafe aesthetic: airy, light, serif, brown tone)
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=32, pady=(16, 4))
+        header.pack(fill="x", padx=36, pady=(20, 12))
 
         title_row = ctk.CTkFrame(header, fg_color="transparent")
         title_row.pack(anchor="w")
@@ -305,70 +354,75 @@ exit
         title_lbl = ctk.CTkLabel(
             title_row,
             text="Claim Helper",
-            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
-            text_color="#1D1D1F"
+            font=ctk.CTkFont(family=FONT_SERIF, size=30, weight="normal"),
+            text_color=ROAST
         )
         title_lbl.pack(side="left")
 
-        ctk.CTkLabel(
+        # Pill badge with delicate line border
+        badge_lbl = ctk.CTkLabel(
             title_row,
             text=f"  {APP_VERSION}  ",
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-            fg_color="#EBF3FE",
-            text_color="#0071E3",
-            corner_radius=6
-        ).pack(side="left", padx=(10, 0), pady=(4, 0))
+            font=ctk.CTkFont(family=FONT_SANS, size=10),
+            fg_color="transparent",
+            text_color=BROWN,
+            corner_radius=10
+        )
+        badge_lbl.pack(side="left", padx=(12, 0), pady=(6, 0))
 
         sub_lbl = ctk.CTkLabel(
             header,
-            text="Hệ thống tự động đối chiếu & điền Purchase Cost cho SOFACOMPANY",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color="#86868B"
+            text="Hệ thống tự động đối chiếu & điền Purchase Cost cho Mrs. Nhung",
+            font=ctk.CTkFont(family=FONT_SANS, size=12),
+            text_color=BROWN
         )
-        sub_lbl.pack(anchor="w", pady=(2, 0))
+        sub_lbl.pack(anchor="w", pady=(3, 0))
 
-        # Dynamic Update Banner Container (only packed when an update exists)
+        # Dynamic Update Banner Container
         self.update_banner_container = ctk.CTkFrame(self, fg_color="transparent")
 
-        # 2. Main Scrollable Container
+        # 2. Main Scrollable Container (Generous whitespace)
         self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.main_scroll.pack(fill="both", expand=True, padx=32, pady=(6, 15))
+        self.main_scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
 
         # ========================================================
-        # CARD 1: Master Overview (Dedicated Drop & Clear Target)
+        # CARD 1: Master Overview (CARD background, 16px radius, LINE border)
         # ========================================================
         self.card_ov = ctk.CTkFrame(
             self.main_scroll,
-            fg_color="#FFFFFF",
-            corner_radius=14,
+            fg_color=CARD,
+            corner_radius=16,
             border_width=1,
-            border_color="#E5E5EA"
+            border_color=LINE
         )
-        self.card_ov.pack(fill="x", pady=(0, 14))
+        self.card_ov.pack(fill="x", pady=(0, 20))
 
         ov_top = ctk.CTkFrame(self.card_ov, fg_color="transparent")
-        ov_top.pack(fill="x", padx=18, pady=(14, 8))
+        ov_top.pack(fill="x", padx=24, pady=(18, 10))
 
         ctk.CTkLabel(
             ov_top,
-            text="📊  FILE MASTER OVERVIEW",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color="#0071E3"
+            text="FILE MASTER OVERVIEW",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
         ).pack(side="left")
 
         ov_btn_box = ctk.CTkFrame(ov_top, fg_color="transparent")
         ov_btn_box.pack(side="right")
 
+        # Pill button with LINE border
         self.btn_pick_ov = ctk.CTkButton(
             ov_btn_box,
             text="+ Chọn File Overview...",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            fg_color="#F2F2F7",
-            text_color="#0071E3",
-            hover_color="#E5E5EA",
-            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
             width=165,
-            height=26,
+            height=28,
             command=self.browse_overview
         )
         self.btn_pick_ov.pack(side="left", padx=4)
@@ -376,13 +430,15 @@ exit
         self.btn_refresh_cache = ctk.CTkButton(
             ov_btn_box,
             text="Đọc Lại Master",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
-            fg_color="#F2F2F7",
-            text_color="#1D1D1F",
-            hover_color="#E5E5EA",
-            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
             width=120,
-            height=26,
+            height=28,
             command=self.force_reload_master
         )
         self.btn_refresh_cache.pack(side="left", padx=4)
@@ -390,43 +446,53 @@ exit
         self.btn_clear_ov = ctk.CTkButton(
             ov_btn_box,
             text="Xóa File",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
             fg_color="transparent",
-            text_color="#FF3B30",
-            hover_color="#FFECEB",
-            corner_radius=8,
-            width=80,
-            height=26,
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
             command=self.clear_overview
         )
         self.btn_clear_ov.pack(side="left", padx=4)
 
-        # Container for Master file display or Drop hint
-        self.ov_display_container = ctk.CTkFrame(self.card_ov, fg_color="#F9F9FB", corner_radius=10)
-        self.ov_display_container.pack(fill="x", padx=16, pady=(0, 14))
+        # Hairline divider
+        ctk.CTkFrame(self.card_ov, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        # Drop Zone / Display container (SAND background, FAINT border, 12px radius)
+        self.ov_display_container = ctk.CTkFrame(
+            self.card_ov,
+            fg_color=SAND,
+            corner_radius=12,
+            border_width=1,
+            border_color=FAINT
+        )
+        self.ov_display_container.pack(fill="x", padx=24, pady=(0, 20))
 
         self.render_overview_display()
 
         # ========================================================
-        # CARD 2: Claim Versus Files (Multi-file select & Drop Target)
+        # CARD 2: Claim Versus Files (CARD background, 16px radius)
         # ========================================================
         self.card_claims = ctk.CTkFrame(
             self.main_scroll,
-            fg_color="#FFFFFF",
-            corner_radius=14,
+            fg_color=CARD,
+            corner_radius=16,
             border_width=1,
-            border_color="#E5E5EA"
+            border_color=LINE
         )
-        self.card_claims.pack(fill="x", pady=(0, 14))
+        self.card_claims.pack(fill="x", pady=(0, 20))
 
         claim_top = ctk.CTkFrame(self.card_claims, fg_color="transparent")
-        claim_top.pack(fill="x", padx=18, pady=(14, 8))
+        claim_top.pack(fill="x", padx=24, pady=(18, 10))
 
         self.claim_count_lbl = ctk.CTkLabel(
             claim_top,
-            text=f"📋  DANH SÁCH FILE CLAIM VERSUS ({len(self.claim_files)})",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color="#0071E3"
+            text=f"DANH SÁCH FILE CLAIM VERSUS ({len(self.claim_files)})",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
         )
         self.claim_count_lbl.pack(side="left")
 
@@ -436,122 +502,146 @@ exit
         ctk.CTkButton(
             actions_box,
             text="+ Chọn File(s)...",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            fg_color="#F2F2F7",
-            text_color="#0071E3",
-            hover_color="#E5E5EA",
-            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
             width=165,
-            height=26,
+            height=28,
             command=self.browse_claim_files
         ).pack(side="left", padx=4)
 
         ctk.CTkButton(
             actions_box,
             text="📂 Thư Mục...",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
-            fg_color="#F2F2F7",
-            text_color="#1D1D1F",
-            hover_color="#E5E5EA",
-            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
             width=120,
-            height=26,
+            height=28,
             command=self.browse_claim_folder
         ).pack(side="left", padx=4)
 
         ctk.CTkButton(
             actions_box,
             text="Xóa Hết",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
             fg_color="transparent",
-            text_color="#FF3B30",
-            hover_color="#FFECEB",
-            corner_radius=8,
-            width=80,
-            height=26,
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
             command=self.clear_all_claims
         ).pack(side="left", padx=4)
 
+        # Hairline divider
+        ctk.CTkFrame(self.card_claims, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
         # File List Inner Container
-        self.file_list_frame = ctk.CTkFrame(self.card_claims, fg_color="#F9F9FB", corner_radius=10)
-        self.file_list_frame.pack(fill="x", padx=16, pady=(0, 14))
+        self.file_list_frame = ctk.CTkFrame(
+            self.card_claims,
+            fg_color=SAND,
+            corner_radius=12,
+            border_width=1,
+            border_color=FAINT
+        )
+        self.file_list_frame.pack(fill="x", padx=24, pady=(0, 20))
 
         self.render_file_list()
 
         # ========================================================
-        # ACTION: Start Processing Button & Progress Bar
+        # ACTION: Start Processing Button (Pill 48px, ROAST, hover MOSS)
         # ========================================================
         act_box = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
-        act_box.pack(fill="x", pady=(4, 12))
+        act_box.pack(fill="x", pady=(4, 14))
 
         self.btn_run = ctk.CTkButton(
             act_box,
             text="Bắt Đầu Đối Chiếu & Điền Giá (Tạo File _filled)",
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
-            fg_color="#0071E3",
-            hover_color="#0077ED",
-            text_color="#FFFFFF",
-            corner_radius=22,
-            height=46,
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            fg_color=ROAST,
+            hover_color=MOSS,
+            text_color=IVORY,
+            corner_radius=24,
+            height=48,
             command=self.start_processing
         )
         self.btn_run.pack(fill="x")
 
+        # Progress Bar (3px high, LINE track, MOSS fill)
         self.prog_bar = ctk.CTkProgressBar(
             self.main_scroll,
-            progress_color="#0071E3",
-            fg_color="#E5E5EA",
-            height=4,
+            progress_color=MOSS,
+            fg_color=LINE,
+            height=3,
             corner_radius=2
         )
         self.prog_bar.set(0)
-        self.prog_bar.pack(fill="x", pady=(0, 12))
+        self.prog_bar.pack(fill="x", pady=(0, 20))
 
         # ========================================================
-        # CARD 3: Apple-Style Live Activity & Results Card
+        # CARD 3: Activity & Results Card
         # ========================================================
         self.card_results = ctk.CTkFrame(
             self.main_scroll,
-            fg_color="#FFFFFF",
-            corner_radius=14,
+            fg_color=CARD,
+            corner_radius=16,
             border_width=1,
-            border_color="#E5E5EA"
+            border_color=LINE
         )
-        self.card_results.pack(fill="both", expand=True, pady=(0, 6))
+        self.card_results.pack(fill="both", expand=True, pady=(0, 8))
 
         results_head = ctk.CTkFrame(self.card_results, fg_color="transparent")
-        results_head.pack(fill="x", padx=18, pady=(14, 8))
+        results_head.pack(fill="x", padx=24, pady=(18, 10))
 
         ctk.CTkLabel(
             results_head,
-            text="⚡  TIẾN ĐỘ & KẾT QUẢ",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color="#0071E3"
+            text="TIẾN ĐỘ & KẾT QUẢ",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
         ).pack(side="left")
 
         self.status_badge = ctk.CTkLabel(
             results_head,
             text="Sẵn sàng",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
-            text_color="#86868B"
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN
         )
         self.status_badge.pack(side="right")
 
+        # Hairline divider
+        ctk.CTkFrame(self.card_results, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
         # Container for concise result items
-        self.results_feed = ctk.CTkFrame(self.card_results, fg_color="#F9F9FB", corner_radius=10)
-        self.results_feed.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        self.results_feed = ctk.CTkFrame(
+            self.card_results,
+            fg_color=SAND,
+            corner_radius=12,
+            border_width=1,
+            border_color=FAINT
+        )
+        self.results_feed.pack(fill="both", expand=True, padx=24, pady=(0, 20))
 
         self.render_initial_feed()
 
-        # 3. Bottom Footer
+        # 3. Bottom Footer (Serif italic, FAINT)
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.pack(fill="x", padx=32, pady=(0, 10))
+        footer.pack(fill="x", padx=36, pady=(0, 14))
 
         ctk.CTkLabel(
             footer,
             text="Powered by Quoc Hung",
-            font=ctk.CTkFont(family="Segoe UI", size=10),
-            text_color="#A1A1A6"
+            font=ctk.CTkFont(family=FONT_SERIF, size=11, slant="italic"),
+            text_color=FAINT
         ).pack(side="left")
 
     # ----------------------------------------------------
@@ -564,9 +654,9 @@ exit
         hint = ctk.CTkLabel(
             self.results_feed,
             text="Kết quả sẽ hiển thị tại đây.",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color="#86868B",
-            pady=20
+            font=ctk.CTkFont(family=FONT_SANS, size=12),
+            text_color=BROWN,
+            pady=24
         )
         hint.pack(fill="both", expand=True)
 
@@ -575,8 +665,8 @@ exit
             child.destroy()
 
         if self.overview_path and os.path.exists(self.overview_path):
-            self.btn_refresh_cache.configure(state="normal", text_color="#1D1D1F")
-            self.btn_clear_ov.configure(state="normal", text_color="#FF3B30")
+            self.btn_refresh_cache.configure(state="normal", text_color=ROAST, border_color=LINE)
+            self.btn_clear_ov.configure(state="normal", text_color=DANGER)
             size_str = format_file_size(os.path.getsize(self.overview_path))
             
             # Check cache status
@@ -592,14 +682,15 @@ exit
                 except Exception:
                     pass
 
-            row = ctk.CTkFrame(self.ov_display_container, fg_color="#FFFFFF", corner_radius=8)
-            row.pack(fill="x", padx=8, pady=8)
+            row = ctk.CTkFrame(self.ov_display_container, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+            row.pack(fill="x", padx=10, pady=10)
 
             ctk.CTkLabel(
                 row,
                 text="📊",
-                font=ctk.CTkFont(size=14)
-            ).pack(side="left", padx=(10, 8), pady=8)
+                font=ctk.CTkFont(size=14),
+                text_color=CARAMEL
+            ).pack(side="left", padx=(12, 8), pady=8)
 
             info_box = ctk.CTkFrame(row, fg_color="transparent")
             info_box.pack(side="left", fill="x", expand=True, pady=6)
@@ -610,25 +701,25 @@ exit
             ctk.CTkLabel(
                 title_row,
                 text=os.path.basename(self.overview_path),
-                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-                text_color="#1D1D1F"
+                font=ctk.CTkFont(family=FONT_SERIF, size=12, weight="bold"),
+                text_color=ROAST
             ).pack(side="left")
 
             if has_cache:
                 ctk.CTkLabel(
                     title_row,
                     text="  ✓ ĐÃ GHI NHỚ  ",
-                    font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
-                    fg_color="#EBF8F2",
-                    text_color="#16A34A",
-                    corner_radius=4
+                    font=ctk.CTkFont(family=FONT_SANS, size=9, weight="bold"),
+                    fg_color=MOSS_SOFT,
+                    text_color=MOSS,
+                    corner_radius=6
                 ).pack(side="left", padx=(8, 0))
 
             ctk.CTkLabel(
                 info_box,
                 text=f"{self.overview_path}  •  {size_str}",
-                font=ctk.CTkFont(family="Segoe UI", size=10),
-                text_color="#86868B",
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN,
                 anchor="w"
             ).pack(anchor="w", pady=(2, 0))
 
@@ -638,22 +729,23 @@ exit
                 text="✕",
                 font=ctk.CTkFont(size=11, weight="bold"),
                 fg_color="transparent",
-                text_color="#86868B",
-                hover_color="#FFECEB",
-                corner_radius=6,
+                text_color=BROWN,
+                hover_color=SAND,
+                border_width=0,
+                corner_radius=12,
                 width=24,
                 height=24,
                 command=self.clear_overview
-            ).pack(side="right", padx=(4, 10), pady=8)
+            ).pack(side="right", padx=(4, 12), pady=8)
         else:
-            self.btn_refresh_cache.configure(state="disabled", text_color="#C7C7CC")
-            self.btn_clear_ov.configure(state="disabled", text_color="#C7C7CC")
+            self.btn_refresh_cache.configure(state="disabled", text_color=FAINT, border_color=LINE)
+            self.btn_clear_ov.configure(state="disabled", text_color=FAINT)
             drop_hint = ctk.CTkLabel(
                 self.ov_display_container,
-                text="📥  Kéo thả file Master Overview (.xlsx) vào đây\nhoặc bấm nút 'Chọn File Overview...' ở góc trên",
-                font=ctk.CTkFont(family="Segoe UI", size=12),
-                text_color="#86868B",
-                pady=18
+                text="📥  Kéo thả file Master Overview vào đây",
+                font=ctk.CTkFont(family=FONT_SANS, size=12),
+                text_color=BROWN,
+                pady=20
             )
             drop_hint.pack(fill="both", expand=True)
 
@@ -669,36 +761,37 @@ exit
         if not self.claim_files:
             empty_lbl = ctk.CTkLabel(
                 self.file_list_frame,
-                text="📥  Kéo thả một hoặc nhiều file Claim Versus (.xlsx) vào đây\nhoặc bấm nút '+ Chọn File(s)...' ở góc trên",
-                font=ctk.CTkFont(family="Segoe UI", size=12),
-                text_color="#86868B",
-                pady=22
+                text="📥  Kéo thả file Claim Versus vào đây",
+                font=ctk.CTkFont(family=FONT_SANS, size=12),
+                text_color=BROWN,
+                pady=24
             )
             empty_lbl.pack(fill="both", expand=True)
-            self.claim_count_lbl.configure(text="📋  DANH SÁCH FILE CLAIM VERSUS (0)")
+            self.claim_count_lbl.configure(text="DANH SÁCH FILE CLAIM VERSUS (0)")
             return
 
-        self.claim_count_lbl.configure(text=f"📋  DANH SÁCH FILE CLAIM VERSUS ({len(self.claim_files)})")
+        self.claim_count_lbl.configure(text=f"DANH SÁCH FILE CLAIM VERSUS ({len(self.claim_files)})")
 
         for idx, fpath in enumerate(self.claim_files):
             fname = os.path.basename(fpath)
             is_casa = "casa" in fname.lower()
             tag_text = "Casa (CS)" if is_casa else "Nhan Hoang (NH)"
-            tag_color = "#EBF3FE" if is_casa else "#EBF8F2"
-            tag_text_color = "#0071E3" if is_casa else "#16A34A"
+            tag_color = SAND
+            tag_text_color = BROWN
 
             base, ext = os.path.splitext(fname)
             out_preview = f"{base}_filled{ext}" if not base.endswith("_filled") else fname
 
-            row = ctk.CTkFrame(self.file_list_frame, fg_color="#FFFFFF", corner_radius=8)
-            row.pack(fill="x", padx=8, pady=4)
+            row = ctk.CTkFrame(self.file_list_frame, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+            row.pack(fill="x", padx=10, pady=4)
 
             # Icon & Name
             ctk.CTkLabel(
                 row,
                 text="📄",
-                font=ctk.CTkFont(size=13)
-            ).pack(side="left", padx=(10, 6), pady=6)
+                font=ctk.CTkFont(size=13),
+                text_color=CARAMEL
+            ).pack(side="left", padx=(12, 6), pady=6)
 
             info = ctk.CTkFrame(row, fg_color="transparent")
             info.pack(side="left", fill="x", expand=True, pady=4)
@@ -706,27 +799,27 @@ exit
             ctk.CTkLabel(
                 info,
                 text=fname,
-                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-                text_color="#1D1D1F",
+                font=ctk.CTkFont(family=FONT_SERIF, size=12, weight="bold"),
+                text_color=ROAST,
                 anchor="w"
             ).pack(anchor="w")
 
             ctk.CTkLabel(
                 info,
                 text=f"↳ File xuất sẽ tạo: {out_preview}",
-                font=ctk.CTkFont(family="Segoe UI", size=10),
-                text_color="#86868B",
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN,
                 anchor="w"
             ).pack(anchor="w")
 
-            # Badge
+            # Pill Badge
             badge = ctk.CTkLabel(
                 row,
                 text=f"  {tag_text}  ",
-                font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
                 fg_color=tag_color,
                 text_color=tag_text_color,
-                corner_radius=6
+                corner_radius=10
             )
             badge.pack(side="left", padx=8, pady=6)
 
@@ -736,14 +829,15 @@ exit
                 text="✕",
                 font=ctk.CTkFont(size=11, weight="bold"),
                 fg_color="transparent",
-                text_color="#86868B",
-                hover_color="#FFECEB",
-                corner_radius=6,
+                text_color=DANGER,
+                hover_color=SAND,
+                border_width=0,
+                corner_radius=12,
                 width=24,
                 height=24,
                 command=lambda p=fpath: self.remove_claim_file(p)
             )
-            del_btn.pack(side="right", padx=(4, 8), pady=6)
+            del_btn.pack(side="right", padx=(4, 10), pady=6)
 
     def remove_claim_file(self, fpath):
         if fpath in self.claim_files:
@@ -774,21 +868,37 @@ exit
         try:
             self.card_ov.dnd_bind('<<Drop>>', self.on_drop_overview)
             self.ov_display_container.dnd_bind('<<Drop>>', self.on_drop_overview)
-            self.card_ov.dnd_bind('<<DropEnter>>', lambda e: self.card_ov.configure(border_color="#0071E3", fg_color="#F0F8FF"))
-            self.card_ov.dnd_bind('<<DropLeave>>', lambda e: self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF"))
+
+            def on_ov_enter(e):
+                self.ov_display_container.configure(border_color=MOSS, fg_color=MOSS_SOFT)
+            def on_ov_leave(e):
+                self.ov_display_container.configure(border_color=FAINT, fg_color=SAND)
+
+            self.card_ov.dnd_bind('<<DropEnter>>', on_ov_enter)
+            self.ov_display_container.dnd_bind('<<DropEnter>>', on_ov_enter)
+            self.card_ov.dnd_bind('<<DropLeave>>', on_ov_leave)
+            self.ov_display_container.dnd_bind('<<DropLeave>>', on_ov_leave)
         except Exception:
             pass
 
         try:
             self.card_claims.dnd_bind('<<Drop>>', self.on_drop_claims)
             self.file_list_frame.dnd_bind('<<Drop>>', self.on_drop_claims)
-            self.card_claims.dnd_bind('<<DropEnter>>', lambda e: self.card_claims.configure(border_color="#0071E3", fg_color="#F0F8FF"))
-            self.card_claims.dnd_bind('<<DropLeave>>', lambda e: self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF"))
+
+            def on_cl_enter(e):
+                self.file_list_frame.configure(border_color=MOSS, fg_color=MOSS_SOFT)
+            def on_cl_leave(e):
+                self.file_list_frame.configure(border_color=FAINT, fg_color=SAND)
+
+            self.card_claims.dnd_bind('<<DropEnter>>', on_cl_enter)
+            self.file_list_frame.dnd_bind('<<DropEnter>>', on_cl_enter)
+            self.card_claims.dnd_bind('<<DropLeave>>', on_cl_leave)
+            self.file_list_frame.dnd_bind('<<DropLeave>>', on_cl_leave)
         except Exception:
             pass
 
     def on_drop_overview(self, event):
-        self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
+        self.ov_display_container.configure(border_color=FAINT, fg_color=SAND)
         paths = parse_drop_paths(event.data)
         for p in paths:
             if os.path.isfile(p) and p.endswith(".xlsx"):
@@ -798,13 +908,13 @@ exit
                 return
 
     def on_drop_claims(self, event):
-        self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
+        self.file_list_frame.configure(border_color=FAINT, fg_color=SAND)
         paths = parse_drop_paths(event.data)
         self.add_claim_paths(paths)
 
     def on_drop_generic(self, event):
-        self.card_ov.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
-        self.card_claims.configure(border_color="#E5E5EA", fg_color="#FFFFFF")
+        self.ov_display_container.configure(border_color=FAINT, fg_color=SAND)
+        self.file_list_frame.configure(border_color=FAINT, fg_color=SAND)
         paths = parse_drop_paths(event.data)
         if not paths:
             return
@@ -896,49 +1006,54 @@ exit
             os.startfile(os.path.abspath(os.path.dirname(__file__)))
 
     # ----------------------------------------------------
-    # Thread-Safe Apple Results Feed Updates
+    # Thread-Safe Results Feed Updates
     # ----------------------------------------------------
     def append_feed_item(self, filename, matched, total, rate_str, full_fpath=None):
-        row = ctk.CTkFrame(self.results_feed, fg_color="#FFFFFF", corner_radius=8)
-        row.pack(fill="x", padx=8, pady=3)
+        row = ctk.CTkFrame(self.results_feed, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+        row.pack(fill="x", padx=10, pady=3)
 
         ctk.CTkLabel(
             row,
             text="✓",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            text_color="#16A34A"
-        ).pack(side="left", padx=(10, 8), pady=6)
+            font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+            text_color=MOSS
+        ).pack(side="left", padx=(12, 8), pady=6)
 
         ctk.CTkLabel(
             row,
             text=filename,
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            text_color="#1D1D1F"
+            font=ctk.CTkFont(family=FONT_SERIF, size=12, weight="bold"),
+            text_color=ROAST
         ).pack(side="left", pady=6)
 
         ctk.CTkLabel(
             row,
             text=f"•  Khớp {matched}/{total} dòng ({rate_str})",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
-            text_color="#86868B"
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN
         ).pack(side="left", padx=8, pady=6)
 
         if full_fpath and os.path.exists(full_fpath):
             ctk.CTkButton(
                 row,
                 text="📂 Xem",
-                font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-                fg_color="#F2F2F7",
-                hover_color="#E5E5EA",
-                text_color="#0071E3",
-                corner_radius=6,
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                fg_color="transparent",
+                hover_color=SAND,
+                border_width=1,
+                border_color=LINE,
+                text_color=ROAST,
+                corner_radius=12,
                 width=52,
-                height=22,
+                height=24,
                 command=lambda p=full_fpath: reveal_in_explorer(p)
-            ).pack(side="right", padx=(4, 8), pady=6)
+            ).pack(side="right", padx=(4, 10), pady=6)
 
-    def set_status_text(self, text, color="#86868B"):
-        self.status_badge.configure(text=text, text_color=color)
+    def set_status_text(self, text, color=BROWN, bg_color=None):
+        if bg_color:
+            self.status_badge.configure(text=f"  {text}  ", text_color=color, fg_color=bg_color, corner_radius=10)
+        else:
+            self.status_badge.configure(text=text, text_color=color, fg_color="transparent")
 
     # ----------------------------------------------------
     # Core Engine Processing (Thread-Safe & Lag-Free)
@@ -951,9 +1066,9 @@ exit
             messagebox.showerror("Thiếu thông tin", "Danh sách file Claim đang trống. Vui lòng chọn hoặc kéo thả ít nhất 1 file Claim Versus!")
             return
 
-        self.btn_run.configure(state="disabled", text="Đang xử lý dữ liệu...")
+        self.btn_run.configure(state="disabled", fg_color=FAINT, text="Đang xử lý dữ liệu...")
         self.prog_bar.set(0.05)
-        self.set_status_text("● Đang xử lý...", "#0071E3")
+        self.set_status_text("● Đang xử lý...", MOSS)
         self.last_created_files = []
 
         # Clear feed
@@ -990,7 +1105,7 @@ exit
                     pass
 
             if not loaded_from_cache:
-                self.after(0, self.set_status_text, "● Đang đọc file Master...", "#0071E3")
+                self.after(0, self.set_status_text, "● Đang đọc file Master...", MOSS)
                 wb_o = openpyxl.load_workbook(self.overview_path, read_only=True, data_only=True)
                 s_o = wb_o['Overview'] if 'Overview' in wb_o.sheetnames else wb_o.active
                 headers_o = next(s_o.iter_rows(max_row=1, values_only=True))
@@ -1219,10 +1334,10 @@ exit
 
     def finish_processing_apple(self, success, total_files, created_files, err_msg=""):
         self.prog_bar.set(1.0 if success else 0)
-        self.btn_run.configure(state="normal", text="Bắt Đầu Đối Chiếu & Điền Giá (Tạo File _filled)")
+        self.btn_run.configure(state="normal", fg_color=ROAST, text="Bắt Đầu Đối Chiếu & Điền Giá (Tạo File _filled)")
 
         if success:
-            self.set_status_text("✓ Hoàn tất", "#16A34A")
+            self.set_status_text("✓ Hoàn tất", MOSS, MOSS_SOFT)
 
             # Determine subtitle message with full path
             if len(created_files) == 1:
@@ -1233,25 +1348,25 @@ exit
                 sub_text = f"Đã tạo {len(created_files)} file:\n" + "\n".join(lines)
                 target_file_to_reveal = created_files[0] if created_files else ""
 
-            # Render completion banner smoothly without blocking modal
-            banner = ctk.CTkFrame(self.results_feed, fg_color="#EBF8F2", corner_radius=10)
-            banner.pack(fill="x", padx=8, pady=(8, 4))
+            # Render completion banner
+            banner = ctk.CTkFrame(self.results_feed, fg_color=MOSS_SOFT, corner_radius=12, border_width=1, border_color=MOSS)
+            banner.pack(fill="x", padx=10, pady=(8, 4))
 
             b_left = ctk.CTkFrame(banner, fg_color="transparent")
-            b_left.pack(side="left", fill="x", expand=True, padx=14, pady=12)
+            b_left.pack(side="left", fill="x", expand=True, padx=16, pady=12)
 
             ctk.CTkLabel(
                 b_left,
-                text=f"🎉 Hoàn tất xuất sắc {total_files} file kết quả!",
-                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-                text_color="#16A34A"
+                text=f"🎉 Hoàn tất đối chiếu {total_files} file thành công!",
+                font=ctk.CTkFont(family=FONT_SERIF, size=13, weight="bold"),
+                text_color=ROAST
             ).pack(anchor="w")
 
             ctk.CTkLabel(
                 b_left,
                 text=sub_text,
-                font=ctk.CTkFont(family="Segoe UI", size=11),
-                text_color="#1F2937",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=BROWN,
                 wraplength=520,
                 justify="left"
             ).pack(anchor="w", pady=(3, 0))
@@ -1259,25 +1374,25 @@ exit
             ctk.CTkButton(
                 banner,
                 text="📂 Xem File",
-                font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                fg_color="#16A34A",
-                text_color="#FFFFFF",
-                hover_color="#15803D",
-                corner_radius=8,
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                fg_color=ROAST,
+                text_color=IVORY,
+                hover_color=MOSS,
+                corner_radius=16,
                 height=32,
                 command=lambda p=target_file_to_reveal: reveal_in_explorer(p)
-            ).pack(side="right", padx=14, pady=12)
+            ).pack(side="right", padx=16, pady=12)
 
         else:
-            self.set_status_text("❌ Lỗi", "#FF3B30")
-            err_box = ctk.CTkFrame(self.results_feed, fg_color="#FFECEB", corner_radius=8)
-            err_box.pack(fill="x", padx=8, pady=6)
+            self.set_status_text("❌ Lỗi", DANGER)
+            err_box = ctk.CTkFrame(self.results_feed, fg_color=CARD, corner_radius=10, border_width=1, border_color=DANGER)
+            err_box.pack(fill="x", padx=10, pady=6)
             ctk.CTkLabel(
                 err_box,
                 text=f"Đã xảy ra lỗi: {err_msg}",
-                font=ctk.CTkFont(family="Segoe UI", size=11),
-                text_color="#FF3B30"
-            ).pack(padx=10, pady=8)
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=DANGER
+            ).pack(padx=12, pady=10)
 
 if __name__ == "__main__":
     app = ClaimHelperAppleApp()
