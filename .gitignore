@@ -10,6 +10,7 @@ ENV/
 build/
 dist/
 *.spec
+*.pkl
 
 # Corporate & Internal Data Files (Bảo mật: Không đẩy dữ liệu công ty lên GitHub)
 *.xlsx
