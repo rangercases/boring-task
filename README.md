@@ -20,6 +20,34 @@ Tự động đối chiếu và điền **Purchase Cost** từ file Master Overv
 - **Xử lý ngầm đa luồng**:
   - Tốc độ đọc ghi nhanh, không đơ lag cửa sổ ngay cả với file Excel dữ liệu lớn (~40MB).
 
+### 2. 🖼️ Image Inserter (Place in Cell)
+Công cụ tự động hóa chèn ảnh khiếu nại chất lượng sản phẩm trực tiếp vào ô tính Microsoft Excel chuẩn **Place in Cell** (SOFACOMPANY):
+- **Tự động nhận diện & Quét ảnh**: Quét các cột link ảnh chuẩn (`Comp. Pic. 1`, `Pic 2`... `Pic 5`).
+- **Tải & Nén ảnh HD 16 luồng song song**: Tải siêu tốc từ server Châu Âu, nén chuẩn HD lưu vào thư mục Cache cục bộ.
+- **Nhúng Excel COM nội tại ô (Place in Cell)**: Tự động điều chỉnh kích thước dòng/cột tương thích, mở file kết quả ngay sau khi hoàn thành.
+- **Kéo & Thả (Drag & Drop)**: Hỗ trợ kéo thả trực tiếp file Excel `.xlsx`, `.xlsm`, `.xls`.
+
+---
+
+## ⚙️ Cấu Hình Phân Quyền Hiển Thị (`config.json`)
+
+Toàn bộ ứng dụng dùng **chung 1 mã nguồn duy nhất**, nhưng giao diện Home sẽ tự động thích ứng hiển thị đúng module theo nhu cầu công việc của từng người máy:
+
+Tạo file `config.json` trong thư mục app (file này nằm trong `.gitignore`, không bao giờ bị ghi đè khi cập nhật):
+- **Bản của Bạn (Admin - Hiện tất cả):**
+  ```json
+  { "mode": "all" }
+  ```
+- **Bản gửi cho Chị A (Chỉ làm Claim Cost):**
+  ```json
+  { "mode": "cost" }
+  ```
+- **Bản gửi cho Chị B (Chỉ làm Chèn Ảnh):**
+  ```json
+  { "mode": "images" }
+  ```
+*(Nếu không có file `config.json`, ứng dụng mặc định hiển thị đầy đủ cả 2 phân hệ).*
+
 ---
 
 ## 🚀 Hướng Dẫn Cài Đặt & Sử Dụng (Dành Cho Máy Công Ty)
@@ -27,14 +55,14 @@ Tự động đối chiếu và điền **Purchase Cost** từ file Master Overv
 ### Cách 1: Cài đặt 1-Click (Khuyên Dùng - Tránh Antivirus Chặn)
 Vì một số phần mềm diệt virus trong môi trường doanh nghiệp thường tự ý xóa/cách ly các file `.exe` lạ, giải pháp chạy trực tiếp qua môi trường Python chính thức là an toàn và ổn định nhất:
 
-1. Tải thư mục này về máy đồng nghiệp.
+1. Copy/gửi thư mục app sang máy đồng nghiệp (có sẵn `config.json` theo đúng quyền nếu muốn).
 2. Nhấp đúp chuột vào file:
    ```text
    Cai_Dat_Boring_Task.bat
    ```
 3. File cài đặt sẽ:
-   - Tự động kiểm tra môi trường Python (hướng dẫn tải nếu chưa có).
-   - Tự động cài đặt các thư viện cần thiết (`openpyxl`, `Pillow`...).
+   - Tự động kiểm tra môi trường Python.
+   - Tự động cài đặt thư viện cần thiết (`openpyxl`, `Pillow`, `pywin32`, `tkinterdnd2`...).
    - Tạo biểu tượng lối tắt **Boring Task** ngoài màn hình Desktop với icon ứng dụng chuẩn.
    - Khởi chạy app ngay lập tức (chạy ngầm không hiện cửa sổ đen CMD).
 
@@ -52,11 +80,12 @@ Nếu máy người dùng được phép chạy file `.exe`:
 ## 📁 Cấu Trúc Thư Mục
 
 ```text
-├── boring_task.pyw           # Ứng dụng chính (Giao diện Apple Home & Purchase Cost Auto-Filled)
+├── boring_task.pyw           # Ứng dụng chính (Giao diện Apple Home & 2 Phân hệ tích hợp)
 ├── Cai_Dat_Boring_Task.bat   # Bộ cài đặt 1-click tạo Shortcut Desktop cho đồng nghiệp
 ├── build_exe.bat             # Script đóng gói thành BoringTask.exe
-├── requirements.txt          # Danh sách thư viện phụ thuộc (openpyxl, Pillow, pyinstaller)
+├── requirements.txt          # Danh sách thư viện phụ thuộc
+├── config.json               # Cấu hình phân quyền hiển thị (local, git-ignored)
 ├── assets/                   # Icon và tài nguyên đồ họa của ứng dụng
-├── .gitignore                # Bảo mật dữ liệu nội bộ, loại trừ các file Excel (.xlsx)
+├── .gitignore                # Bảo mật dữ liệu nội bộ & cấu hình cá nhân
 └── README.md                 # Tài liệu hướng dẫn sử dụng
 ```

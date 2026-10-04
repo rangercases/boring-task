@@ -12,6 +12,10 @@ import time
 from copy import copy
 import ctypes
 import zipfile
+import shutil
+import hashlib
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -29,10 +33,21 @@ except Exception:
 # Set Light Mode
 ctk.set_appearance_mode("Light")
 
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
 GITHUB_REPO = "rangercases/claim-helper"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
+
+# Per-machine module visibility (NOT tracked by git, never overwritten by updater)
+# {"mode": "all"} | {"mode": "cost"} | {"mode": "images"}
+CONFIG_FILE_NAME = "config.json"
+APP_MODES = ("all", "cost", "images")
+
+# Image Inserter module
+IMAGE_CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "BoringTask", "ImageCache")
+IMG_LINK_COLUMNS = ("Comp. Pic. 1", "Pic 2", "Pic 3", "Pic 4", "Pic 5")
+IMG_EXTENSIONS = (".xlsx", ".xlsm", ".xls")
+IMG_BTN_TEXT = "Bắt Đầu Chèn Ảnh (Place in Cell)"
 
 # ----------------------------------------------------
 # THEME: "Soft Ivory Bakery" (Japanese Cafe Style)
@@ -134,6 +149,57 @@ def validate_excel_file(filepath):
     except Exception as e:
         raise ValueError(f"Không thể đọc file '{fname}': {e}")
 
+def get_config_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE_NAME)
+
+def load_app_mode():
+    """Reads which modules this machine may see. Missing/invalid config -> 'all'."""
+    try:
+        with open(get_config_path(), "r", encoding="utf-8") as f:
+            mode = str(json.load(f).get("mode", "all")).strip().lower()
+        return mode if mode in APP_MODES else "all"
+    except Exception:
+        return "all"
+
+def img_url_to_unc(url):
+    """Converts a file:// link stored in Excel into a Windows UNC path."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    if url.startswith('file://'):
+        url = url[7:]
+    elif url.startswith('file:'):
+        url = url[5:]
+    url = urllib.parse.unquote(url)
+    return '\\\\' + url.replace('/', '\\').lstrip('\\')
+
+def img_thumb_path(unc_path):
+    h = hashlib.md5(unc_path.lower().encode('utf-8')).hexdigest()
+    return os.path.join(IMAGE_CACHE_DIR, f"{h}.jpg")
+
+def img_prepare_thumb(unc_path):
+    """Downloads + compresses one image to the local cache. Returns True if ready."""
+    target = img_thumb_path(unc_path)
+    if os.path.exists(target) and os.path.getsize(target) > 0:
+        return True
+    try:
+        if not os.path.exists(unc_path):
+            return False
+        with Image.open(unc_path) as img:
+            img.thumbnail((800, 800), Image.Resampling.LANCZOS)
+            if img.mode in ('RGBA', 'P', 'LA'):
+                img = img.convert('RGB')
+            img.save(target, 'JPEG', quality=88)
+        return True
+    except Exception:
+        return False
+
+def com_rows(value):
+    """Normalizes Excel Range.Value (scalar or tuple-of-tuples) to tuple-of-tuples."""
+    if isinstance(value, tuple):
+        return value
+    return ((value,),)
+
 class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
@@ -153,9 +219,16 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 pass
 
         # State Variables
+        self.app_mode = load_app_mode()
+        self.current_view = None
         self.overview_path = ""
         self.claim_files = [] # list of absolute paths
         self.last_created_files = [] # list of created output files
+
+        # Image Inserter state
+        self.img_file = ""
+        self.img_running = False
+        self.img_active_step = -1
 
         curr_dir = os.path.abspath(os.path.dirname(__file__))
         saved_state = self.load_saved_state()
@@ -342,6 +415,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         self.home_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.claim_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.image_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
 
         self.build_home()
         self.build_feature_nav(self.claim_view, "Purchase Cost Auto-Filled")
@@ -609,6 +683,9 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             text_color=FAINT
         ).pack(side="left")
 
+        if self.app_mode in ("all", "images"):
+            self.build_image_inserter()
+
         self.show_home()
 
     # ----------------------------------------------------
@@ -628,15 +705,22 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         grid = ctk.CTkFrame(wrap, fg_color="transparent")
         grid.pack(anchor="w")
 
-        # To add a new feature: append one entry here.
-        features = [
-            {
+        # To add a new feature: append one entry here (gated by config.json mode).
+        features = []
+        if self.app_mode in ("all", "cost"):
+            features.append({
                 "icon": "📋",
                 "title": "Purchase Cost",
                 "subtitle": "Auto-Filled",
                 "command": lambda: self.show_feature(self.claim_view, "Purchase Cost Auto-Filled"),
-            },
-        ]
+            })
+        if self.app_mode in ("all", "images"):
+            features.append({
+                "icon": "🖼️",
+                "title": "Image Inserter",
+                "subtitle": "Place in Cell",
+                "command": lambda: self.show_feature(self.image_view, "Image Inserter"),
+            })
 
         cols = 3
         for i, f in enumerate(features):
@@ -764,12 +848,15 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def show_home(self):
         self.claim_view.pack_forget()
+        self.image_view.pack_forget()
         self.home_view.pack(fill="both", expand=True)
+        self.current_view = self.home_view
         self.title("Boring Task")
 
     def show_feature(self, view, title):
         self.home_view.pack_forget()
         view.pack(fill="both", expand=True)
+        self.current_view = view
         self.title(f"Boring Task — {title}")
 
     # ----------------------------------------------------
@@ -1025,6 +1112,22 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         except Exception:
             pass
 
+        # Image Inserter drop zone
+        if hasattr(self, "img_drop_zone"):
+            def on_img_enter(e):
+                self.img_drop_zone.configure(border_color=MOSS, fg_color=MOSS_SOFT)
+            def on_img_leave(e):
+                self.img_drop_zone.configure(border_color=FAINT, fg_color=SAND)
+
+            for t in (self.img_card, self.img_drop_zone):
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', self.on_drop_image)
+                    t.dnd_bind('<<DropEnter>>', on_img_enter)
+                    t.dnd_bind('<<DropLeave>>', on_img_leave)
+                except Exception:
+                    pass
+
     def on_drop_overview(self, event):
         self.ov_display_container.configure(border_color=FAINT, fg_color=SAND)
         paths = parse_drop_paths(event.data)
@@ -1041,6 +1144,11 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.add_claim_paths(paths)
 
     def on_drop_generic(self, event):
+        # Route window-level drops to whichever module is on screen
+        if self.current_view is self.image_view:
+            return self.on_drop_image(event)
+        if self.current_view is not self.claim_view:
+            return
         self.ov_display_container.configure(border_color=FAINT, fg_color=SAND)
         self.file_list_frame.configure(border_color=FAINT, fg_color=SAND)
         paths = parse_drop_paths(event.data)
@@ -1590,6 +1698,521 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 height=32,
                 command=lambda p=target_file_to_reveal: reveal_in_explorer(p)
             ).pack(side="right", padx=16, pady=12)
+
+    # ====================================================
+    # MODULE: Image Inserter / Place in Cell
+    # ====================================================
+    def build_image_inserter(self):
+        self.build_feature_nav(self.image_view, "Image Inserter")
+
+        scroll = ctk.CTkScrollableFrame(self.image_view, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
+
+        # ---------- CARD 1: Excel file ----------
+        self.img_card = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.img_card.pack(fill="x", pady=(0, 20))
+
+        top = ctk.CTkFrame(self.img_card, fg_color="transparent")
+        top.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top,
+            text="FILE EXCEL CẦN CHÈN ẢNH",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_box = ctk.CTkFrame(top, fg_color="transparent")
+        btn_box.pack(side="right")
+
+        self.img_btn_pick = ctk.CTkButton(
+            btn_box,
+            text="+ Chọn File Excel...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=150,
+            height=28,
+            command=self.img_browse_file
+        )
+        self.img_btn_pick.pack(side="left", padx=4)
+
+        self.img_btn_clear = ctk.CTkButton(
+            btn_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
+            command=self.img_clear_file
+        )
+        self.img_btn_clear.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.img_card, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.img_drop_zone = ctk.CTkFrame(
+            self.img_card, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.img_drop_zone.pack(fill="x", padx=24, pady=(0, 20))
+        self.img_render_file()
+
+        # ---------- ACTION ----------
+        act = ctk.CTkFrame(scroll, fg_color="transparent")
+        act.pack(fill="x", pady=(4, 14))
+
+        self.img_btn_run = ctk.CTkButton(
+            act,
+            text=IMG_BTN_TEXT,
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            fg_color=ROAST,
+            hover_color=MOSS,
+            text_color=IVORY,
+            corner_radius=24,
+            height=48,
+            command=self.img_start
+        )
+        self.img_btn_run.pack(fill="x")
+
+        self.img_prog = ctk.CTkProgressBar(scroll, progress_color=MOSS, fg_color=LINE, height=3, corner_radius=2)
+        self.img_prog.set(0)
+        self.img_prog.pack(fill="x", pady=(0, 20))
+
+        # ---------- CARD 2: Progress & result ----------
+        card_res = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        card_res.pack(fill="both", expand=True, pady=(0, 8))
+
+        head = ctk.CTkFrame(card_res, fg_color="transparent")
+        head.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            head,
+            text="TIẾN ĐỘ & KẾT QUẢ",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        self.img_status = ctk.CTkLabel(
+            head, text="Sẵn sàng",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN, corner_radius=10
+        )
+        self.img_status.pack(side="right")
+
+        ctk.CTkFrame(card_res, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.img_feed = ctk.CTkFrame(card_res, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT)
+        self.img_feed.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.img_render_feed()
+
+    # ---------- Renderers ----------
+    def img_render_file(self):
+        for child in self.img_drop_zone.winfo_children():
+            child.destroy()
+
+        if self.img_file and os.path.exists(self.img_file):
+            self.img_btn_clear.configure(state="normal", text_color=DANGER)
+            row = ctk.CTkFrame(self.img_drop_zone, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+            row.pack(fill="x", padx=10, pady=10)
+
+            ctk.CTkLabel(row, text="📊", font=ctk.CTkFont(size=14), text_color=CARAMEL).pack(side="left", padx=(12, 8), pady=8)
+
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True, pady=6)
+
+            ctk.CTkLabel(
+                info, text=os.path.basename(self.img_file),
+                font=ctk.CTkFont(family=FONT_SERIF, size=12, weight="bold"),
+                text_color=ROAST, anchor="w"
+            ).pack(anchor="w")
+
+            ctk.CTkLabel(
+                info, text=f"{self.img_file}  •  {format_file_size(os.path.getsize(self.img_file))}",
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN, anchor="w"
+            ).pack(anchor="w", pady=(2, 0))
+
+            ctk.CTkButton(
+                row, text="✕",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="transparent", text_color=BROWN, hover_color=SAND,
+                border_width=0, corner_radius=12, width=24, height=24,
+                command=self.img_clear_file
+            ).pack(side="right", padx=(4, 12), pady=8)
+        else:
+            self.img_btn_clear.configure(state="disabled", text_color=FAINT)
+            ctk.CTkLabel(
+                self.img_drop_zone,
+                text="📥  Kéo thả file Excel vào đây",
+                font=ctk.CTkFont(family=FONT_SANS, size=12),
+                text_color=BROWN,
+                pady=20
+            ).pack(fill="both", expand=True)
+
+    def img_render_feed(self):
+        for child in self.img_feed.winfo_children():
+            child.destroy()
+
+        self.img_steps = []
+        self.img_active_step = -1
+        titles = ("Đọc danh sách ảnh", "Tải & nén ảnh HD", "Chèn ảnh vào ô (Place in Cell)")
+
+        steps_box = ctk.CTkFrame(self.img_feed, fg_color="transparent")
+        steps_box.pack(fill="x", padx=14, pady=(12, 4))
+
+        for t in titles:
+            row = ctk.CTkFrame(steps_box, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+
+            dot = ctk.CTkLabel(row, text="○", width=22, font=ctk.CTkFont(family=FONT_SANS, size=13), text_color=FAINT)
+            dot.pack(side="left", anchor="n")
+
+            txt = ctk.CTkFrame(row, fg_color="transparent")
+            txt.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+            title = ctk.CTkLabel(txt, text=t, font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"), text_color=FAINT, anchor="w")
+            title.pack(anchor="w")
+
+            detail = ctk.CTkLabel(txt, text="", font=ctk.CTkFont(family=FONT_SANS, size=10), text_color=BROWN, anchor="w", height=14)
+            detail.pack(anchor="w")
+
+            self.img_steps.append((dot, title, detail))
+
+        self.img_result_box = ctk.CTkFrame(self.img_feed, fg_color="transparent")
+        self.img_result_box.pack(fill="x")
+
+        ctk.CTkLabel(
+            self.img_result_box,
+            text="Cần Excel 365  ·  Không copy/paste trong lúc đang chèn ảnh",
+            font=ctk.CTkFont(family=FONT_SANS, size=10),
+            text_color=FAINT
+        ).pack(anchor="w", padx=16, pady=(4, 12))
+
+    def img_set_step(self, idx, state, detail=None):
+        dot, title, det = self.img_steps[idx]
+        look = {
+            "pending": ("○", FAINT, FAINT),
+            "active": ("●", MOSS, ROAST),
+            "done": ("✓", MOSS, ROAST),
+            "error": ("✕", DANGER, DANGER),
+        }[state]
+        dot.configure(text=look[0], text_color=look[1])
+        title.configure(text_color=look[2])
+        if detail is not None:
+            det.configure(text=detail)
+        if state == "active":
+            self.img_active_step = idx
+
+    def img_set_status(self, text, color, bg="transparent"):
+        self.img_status.configure(text=f"  {text}  " if bg != "transparent" else text, text_color=color, fg_color=bg)
+
+    def img_ui(self, fn, *args):
+        """Thread-safe: schedule a UI update on the Tk main thread."""
+        self.after(0, lambda: fn(*args))
+
+    # ---------- File selection ----------
+    def img_set_file(self, path):
+        if self.img_running:
+            return
+        name = os.path.basename(path)
+        if not os.path.isfile(path) or name.startswith("~$") or os.path.splitext(path)[1].lower() not in IMG_EXTENSIONS:
+            messagebox.showwarning("Định dạng không hợp lệ", "Vui lòng chọn file Excel (.xlsx, .xlsm hoặc .xls).")
+            return
+        self.img_file = os.path.abspath(path)
+        self.img_render_file()
+        self.img_render_feed()
+        self.img_prog.set(0)
+        self.img_set_status("Sẵn sàng", BROWN)
+
+    def img_browse_file(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file Excel",
+            filetypes=[("Excel Files", "*.xlsx *.xlsm *.xls")]
+        )
+        if path:
+            self.img_set_file(path)
+
+    def img_clear_file(self):
+        if self.img_running:
+            return
+        self.img_file = ""
+        self.img_render_file()
+        self.img_render_feed()
+        self.img_prog.set(0)
+        self.img_set_status("Sẵn sàng", BROWN)
+
+    def on_drop_image(self, event):
+        self.img_drop_zone.configure(border_color=FAINT, fg_color=SAND)
+        paths = [p for p in parse_drop_paths(event.data) if os.path.isfile(p)]
+        if paths:
+            self.img_set_file(paths[0])
+
+    # ---------- Processing ----------
+    def img_start(self):
+        if self.img_running:
+            return
+        if not self.img_file or not os.path.exists(self.img_file):
+            messagebox.showwarning("Thông báo", "Vui lòng chọn file Excel trước khi bắt đầu.")
+            return
+
+        self.img_running = True
+        self.img_btn_run.configure(state="disabled", fg_color=FAINT, text="Đang chèn ảnh...")
+        self.img_btn_pick.configure(state="disabled")
+        self.img_btn_clear.configure(state="disabled", text_color=FAINT)
+        self.img_prog.set(0)
+        self.img_render_feed()
+        self.img_set_status("Đang xử lý", BROWN, SAND)
+
+        threading.Thread(target=self.img_worker, daemon=True).start()
+
+    def img_worker(self):
+        src = self.img_file
+        base, ext = os.path.splitext(os.path.basename(src))
+        out_file = os.path.join(os.path.dirname(src), f"{base} - With Images{ext}")
+
+        excel = None
+        wb = None
+        com_ready = False
+        out_created = False
+        failed = False
+        pythoncom = None
+
+        try:
+            # Lazy import: only machines that use this module need pywin32
+            try:
+                import pythoncom
+                import win32com.client
+            except ImportError:
+                raise RuntimeError("Máy chưa có thư viện pywin32. Vui lòng chạy lại file Cai_Dat_Boring_Task.bat.")
+
+            pythoncom.CoInitialize()
+            com_ready = True
+
+            # ---- Step 1: read image links ----
+            self.img_ui(self.img_set_step, 0, "active", "Đang mở file...")
+            os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+
+            try:
+                shutil.copyfile(src, out_file)
+            except PermissionError:
+                raise RuntimeError(f"File '{os.path.basename(out_file)}' đang mở trong Excel. Vui lòng đóng file rồi thử lại.")
+            out_created = True
+
+            # Separate Excel instance: never touches workbooks the user has open
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            excel.ScreenUpdating = False
+
+            wb = excel.Workbooks.Open(out_file)
+            ws = wb.Worksheets(1)
+            ws.Activate()
+
+            used = ws.UsedRange
+            last_row = used.Row + used.Rows.Count - 1
+            last_col = used.Column + used.Columns.Count - 1
+            if last_row < 2:
+                raise ValueError("File không có dòng dữ liệu nào.")
+
+            headers = com_rows(ws.Range(ws.Cells(1, 1), ws.Cells(1, last_col)).Value)[0]
+            pairs = []
+            for col_idx, h in enumerate(headers, 1):
+                if h is not None and str(h).strip() in IMG_LINK_COLUMNS:
+                    pairs.append((col_idx, col_idx + 1))  # link column -> picture column on its right
+
+            if not pairs:
+                raise ValueError("Không tìm thấy cột link ảnh (Comp. Pic. 1, Pic 2 … Pic 5) ở dòng tiêu đề.")
+
+            links = {}
+            all_unc = set()
+            for url_col, _ in pairs:
+                rows = com_rows(ws.Range(ws.Cells(2, url_col), ws.Cells(last_row, url_col)).Value)
+                col_vals = [img_url_to_unc(str(r[0])) if r[0] else None for r in rows]
+                links[url_col] = col_vals
+                all_unc.update(u for u in col_vals if u)
+
+            total_imgs = len(all_unc)
+            num_rows = last_row - 1
+            self.img_ui(self.img_set_step, 0, "done", f"{total_imgs} ảnh trong {num_rows} dòng")
+            self.img_ui(self.img_prog.set, 0.08)
+
+            # ---- Step 2: parallel download & compress ----
+            self.img_ui(self.img_set_step, 1, "active", f"0/{total_imgs} ảnh")
+            ready = 0
+            done = 0
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                futures = [pool.submit(img_prepare_thumb, p) for p in all_unc]
+                for fut in as_completed(futures):
+                    done += 1
+                    if fut.result():
+                        ready += 1
+                    if done % 10 == 0 or done == total_imgs:
+                        pct = done / max(total_imgs, 1)
+                        self.img_ui(self.img_set_step, 1, "active", f"{done}/{total_imgs} ảnh ({int(pct * 100)}%)")
+                        self.img_ui(self.img_prog.set, 0.08 + pct * 0.42)
+
+            missing = total_imgs - ready
+            detail = f"Sẵn sàng {ready}/{total_imgs} ảnh"
+            if missing:
+                detail += f"  ·  {missing} ảnh không truy cập được"
+            self.img_ui(self.img_set_step, 1, "done", detail)
+
+            # ---- Step 3: embed into cells ----
+            self.img_ui(self.img_set_step, 2, "active", f"0/{num_rows} dòng")
+            for _, pic_col in pairs:
+                ws.Columns(pic_col).ColumnWidth = 14
+
+            inserted = 0
+            attempts = 0
+            for r in range(2, last_row + 1):
+                i = r - 2
+                row_has_pic = False
+                for url_col, pic_col in pairs:
+                    unc = links[url_col][i]
+                    if not unc:
+                        continue
+                    thumb = img_thumb_path(unc)
+                    if not os.path.exists(thumb):
+                        continue
+                    attempts += 1
+                    try:
+                        cell = ws.Cells(r, pic_col)
+                        cell.Select()
+                        pic = ws.Pictures().Insert(thumb)
+                        pic.Select()
+                        pic.Copy()
+                        pic.Delete()
+                        time.sleep(0.03)
+                        cell.PastePictureInCell()
+                        inserted += 1
+                        row_has_pic = True
+                    except Exception:
+                        # First few all failing => this Excel has no Place in Cell support
+                        if inserted == 0 and attempts >= 3:
+                            raise RuntimeError("Excel trên máy chưa hỗ trợ Place in Cell. Cần Microsoft Excel 365 bản mới.")
+                if row_has_pic:
+                    ws.Rows(r).RowHeight = 65
+
+                if r % 10 == 0 or r == last_row:
+                    pct = (r - 1) / max(num_rows, 1)
+                    self.img_ui(self.img_set_step, 2, "active", f"{r - 1}/{num_rows} dòng  ·  đã chèn {inserted} ảnh")
+                    self.img_ui(self.img_prog.set, 0.50 + pct * 0.50)
+
+            excel.ScreenUpdating = True
+            wb.Save()
+            wb.Close(False)
+            wb = None
+            excel.Quit()
+            excel = None
+
+            self.img_ui(self.img_set_step, 2, "done", f"Đã chèn {inserted} ảnh")
+            self.img_ui(self.img_finish, out_file, inserted, missing, "")
+
+        except Exception as e:
+            failed = True
+            self.img_ui(self.img_finish, out_file, 0, 0, str(e))
+
+        finally:
+            if wb is not None:
+                try:
+                    wb.Close(False)
+                except Exception:
+                    pass
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+            if failed and out_created:
+                try:
+                    os.remove(out_file)  # don't leave a half-finished result behind
+                except Exception:
+                    pass
+            if com_ready and pythoncom is not None:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    def img_finish(self, out_file, inserted, missing, err_msg):
+        self.img_running = False
+        self.img_btn_run.configure(state="normal", fg_color=ROAST, text=IMG_BTN_TEXT)
+        self.img_btn_pick.configure(state="normal")
+        self.img_btn_clear.configure(state="normal", text_color=DANGER)
+
+        for child in self.img_result_box.winfo_children():
+            child.destroy()
+
+        if err_msg:
+            self.img_prog.set(0)
+            self.img_set_status("❌ Lỗi", DANGER)
+            if self.img_active_step >= 0:
+                self.img_set_step(self.img_active_step, "error")
+            err_box = ctk.CTkFrame(self.img_result_box, fg_color=CARD, corner_radius=10, border_width=1, border_color=DANGER)
+            err_box.pack(fill="x", padx=10, pady=(4, 10))
+            ctk.CTkLabel(
+                err_box, text=err_msg,
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=DANGER, wraplength=520, justify="left"
+            ).pack(padx=12, pady=10, anchor="w")
+            return
+
+        self.img_prog.set(1.0)
+        self.img_set_status("✓ Hoàn tất", MOSS, MOSS_SOFT)
+
+        banner = ctk.CTkFrame(self.img_result_box, fg_color=MOSS_SOFT, corner_radius=12, border_width=1, border_color=MOSS)
+        banner.pack(fill="x", padx=10, pady=(4, 10))
+
+        left = ctk.CTkFrame(banner, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True, padx=16, pady=12)
+
+        ctk.CTkLabel(
+            left, text=f"Đã chèn {inserted} ảnh vào file.",
+            font=ctk.CTkFont(family=FONT_SERIF, size=13, weight="bold"),
+            text_color=ROAST
+        ).pack(anchor="w")
+
+        sub = f"Đã tạo file: {out_file}"
+        if missing:
+            sub += f"\n{missing} ảnh không truy cập được trên server."
+        ctk.CTkLabel(
+            left, text=sub,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN, wraplength=440, justify="left"
+        ).pack(anchor="w", pady=(3, 0))
+
+        btns = ctk.CTkFrame(banner, fg_color="transparent")
+        btns.pack(side="right", padx=16, pady=12)
+
+        ctk.CTkButton(
+            btns, text="Mở File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            fg_color=ROAST, text_color=IVORY, hover_color=MOSS,
+            corner_radius=16, height=32, width=96,
+            command=lambda p=out_file: os.startfile(p)
+        ).pack(pady=(0, 6))
+
+        ctk.CTkButton(
+            btns, text="📂 Xem File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent", text_color=ROAST, hover_color=SAND,
+            border_width=1, border_color=LINE,
+            corner_radius=16, height=32, width=96,
+            command=lambda p=out_file: reveal_in_explorer(p)
+        ).pack()
+
+        # Open the result automatically, as the original tool did
+        try:
+            os.startfile(out_file)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app = BoringTaskApp()
