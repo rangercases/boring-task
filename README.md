@@ -52,19 +52,22 @@ Tạo file `config.json` trong thư mục app (file này nằm trong `.gitignore
 
 ## 🚀 Hướng Dẫn Cài Đặt & Sử Dụng (Dành Cho Máy Công Ty)
 
-### Cách 1: Cài đặt 1-Click (Khuyên Dùng - Tránh Antivirus Chặn)
-Vì một số phần mềm diệt virus trong môi trường doanh nghiệp thường tự ý xóa/cách ly các file `.exe` lạ, giải pháp chạy trực tiếp qua môi trường Python chính thức là an toàn và ổn định nhất:
+### Cách 1: Cài đặt Siêu Tốc (Gửi DUY NHẤT 1 file .bat - Khuyên Dùng)
+Giải pháp tiện lợi nhất dành cho đồng nghiệp (không rành công nghệ, tránh hoàn toàn phần mềm diệt virus chặn file `.exe`):
 
-1. Copy/gửi thư mục app sang máy đồng nghiệp (có sẵn `config.json` theo đúng quyền nếu muốn).
-2. Nhấp đúp chuột vào file:
+1. Bạn chỉ cần gửi duy nhất file:
    ```text
    Cai_Dat_Boring_Task.bat
    ```
-3. File cài đặt sẽ:
-   - Tự động kiểm tra môi trường Python.
-   - Tự động cài đặt thư viện cần thiết (`openpyxl`, `Pillow`, `pywin32`, `tkinterdnd2`...).
-   - Tạo biểu tượng lối tắt **Boring Task** ngoài màn hình Desktop với icon ứng dụng chuẩn.
-   - Khởi chạy app ngay lập tức (chạy ngầm không hiện cửa sổ đen CMD).
+2. Đồng nghiệp lưu file này ở bất kỳ đâu (Desktop, Downloads...) và nhấp đúp chuột để chạy.
+3. Bộ cài sẽ:
+   - Tự động kiểm tra Python trên máy.
+   - Tự động tạo thư mục chuẩn `%LOCALAPPDATA%\BoringTask\` và tải toàn bộ mã nguồn, tài nguyên từ GitHub về.
+   - Cho phép chọn phân hệ làm việc 1 lần duy nhất (Chị A / Chị B / Admin) và lưu vĩnh viễn.
+   - Tự động cài đặt thư viện cần thiết (`openpyxl`, `Pillow`, `pywin32`, `tkinterdnd2`...) với cờ `--user` chống lỗi quyền Admin.
+   - Tạo biểu tượng lối tắt **Boring Task** ngoài màn hình Desktop kèm Logo sắc nét.
+   - Khởi chạy app ngay lập tức (chạy ngầm, không hiện cửa sổ đen CMD).
+4. Sau khi cài xong, đồng nghiệp có thể **xóa luôn file `.bat`** đi. Từ ngày hôm sau chỉ cần bấm vào icon ngoài Desktop!
 
 ### 🔄 Cơ chế Tự Động Cập Nhật Ngầm (Silent Auto-Update)
 Mỗi khi khởi động **Boring Task**, ứng dụng sẽ tự động chạy tiến trình ngầm kiểm tra mã nguồn mới nhất trên GitHub repository trong vài mili-giây. Nếu bạn đẩy bản cập nhật mới lên GitHub, app trên các máy người dùng sẽ tự động đồng bộ mà người dùng không cần thao tác gì thêm!
