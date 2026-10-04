@@ -6,7 +6,7 @@
 
 ## 🧩 Các Phân Hệ (Modules)
 
-### 1. 📊 Purchase Cost Auto-Filled (SOFACOMPANY Claim & Cost Matcher)
+### 1. 📊 Purchase Cost Auto-Filled (Claim & Cost Matcher)
 Tự động đối chiếu và điền **Purchase Cost** từ file Master Overview vào các báo cáo khiếu nại (Claim Versus) theo từng quý/tháng:
 - **Đối chiếu đa tầng thông minh (Multi-Level Matching)**:
   - Khớp chính xác 100% theo mã sản phẩm (`Customer art No`) và nhà cung cấp (`Casa / CS` hoặc `Nhan Hoang / NH`).
@@ -21,7 +21,7 @@ Tự động đối chiếu và điền **Purchase Cost** từ file Master Overv
   - Tốc độ đọc ghi nhanh, không đơ lag cửa sổ ngay cả với file Excel dữ liệu lớn (~40MB).
 
 ### 2. 🖼️ Image Inserter (Place in Cell)
-Công cụ tự động hóa chèn ảnh khiếu nại chất lượng sản phẩm trực tiếp vào ô tính Microsoft Excel chuẩn **Place in Cell** (SOFACOMPANY):
+Công cụ tự động hóa chèn ảnh khiếu nại chất lượng sản phẩm trực tiếp vào ô tính Microsoft Excel chuẩn **Place in Cell**:
 - **Tự động nhận diện & Quét ảnh**: Quét các cột link ảnh chuẩn (`Comp. Pic. 1`, `Pic 2`... `Pic 5`).
 - **Tải & Nén ảnh HD 16 luồng song song**: Tải siêu tốc từ server Châu Âu, nén chuẩn HD lưu vào thư mục Cache cục bộ.
 - **Nhúng Excel COM nội tại ô (Place in Cell)**: Tự động điều chỉnh kích thước dòng/cột tương thích, mở file kết quả ngay sau khi hoàn thành.
