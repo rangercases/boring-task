@@ -7,22 +7,29 @@ import pickle
 import json
 import subprocess
 import urllib.request
-import urllib.error
 import tempfile
 import time
 from copy import copy
 import ctypes
+import zipfile
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import tkinterdnd2 as tkdnd
 import openpyxl
 from openpyxl.utils import get_column_letter
+from PIL import Image
+
+# Set Windows App User Model ID so Taskbar groups and shows custom icon
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("rangercases.boringtask.v1")
+except Exception:
+    pass
 
 # Set Light Mode
 ctk.set_appearance_mode("Light")
 
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.0"
 GITHUB_REPO = "rangercases/claim-helper"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
@@ -57,6 +64,11 @@ def is_newer_version(latest_tag, current_tag):
     v_latest = parse_version(latest_tag)
     v_curr = parse_version(current_tag)
     return v_latest > v_curr
+
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller bundle."""
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 def get_cache_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), CACHE_FILE_NAME)
@@ -98,21 +110,52 @@ def reveal_in_explorer(filepath):
     except Exception as e:
         print(f"Error revealing in explorer: {e}")
 
-class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
+def validate_excel_file(filepath):
+    """Validates if file exists, non-empty, and has valid ZIP/XLSX signature."""
+    fname = os.path.basename(filepath)
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Không tìm thấy file '{fname}'.")
+    if os.path.getsize(filepath) == 0:
+        raise ValueError(f"File '{fname}' bị rỗng (0 KB), có thể do tải dở từ OneDrive/Email.")
+    
+    # Check magic bytes for ZIP (.xlsx is a zip package)
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(4)
+        if header != b'PK\x03\x04':
+            if header.startswith(b'\xd0\xcf\x11\xe0'):
+                raise ValueError(f"File '{fname}' là định dạng Excel cũ (.xls) bị đổi đuôi. Vui lòng mở bằng Excel và Save As thành Excel Workbook (*.xlsx).")
+            elif header.startswith(b'<html') or header.startswith(b'<!DOC') or header.startswith(b'<?xml'):
+                raise ValueError(f"File '{fname}' là file web (HTML/XML) bị đổi đuôi thành .xlsx. Vui lòng mở bằng Excel và Save As lại.")
+            else:
+                raise ValueError(f"File '{fname}' không phải định dạng Excel (.xlsx) chuẩn hoặc bị hỏng dữ liệu.")
+    except (PermissionError, ValueError, FileNotFoundError):
+        raise
+    except Exception as e:
+        raise ValueError(f"Không thể đọc file '{fname}': {e}")
+
+class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
         self.TkdndVersion = tkdnd.TkinterDnD._require(self)
 
-        self.title("Claim Helper")
+        self.title("Boring Task")
         self.geometry("860x780")
         self.minsize(800, 700)
         self.configure(fg_color=IVORY)  # Soft Ivory Bakery background
+
+        # Set Window & Taskbar Icon
+        ico_path = get_resource_path(os.path.join("assets", "app_icon.ico"))
+        if os.path.exists(ico_path):
+            try:
+                self.iconbitmap(ico_path)
+            except Exception:
+                pass
 
         # State Variables
         self.overview_path = ""
         self.claim_files = [] # list of absolute paths
         self.last_created_files = [] # list of created output files
-        self.is_processing = False
 
         curr_dir = os.path.abspath(os.path.dirname(__file__))
         saved_state = self.load_saved_state()
@@ -127,12 +170,6 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             saved_claims = saved_state.get("claim_files", [])
             self.claim_files = [p for p in saved_claims if os.path.exists(p)]
         else:
-            # First launch: Auto-detect Overview in current directory
-            for f in os.listdir(curr_dir):
-                if f.lower().startswith("overview") and f.endswith(".xlsx") and not f.startswith("~$"):
-                    self.overview_path = os.path.join(curr_dir, f)
-                    break
-
             # First launch: Auto-detect initial versus files in current directory
             for f in os.listdir(curr_dir):
                 if "versus" in f.lower() and f.endswith(".xlsx") and not f.endswith("_backup.xlsx") and not f.endswith("_filled.xlsx") and not f.startswith("~$"):
@@ -152,7 +189,7 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.apply_windows_titlebar_theme()
 
         # Check for remote updates silently in background
-        threading.Thread(target=self.check_for_updates, daemon=True).start()
+        threading.Thread(target=self.silent_auto_update, daemon=True).start()
 
     def apply_windows_titlebar_theme(self):
         """Customizes Windows title bar color to match IVORY & ROAST theme."""
@@ -213,135 +250,38 @@ class ClaimHelperAppleApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             print(f"Error saving state: {e}")
 
     # ----------------------------------------------------
-    # GitHub Auto-Updater (Non-blocking & Seamless)
+    # Silent Lightning-Fast Background Auto-Updater
     # ----------------------------------------------------
-    def check_for_updates(self):
-        """Silently checks GitHub Releases for new versions."""
+    def silent_auto_update(self):
+        """Runs silently in background. Checks GitHub Releases / raw code in 1-2s.
+        If a newer release exists, silently downloads and overwrites local code in <1s.
+        """
         try:
             url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-            req = urllib.request.Request(url, headers={"User-Agent": "ClaimHelper-App"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            req = urllib.request.Request(url, headers={"User-Agent": "BoringTask-App"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
                     latest_tag = data.get("tag_name", "")
                     if latest_tag and is_newer_version(latest_tag, APP_VERSION):
-                        assets = data.get("assets", [])
-                        exe_url = None
-                        for a in assets:
-                            if a.get("name", "").lower().endswith(".exe"):
-                                exe_url = a.get("browser_download_url")
-                                break
-                        if exe_url:
-                            self.after(0, self.show_update_banner, latest_tag, exe_url)
+                        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/boring_task.pyw"
+                        req_raw = urllib.request.Request(raw_url, headers={"User-Agent": "BoringTask-App"})
+                        with urllib.request.urlopen(req_raw, timeout=5) as raw_resp:
+                            if raw_resp.status == 200:
+                                new_code = raw_resp.read()
+                                if len(new_code) > 1000 and (b"BoringTask" in new_code or b"ClaimHelper" in new_code):
+                                    curr_file = os.path.abspath(__file__)
+                                    tmp_file = curr_file + ".new"
+                                    with open(tmp_file, "wb") as f:
+                                        f.write(new_code)
+                                    os.replace(tmp_file, curr_file)
+                                    self.after(0, self.set_update_badge, f"✓ Đã tự động cập nhật {latest_tag}")
         except Exception:
             pass
 
-    def show_update_banner(self, latest_tag, exe_url):
-        self.update_banner_container.pack(fill="x", padx=32, pady=(0, 16))
-        for child in self.update_banner_container.winfo_children():
-            child.destroy()
-
-        banner = ctk.CTkFrame(
-            self.update_banner_container,
-            fg_color=CARD,
-            corner_radius=14,
-            border_width=1,
-            border_color=LINE
-        )
-        banner.pack(fill="x")
-
-        left = ctk.CTkFrame(banner, fg_color="transparent")
-        left.pack(side="left", padx=20, pady=12, fill="x", expand=True)
-
-        ctk.CTkLabel(
-            left,
-            text=f"✦ Đã có phiên bản mới ({latest_tag})",
-            font=ctk.CTkFont(family=FONT_SERIF, size=13, weight="bold"),
-            text_color=ROAST
-        ).pack(anchor="w")
-
-        ctk.CTkLabel(
-            left,
-            text=f"Phiên bản hiện tại: {APP_VERSION}. Nhấn để nâng cấp tự động.",
-            font=ctk.CTkFont(family=FONT_SANS, size=11),
-            text_color=BROWN
-        ).pack(anchor="w", pady=(2, 0))
-
-        btn_box = ctk.CTkFrame(banner, fg_color="transparent")
-        btn_box.pack(side="right", padx=20, pady=12)
-
-        self.btn_update = ctk.CTkButton(
-            btn_box,
-            text="Cập Nhật Ngay",
-            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
-            fg_color=ROAST,
-            hover_color=MOSS,
-            text_color=IVORY,
-            corner_radius=16,
-            width=125,
-            height=32,
-            command=lambda: self.start_download_update(exe_url, latest_tag)
-        )
-        self.btn_update.pack(side="right")
-
-    def start_download_update(self, exe_url, latest_tag):
-        self.btn_update.configure(state="disabled", text="Đang tải 0%...")
-        threading.Thread(
-            target=self._download_and_install_update,
-            args=(exe_url, latest_tag),
-            daemon=True
-        ).start()
-
-    def _download_and_install_update(self, exe_url, latest_tag):
-        try:
-            temp_dir = tempfile.gettempdir()
-            target_exe_name = f"ClaimHelper_update_{int(time.time())}.exe"
-            temp_file = os.path.join(temp_dir, target_exe_name)
-
-            req = urllib.request.Request(exe_url, headers={"User-Agent": "ClaimHelper-App"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                total_size = int(resp.headers.get("content-length", 0))
-                downloaded = 0
-                chunk_size = 64 * 1024
-                with open(temp_file, "wb") as f:
-                    while True:
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            pct = int(downloaded / total_size * 100)
-                            self.after(0, self.btn_update.configure, {"text": f"Đang tải {pct}%..."})
-
-            self.after(0, self.btn_update.configure, {"text": "Đang khởi động..."})
-
-            is_frozen = getattr(sys, "frozen", False)
-            if is_frozen:
-                current_exe = os.path.abspath(sys.executable)
-            else:
-                current_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ClaimHelper.exe")
-
-            updater_bat = os.path.join(temp_dir, f"claim_update_{int(time.time())}.bat")
-            bat_script = f"""@echo off
-timeout /t 1 /nobreak > nul
-move /y "{temp_file}" "{current_exe}" > nul
-start "" "{current_exe}"
-del "%~f0"
-exit
-"""
-            with open(updater_bat, "w", encoding="utf-8") as bf:
-                bf.write(bat_script)
-
-            subprocess.Popen(["cmd.exe", "/c", updater_bat], creationflags=0x08000000)
-            self.after(100, self.destroy)
-        except Exception as e:
-            self.after(0, self.on_update_failed, str(e))
-
-    def on_update_failed(self, err):
-        if hasattr(self, 'btn_update'):
-            self.btn_update.configure(state="normal", text="Thử lại")
-        messagebox.showerror("Cập nhật thất bại", f"Không thể tải bản cập nhật: {err}")
+    def set_update_badge(self, text):
+        if hasattr(self, 'badge_update'):
+            self.badge_update.configure(text=f"  {text}  ", text_color=ROAST, fg_color=MOSS_SOFT)
 
     def setup_ui(self):
         # 1. Header Frame (Japanese Cafe aesthetic: airy, light, serif, brown tone)
@@ -351,15 +291,27 @@ exit
         title_row = ctk.CTkFrame(header, fg_color="transparent")
         title_row.pack(anchor="w")
 
-        title_lbl = ctk.CTkLabel(
-            title_row,
-            text="Claim Helper",
-            font=ctk.CTkFont(family=FONT_SERIF, size=30, weight="normal"),
-            text_color=ROAST
-        )
-        title_lbl.pack(side="left")
+        # Boring Task Brand Logo Banner
+        banner_path = get_resource_path(os.path.join("assets", "boring_task_banner.png"))
+        if os.path.exists(banner_path):
+            try:
+                pil_banner = Image.open(banner_path)
+                # Aspect ratio is 1024 / 132 = ~7.75. Display at (225, 29)
+                self.header_logo_img = ctk.CTkImage(light_image=pil_banner, dark_image=pil_banner, size=(225, 29))
+                banner_lbl = ctk.CTkLabel(title_row, text="", image=self.header_logo_img)
+                banner_lbl.pack(side="left", padx=(0, 12))
+            except Exception:
+                pass
+        else:
+            title_lbl = ctk.CTkLabel(
+                title_row,
+                text="Boring Task",
+                font=ctk.CTkFont(family=FONT_SERIF, size=28, weight="bold"),
+                text_color=ROAST
+            )
+            title_lbl.pack(side="left", padx=(0, 12))
 
-        # Pill badge with delicate line border
+        # Pill version badge
         badge_lbl = ctk.CTkLabel(
             title_row,
             text=f"  {APP_VERSION}  ",
@@ -368,21 +320,34 @@ exit
             text_color=BROWN,
             corner_radius=10
         )
-        badge_lbl.pack(side="left", padx=(12, 0), pady=(6, 0))
+        badge_lbl.pack(side="left", pady=(6, 0))
 
-        sub_lbl = ctk.CTkLabel(
-            header,
-            text="Hệ thống tự động đối chiếu & điền Purchase Cost cho Mrs. Nhung",
-            font=ctk.CTkFont(family=FONT_SANS, size=12),
-            text_color=BROWN
+        # Silent update status badge
+        self.badge_update = ctk.CTkLabel(
+            title_row,
+            text="",
+            font=ctk.CTkFont(family=FONT_SANS, size=10),
+            fg_color="transparent",
+            text_color=MOSS,
+            corner_radius=10
         )
-        sub_lbl.pack(anchor="w", pady=(3, 0))
+        self.badge_update.pack(side="left", padx=(10, 0), pady=(6, 0))
 
         # Dynamic Update Banner Container
         self.update_banner_container = ctk.CTkFrame(self, fg_color="transparent")
 
+        # View container: hosts Home screen and feature screens (switched via pack/pack_forget)
+        self.view_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.view_container.pack(fill="both", expand=True)
+
+        self.home_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.claim_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+
+        self.build_home()
+        self.build_feature_nav(self.claim_view, "Purchase Cost Auto-Filled")
+
         # 2. Main Scrollable Container (Generous whitespace)
-        self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.main_scroll = ctk.CTkScrollableFrame(self.claim_view, fg_color="transparent")
         self.main_scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
 
         # ========================================================
@@ -644,6 +609,169 @@ exit
             text_color=FAINT
         ).pack(side="left")
 
+        self.show_home()
+
+    # ----------------------------------------------------
+    # Home Screen & Navigation
+    # ----------------------------------------------------
+    def build_home(self):
+        wrap = ctk.CTkFrame(self.home_view, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=36, pady=(18, 16))
+
+        ctk.CTkLabel(
+            wrap,
+            text="CÔNG CỤ",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(anchor="w", pady=(0, 12))
+
+        grid = ctk.CTkFrame(wrap, fg_color="transparent")
+        grid.pack(anchor="w")
+
+        # To add a new feature: append one entry here.
+        features = [
+            {
+                "icon": "📋",
+                "title": "Purchase Cost",
+                "subtitle": "Auto-Filled",
+                "command": lambda: self.show_feature(self.claim_view, "Purchase Cost Auto-Filled"),
+            },
+        ]
+
+        cols = 3
+        for i, f in enumerate(features):
+            tile = self.make_feature_tile(grid, **f)
+            tile.grid(row=i // cols, column=i % cols, padx=(0, 16), pady=(0, 16), sticky="nw")
+
+    def make_feature_tile(self, parent, icon, title, subtitle, command):
+        HOVER_BG = "#fbf5ea"
+
+        tile = ctk.CTkFrame(
+            parent, width=200, height=168,
+            fg_color=CARD, corner_radius=18,
+            border_width=1, border_color=LINE
+        )
+        tile.pack_propagate(False)
+
+        icon_box = ctk.CTkFrame(tile, width=52, height=52, fg_color=SAND, corner_radius=14)
+        icon_box.pack_propagate(False)
+        icon_box.pack(anchor="w", padx=20, pady=(22, 0))
+
+        icon_lbl = ctk.CTkLabel(
+            icon_box, text=icon,
+            font=ctk.CTkFont(family="Segoe UI Emoji", size=22),
+            text_color=ROAST
+        )
+        icon_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+        text_box = ctk.CTkFrame(tile, fg_color="transparent")
+        text_box.pack(side="bottom", fill="x", padx=20, pady=(0, 20))
+
+        t1 = ctk.CTkLabel(
+            text_box, text=title,
+            font=ctk.CTkFont(family=FONT_SERIF, size=16, weight="bold"),
+            text_color=ROAST, anchor="w"
+        )
+        t1.pack(anchor="w")
+
+        t2 = ctk.CTkLabel(
+            text_box, text=subtitle,
+            font=ctk.CTkFont(family=FONT_SANS, size=12),
+            text_color=BROWN, anchor="w"
+        )
+        t2.pack(anchor="w")
+
+        state = {"hover": False}
+
+        def set_look(bg, border):
+            tile.configure(fg_color=bg, border_color=border)
+
+        def pointer_inside():
+            try:
+                x, y = tile.winfo_pointerxy()
+                rx, ry = tile.winfo_rootx(), tile.winfo_rooty()
+                return rx <= x < rx + tile.winfo_width() and ry <= y < ry + tile.winfo_height()
+            except Exception:
+                return False
+
+        def on_enter(_e=None):
+            if not state["hover"]:
+                state["hover"] = True
+                set_look(HOVER_BG, MOSS)
+
+        def check_leave():
+            if state["hover"] and not pointer_inside():
+                state["hover"] = False
+                set_look(CARD, LINE)
+
+        def on_leave(_e=None):
+            tile.after(15, check_leave)
+
+        def on_press(_e=None):
+            set_look(SAND, MOSS)
+
+        def on_release(_e=None):
+            if pointer_inside():
+                set_look(HOVER_BG, MOSS)
+
+                def go():
+                    state["hover"] = False
+                    set_look(CARD, LINE)
+                    command()
+
+                tile.after(70, go)
+            else:
+                state["hover"] = False
+                set_look(CARD, LINE)
+
+        for w in (tile, icon_box, icon_lbl, text_box, t1, t2):
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+            w.bind("<ButtonPress-1>", on_press)
+            w.bind("<ButtonRelease-1>", on_release)
+            try:
+                w.configure(cursor="hand2")
+            except Exception:
+                pass
+
+        return tile
+
+    def build_feature_nav(self, view, title):
+        nav = ctk.CTkFrame(view, fg_color="transparent", height=34)
+        nav.pack(fill="x", padx=36, pady=(2, 12))
+        nav.pack_propagate(False)
+
+        ctk.CTkButton(
+            nav,
+            text="‹  Trang chủ",
+            font=ctk.CTkFont(family=FONT_SANS, size=12),
+            fg_color="transparent",
+            hover_color=SAND,
+            text_color=MOSS,
+            corner_radius=14,
+            width=104,
+            height=30,
+            anchor="w",
+            command=self.show_home
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            nav,
+            text=title,
+            font=ctk.CTkFont(family=FONT_SERIF, size=14, weight="bold"),
+            text_color=ROAST
+        ).place(relx=0.5, rely=0.5, anchor="center")
+
+    def show_home(self):
+        self.claim_view.pack_forget()
+        self.home_view.pack(fill="both", expand=True)
+        self.title("Boring Task")
+
+    def show_feature(self, view, title):
+        self.home_view.pack_forget()
+        view.pack(fill="both", expand=True)
+        self.title(f"Boring Task — {title}")
+
     # ----------------------------------------------------
     # UI Renderers
     # ----------------------------------------------------
@@ -772,7 +900,7 @@ exit
 
         self.claim_count_lbl.configure(text=f"DANH SÁCH FILE CLAIM VERSUS ({len(self.claim_files)})")
 
-        for idx, fpath in enumerate(self.claim_files):
+        for fpath in self.claim_files:
             fname = os.path.basename(fpath)
             is_casa = "casa" in fname.lower()
             tag_text = "Casa (CS)" if is_casa else "Nhan Hoang (NH)"
@@ -993,18 +1121,6 @@ exit
         self.render_overview_display()
         messagebox.showinfo("Thông báo", "Đã xóa bộ nhớ ghi nhớ! Lần chạy tới sẽ đọc lại file Master từ đầu.")
 
-    def open_current_folder(self):
-        if self.last_created_files:
-            reveal_in_explorer(self.last_created_files[0])
-        elif self.claim_files:
-            folder = os.path.dirname(self.claim_files[0])
-            os.startfile(folder)
-        elif self.overview_path:
-            folder = os.path.dirname(self.overview_path)
-            os.startfile(folder)
-        else:
-            os.startfile(os.path.abspath(os.path.dirname(__file__)))
-
     # ----------------------------------------------------
     # Thread-Safe Results Feed Updates
     # ----------------------------------------------------
@@ -1049,6 +1165,33 @@ exit
                 command=lambda p=full_fpath: reveal_in_explorer(p)
             ).pack(side="right", padx=(4, 10), pady=6)
 
+    def append_feed_error_item(self, filename, error_msg):
+        row = ctk.CTkFrame(self.results_feed, fg_color=CARD, corner_radius=10, border_width=1, border_color=DANGER)
+        row.pack(fill="x", padx=10, pady=3)
+
+        ctk.CTkLabel(
+            row,
+            text="✕",
+            font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+            text_color=DANGER
+        ).pack(side="left", padx=(12, 8), pady=6)
+
+        ctk.CTkLabel(
+            row,
+            text=filename,
+            font=ctk.CTkFont(family=FONT_SERIF, size=12, weight="bold"),
+            text_color=ROAST
+        ).pack(side="left", pady=6)
+
+        ctk.CTkLabel(
+            row,
+            text=f"•  {error_msg}",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=DANGER,
+            wraplength=520,
+            justify="left"
+        ).pack(side="left", padx=8, pady=6)
+
     def set_status_text(self, text, color=BROWN, bg_color=None):
         if bg_color:
             self.status_badge.configure(text=f"  {text}  ", text_color=color, fg_color=bg_color, corner_radius=10)
@@ -1081,6 +1224,13 @@ exit
 
     def run_engine(self):
         try:
+            # 0. Validate Master Overview
+            try:
+                validate_excel_file(self.overview_path)
+            except Exception as ve:
+                self.after(0, self.finish_processing_apple, 0, [], 0, f"Lỗi file Master Overview: {ve}")
+                return
+
             # 1. Load Master Overview with Cache
             c_path = get_cache_path()
             ov_abs = os.path.abspath(self.overview_path)
@@ -1106,7 +1256,15 @@ exit
 
             if not loaded_from_cache:
                 self.after(0, self.set_status_text, "● Đang đọc file Master...", MOSS)
-                wb_o = openpyxl.load_workbook(self.overview_path, read_only=True, data_only=True)
+                try:
+                    wb_o = openpyxl.load_workbook(self.overview_path, read_only=True, data_only=True)
+                except PermissionError:
+                    self.after(0, self.finish_processing_apple, 0, [], 0, "File Master Overview đang mở trong Excel hoặc ứng dụng khác. Vui lòng đóng lại trước khi chạy.")
+                    return
+                except (zipfile.BadZipFile, Exception) as oe:
+                    self.after(0, self.finish_processing_apple, 0, [], 0, f"Không thể đọc file Master Overview ({oe}).")
+                    return
+
                 s_o = wb_o['Overview'] if 'Overview' in wb_o.sheetnames else wb_o.active
                 headers_o = next(s_o.iter_rows(max_row=1, values_only=True))
                 col_idx = {h: i for i, h in enumerate(headers_o)}
@@ -1159,209 +1317,258 @@ exit
             # 2. Process Files
             total_files = len(self.claim_files)
             created_files = []
+            failed_count = 0
 
             for i, fpath in enumerate(self.claim_files, start=1):
                 fname = os.path.basename(fpath)
-                is_casa = "casa" in fname.lower()
-                ref_db = cs_records if is_casa else nh_records
+                try:
+                    validate_excel_file(fpath)
 
-                wb = openpyxl.load_workbook(fpath)
-                s = wb['Export'] if 'Export' in wb.sheetnames else wb.active
-                headers = [cell.value for cell in s[1]]
+                    is_casa = "casa" in fname.lower()
+                    ref_db = cs_records if is_casa else nh_records
 
-                # Add Purchase Cost (USD)
-                if 'Purchase Cost (USD)' in headers:
-                    col_cost_idx = headers.index('Purchase Cost (USD)') + 1
-                else:
-                    col_cost_idx = len(headers) + 1
-                    headers.append('Purchase Cost (USD)')
-                    c_h1 = s.cell(row=1, column=col_cost_idx, value='Purchase Cost (USD)')
-                    sample_h = s.cell(row=1, column=headers.index('Unit Cost x QTY')+1 if 'Unit Cost x QTY' in headers else 1)
-                    if sample_h.has_style:
-                        c_h1.font, c_h1.border, c_h1.fill, c_h1.alignment = copy(sample_h.font), copy(sample_h.border), copy(sample_h.fill), copy(sample_h.alignment)
+                    wb = openpyxl.load_workbook(fpath)
+                    s = wb['Export'] if 'Export' in wb.sheetnames else wb.active
+                    headers = [cell.value for cell in s[1]]
 
-                # Add Purchase Cost Note
-                if 'Purchase Cost Note' in headers:
-                    col_note_idx = headers.index('Purchase Cost Note') + 1
-                else:
-                    col_note_idx = len(headers) + 1
-                    headers.append('Purchase Cost Note')
-                    c_h2 = s.cell(row=1, column=col_note_idx, value='Purchase Cost Note')
-                    sample_h = s.cell(row=1, column=headers.index('Unit Cost x QTY')+1 if 'Unit Cost x QTY' in headers else 1)
-                    if sample_h.has_style:
-                        c_h2.font, c_h2.border, c_h2.fill, c_h2.alignment = copy(sample_h.font), copy(sample_h.border), copy(sample_h.fill), copy(sample_h.alignment)
+                    # Add Purchase Cost (USD)
+                    if 'Purchase Cost (USD)' in headers:
+                        col_cost_idx = headers.index('Purchase Cost (USD)') + 1
+                    else:
+                        col_cost_idx = len(headers) + 1
+                        headers.append('Purchase Cost (USD)')
+                        c_h1 = s.cell(row=1, column=col_cost_idx, value='Purchase Cost (USD)')
+                        sample_h = s.cell(row=1, column=headers.index('Unit Cost x QTY')+1 if 'Unit Cost x QTY' in headers else 1)
+                        if sample_h.has_style:
+                            c_h1.font, c_h1.border, c_h1.fill, c_h1.alignment = copy(sample_h.font), copy(sample_h.border), copy(sample_h.fill), copy(sample_h.alignment)
 
-                cost_letter = get_column_letter(col_cost_idx)
-                note_letter = get_column_letter(col_note_idx)
-                s.column_dimensions[cost_letter].width = 22
-                s.column_dimensions[note_letter].width = 85
+                    # Add Purchase Cost Note
+                    if 'Purchase Cost Note' in headers:
+                        col_note_idx = headers.index('Purchase Cost Note') + 1
+                    else:
+                        col_note_idx = len(headers) + 1
+                        headers.append('Purchase Cost Note')
+                        c_h2 = s.cell(row=1, column=col_note_idx, value='Purchase Cost Note')
+                        sample_h = s.cell(row=1, column=headers.index('Unit Cost x QTY')+1 if 'Unit Cost x QTY' in headers else 1)
+                        if sample_h.has_style:
+                            c_h2.font, c_h2.border, c_h2.fill, c_h2.alignment = copy(sample_h.font), copy(sample_h.border), copy(sample_h.fill), copy(sample_h.alignment)
 
-                max_row = s.max_row
-                art_col_idx = headers.index('No') + 1 if 'No' in headers else 7
-                unit_cost_col_idx = headers.index('Unit Cost x QTY') + 1 if 'Unit Cost x QTY' in headers else None
+                    cost_letter = get_column_letter(col_cost_idx)
+                    note_letter = get_column_letter(col_note_idx)
+                    s.column_dimensions[cost_letter].width = 22
+                    s.column_dimensions[note_letter].width = 85
 
-                last_art = s.cell(row=max_row, column=art_col_idx).value
-                last_is_total = (last_art is None or str(last_art).strip() == '')
-                data_end = max_row - 1 if last_is_total else max_row
-                data_count = data_end - 1
+                    max_row = s.max_row
+                    art_col_idx = headers.index('No') + 1 if 'No' in headers else 7
+                    unit_cost_col_idx = headers.index('Unit Cost x QTY') + 1 if 'Unit Cost x QTY' in headers else None
 
-                rate_samples = []
-                if unit_cost_col_idx:
+                    last_art = s.cell(row=max_row, column=art_col_idx).value
+                    last_is_total = (last_art is None or str(last_art).strip() == '')
+                    data_end = max_row - 1 if last_is_total else max_row
+                    data_count = data_end - 1
+
+                    rate_samples = []
+                    if unit_cost_col_idx:
+                        for r_idx in range(2, data_end + 1):
+                            art = str(s.cell(row=r_idx, column=art_col_idx).value or '').strip()
+                            dkk = s.cell(row=r_idx, column=unit_cost_col_idx).value
+                            exact = [rec for rec in ref_db if rec['art'] == art]
+                            if exact and isinstance(dkk, (int, float)) and dkk > 0:
+                                avg_usd = sum(e['cost'] for e in exact) / len(exact)
+                                rate_samples.append(dkk / avg_usd)
+
+                    median_rate = sorted(rate_samples)[len(rate_samples)//2] if rate_samples else (8.0087 if is_casa else 7.8210)
+
+                    file_matched = 0
                     for r_idx in range(2, data_end + 1):
                         art = str(s.cell(row=r_idx, column=art_col_idx).value or '').strip()
-                        dkk = s.cell(row=r_idx, column=unit_cost_col_idx).value
-                        exact = [rec for rec in ref_db if rec['art'] == art]
-                        if exact and isinstance(dkk, (int, float)) and dkk > 0:
-                            avg_usd = sum(e['cost'] for e in exact) / len(exact)
-                            rate_samples.append(dkk / avg_usd)
+                        posting_date = s.cell(row=r_idx, column=headers.index('PostingDate')+1).value if 'PostingDate' in headers else None
+                        days = s.cell(row=r_idx, column=headers.index('Days Between Order And Complaint')+1).value if 'Days Between Order And Complaint' in headers else 0
+                        days = days if isinstance(days, (int, float)) else 0
+                        unit_cost_dkk = s.cell(row=r_idx, column=unit_cost_col_idx).value if unit_cost_col_idx else 0
+                        unit_cost_dkk = unit_cost_dkk if isinstance(unit_cost_dkk, (int, float)) else 0
 
-                median_rate = sorted(rate_samples)[len(rate_samples)//2] if rate_samples else (8.0087 if is_casa else 7.8210)
+                        order_date = None
+                        if isinstance(posting_date, datetime.datetime):
+                            order_date = posting_date - datetime.timedelta(days=int(days))
+                        elif isinstance(posting_date, datetime.date):
+                            order_date = posting_date - datetime.timedelta(days=int(days))
 
-                file_matched = 0
-                for r_idx in range(2, data_end + 1):
-                    art = str(s.cell(row=r_idx, column=art_col_idx).value or '').strip()
-                    desc = str(s.cell(row=r_idx, column=headers.index('Description')+1).value or '').strip() if 'Description' in headers else ''
-                    desc2 = str(s.cell(row=r_idx, column=headers.index('Description_2')+1).value or '').strip() if 'Description_2' in headers else ''
-                    posting_date = s.cell(row=r_idx, column=headers.index('PostingDate')+1).value if 'PostingDate' in headers else None
-                    days = s.cell(row=r_idx, column=headers.index('Days Between Order And Complaint')+1).value if 'Days Between Order And Complaint' in headers else 0
-                    days = days if isinstance(days, (int, float)) else 0
-                    unit_cost_dkk = s.cell(row=r_idx, column=unit_cost_col_idx).value if unit_cost_col_idx else 0
-                    unit_cost_dkk = unit_cost_dkk if isinstance(unit_cost_dkk, (int, float)) else 0
+                        exact_matches = [rec for rec in ref_db if rec['art'] == art]
+                        selected_cost = None
+                        note = ""
 
-                    order_date = None
-                    if isinstance(posting_date, datetime.datetime):
-                        order_date = posting_date - datetime.timedelta(days=int(days))
-                    elif isinstance(posting_date, datetime.date):
-                        order_date = posting_date - datetime.timedelta(days=int(days))
+                        if exact_matches:
+                            file_matched += 1
+                            if unit_cost_dkk > 0:
+                                target_usd = unit_cost_dkk / median_rate
+                                plausible = [e for e in exact_matches if 0.7 * target_usd <= e['cost'] <= 1.3 * target_usd]
+                                if not plausible: plausible = exact_matches
+                            else:
+                                plausible = exact_matches
 
-                    exact_matches = [rec for rec in ref_db if rec['art'] == art]
-                    selected_cost = None
-                    note = ""
-
-                    if exact_matches:
-                        file_matched += 1
-                        if unit_cost_dkk > 0:
-                            target_usd = unit_cost_dkk / median_rate
-                            plausible = [e for e in exact_matches if 0.7 * target_usd <= e['cost'] <= 1.3 * target_usd]
-                            if not plausible: plausible = exact_matches
+                            valid_dates = [e for e in plausible if isinstance(e['po_date'], (datetime.datetime, datetime.date))]
+                            if valid_dates and order_date:
+                                o_d = order_date.date() if isinstance(order_date, datetime.datetime) else order_date
+                                best_match = min(valid_dates, key=lambda e: abs((e['po_date'].date() if isinstance(e['po_date'], datetime.datetime) else e['po_date']) - o_d))
+                                selected_cost = best_match['cost']
+                                po_str = best_match['po_date'].strftime('%d/%m/%Y')
+                                od_str = order_date.strftime('%d/%m/%Y')
+                                note = f"Khớp 100% Art No ({art}). Chọn {selected_cost}$ theo đợt PO ({po_str}) gần nhất ngày đặt hàng ({od_str})."
+                            else:
+                                best_match = min(plausible, key=lambda e: abs(e['cost'] - (unit_cost_dkk/median_rate if unit_cost_dkk > 0 else plausible[0]['cost'])))
+                                selected_cost = best_match['cost']
+                                note = f"Khớp 100% Art No ({art}). Chọn {selected_cost}$ từ danh mục trong Overview."
                         else:
-                            plausible = exact_matches
+                            candidates = [rec for rec in ref_db if rec['art'].startswith(art) or art in rec['art']]
+                            if not candidates and len(art) >= 6:
+                                candidates = [rec for rec in ref_db if rec['art'].startswith(art[:6])]
 
-                        valid_dates = [e for e in plausible if isinstance(e['po_date'], (datetime.datetime, datetime.date))]
-                        if valid_dates and order_date:
-                            o_d = order_date.date() if isinstance(order_date, datetime.datetime) else order_date
-                            best_match = min(valid_dates, key=lambda e: abs((e['po_date'].date() if isinstance(e['po_date'], datetime.datetime) else e['po_date']) - o_d))
-                            selected_cost = best_match['cost']
-                            po_str = best_match['po_date'].strftime('%d/%m/%Y')
-                            od_str = order_date.strftime('%d/%m/%Y')
-                            note = f"Khớp 100% Art No ({art}). Chọn {selected_cost}$ theo đợt PO ({po_str}) gần nhất ngày đặt hàng ({od_str})."
-                        else:
-                            best_match = min(plausible, key=lambda e: abs(e['cost'] - (unit_cost_dkk/median_rate if unit_cost_dkk > 0 else plausible[0]['cost'])))
-                            selected_cost = best_match['cost']
-                            note = f"Khớp 100% Art No ({art}). Chọn {selected_cost}$ từ danh mục trong Overview."
+                            if candidates and unit_cost_dkk > 0:
+                                file_matched += 1
+                                est_usd = unit_cost_dkk / median_rate
+                                best_cand = min(candidates, key=lambda c: abs(c['cost'] - est_usd))
+                                selected_cost = best_cand['cost']
+                                note = f"Mã rút gọn MM ({art}). Dựa vào Unit Cost {unit_cost_dkk:.2f} DKK (~{est_usd:.2f}$), khớp phân khúc vải '{best_cand['fabric']}' (giá {selected_cost}$)."
+                            elif candidates:
+                                file_matched += 1
+                                selected_cost = round(sum(c['cost'] for c in candidates) / len(candidates), 2)
+                                note = f"Mã rút gọn MM ({art}). Lấy giá trung bình phân khúc {selected_cost}$."
+                            elif unit_cost_dkk > 0:
+                                file_matched += 1
+                                selected_cost = round(unit_cost_dkk / median_rate, 2)
+                                note = f"Mã {art} không còn trong Overview. Tính theo tỷ giá quy đổi Unit Cost: {unit_cost_dkk:.2f} DKK / {median_rate:.4f} = {selected_cost}$."
+                            else:
+                                selected_cost = 0.0
+                                note = f"Không tìm thấy mã {art} trong Overview."
+
+                        c_cost = s.cell(row=r_idx, column=col_cost_idx, value=selected_cost)
+                        c_cost.number_format = '#,##0.00'
+                        sample_c = s.cell(row=r_idx, column=unit_cost_col_idx if unit_cost_col_idx else 1)
+                        if sample_c.has_style:
+                            c_cost.font, c_cost.border = copy(sample_c.font), copy(sample_c.border)
+
+                        c_note = s.cell(row=r_idx, column=col_note_idx, value=note)
+                        if sample_c.has_style:
+                            c_note.font, c_note.border = copy(sample_c.font), copy(sample_c.border)
+
+                    # Total Row
+                    if last_is_total:
+                        c_total = s.cell(row=max_row, column=col_cost_idx, value=f"=SUM({cost_letter}2:{cost_letter}{data_end})")
+                        c_total.number_format = '#,##0.00'
+                        sample_t = s.cell(row=max_row, column=unit_cost_col_idx if unit_cost_col_idx else 1)
+                        if sample_t.has_style:
+                            c_total.font, c_total.border = copy(sample_t.font), copy(sample_t.border)
+
+                        c_t_note = s.cell(row=max_row, column=col_note_idx, value=f"Tổng Purchase Cost (USD) của {data_count} vụ khiếu nại")
+                        if sample_t.has_style:
+                            c_t_note.font, c_t_note.border = copy(sample_t.font), copy(sample_t.border)
+
+                    # Save as adjacent file with '_filled' suffix
+                    dir_name = os.path.dirname(fpath)
+                    base_name, ext = os.path.splitext(fname)
+                    if base_name.endswith("_filled"):
+                        out_fpath = fpath
                     else:
-                        candidates = [rec for rec in ref_db if rec['art'].startswith(art) or art in rec['art']]
-                        if not candidates and len(art) >= 6:
-                            candidates = [rec for rec in ref_db if rec['art'].startswith(art[:6])]
+                        out_fpath = os.path.join(dir_name, f"{base_name}_filled{ext}")
 
-                        if candidates and unit_cost_dkk > 0:
-                            file_matched += 1
-                            est_usd = unit_cost_dkk / median_rate
-                            best_cand = min(candidates, key=lambda c: abs(c['cost'] - est_usd))
-                            selected_cost = best_cand['cost']
-                            note = f"Mã rút gọn MM ({art}). Dựa vào Unit Cost {unit_cost_dkk:.2f} DKK (~{est_usd:.2f}$), khớp phân khúc vải '{best_cand['fabric']}' (giá {selected_cost}$)."
-                        elif candidates:
-                            file_matched += 1
-                            selected_cost = round(sum(c['cost'] for c in candidates) / len(candidates), 2)
-                            note = f"Mã rút gọn MM ({art}). Lấy giá trung bình phân khúc {selected_cost}$."
-                        elif unit_cost_dkk > 0:
-                            file_matched += 1
-                            selected_cost = round(unit_cost_dkk / median_rate, 2)
-                            note = f"Mã {art} không còn trong Overview. Tính theo tỷ giá quy đổi Unit Cost: {unit_cost_dkk:.2f} DKK / {median_rate:.4f} = {selected_cost}$."
-                        else:
-                            selected_cost = 0.0
-                            note = f"Không tìm thấy mã {art} trong Overview."
+                    wb.save(out_fpath)
+                    wb.close()
 
-                    c_cost = s.cell(row=r_idx, column=col_cost_idx, value=selected_cost)
-                    c_cost.number_format = '#,##0.00'
-                    sample_c = s.cell(row=r_idx, column=unit_cost_col_idx if unit_cost_col_idx else 1)
-                    if sample_c.has_style:
-                        c_cost.font, c_cost.border = copy(sample_c.font), copy(sample_c.border)
+                    out_abs = os.path.abspath(out_fpath)
+                    created_files.append(out_abs)
 
-                    c_note = s.cell(row=r_idx, column=col_note_idx, value=note)
-                    if sample_c.has_style:
-                        c_note.font, c_note.border = copy(sample_c.font), copy(sample_c.border)
+                    rate_str = f"{(file_matched / data_count * 100):.1f}%" if data_count > 0 else "100%"
+                    out_name = os.path.basename(out_fpath)
+                    self.after(0, self.append_feed_item, out_name, file_matched, data_count, rate_str, out_abs)
 
-                # Total Row
-                if last_is_total:
-                    c_total = s.cell(row=max_row, column=col_cost_idx, value=f"=SUM({cost_letter}2:{cost_letter}{data_end})")
-                    c_total.number_format = '#,##0.00'
-                    sample_t = s.cell(row=max_row, column=unit_cost_col_idx if unit_cost_col_idx else 1)
-                    if sample_t.has_style:
-                        c_total.font, c_total.border = copy(sample_t.font), copy(sample_t.border)
-
-                    c_t_note = s.cell(row=max_row, column=col_note_idx, value=f"Tổng Purchase Cost (USD) của {data_count} vụ khiếu nại")
-                    if sample_t.has_style:
-                        c_t_note.font, c_t_note.border = copy(sample_t.font), copy(sample_t.border)
-
-                # Save as adjacent file with '_filled' suffix
-                dir_name = os.path.dirname(fpath)
-                base_name, ext = os.path.splitext(fname)
-                if base_name.endswith("_filled"):
-                    out_fpath = fpath
-                else:
-                    out_fpath = os.path.join(dir_name, f"{base_name}_filled{ext}")
-
-                wb.save(out_fpath)
-                wb.close()
-
-                out_abs = os.path.abspath(out_fpath)
-                created_files.append(out_abs)
-
-                rate_str = f"{(file_matched / data_count * 100):.1f}%" if data_count > 0 else "100%"
-                out_name = os.path.basename(out_fpath)
-                self.after(0, self.append_feed_item, out_name, file_matched, data_count, rate_str, out_abs)
-
-                progress_val = 0.1 + 0.9 * (i / total_files)
-                self.after(0, self.prog_bar.set, progress_val)
+                except PermissionError:
+                    failed_count += 1
+                    err_msg = "File đang mở trong Excel hoặc ứng dụng khác. Vui lòng đóng file rồi thử lại."
+                    self.after(0, self.append_feed_error_item, fname, err_msg)
+                except (zipfile.BadZipFile, ValueError) as e:
+                    failed_count += 1
+                    err_msg = str(e) if isinstance(e, ValueError) else "File bị hỏng cấu trúc nén hoặc không phải định dạng .xlsx hợp lệ."
+                    self.after(0, self.append_feed_error_item, fname, err_msg)
+                except Exception as e:
+                    failed_count += 1
+                    err_msg = f"Lỗi: {e}"
+                    self.after(0, self.append_feed_error_item, fname, err_msg)
+                finally:
+                    progress_val = 0.1 + 0.9 * (i / total_files)
+                    self.after(0, self.prog_bar.set, progress_val)
 
             # Completion
             self.last_created_files = created_files
-            self.after(0, self.finish_processing_apple, True, total_files, created_files)
+            self.after(0, self.finish_processing_apple, total_files, created_files, failed_count)
 
         except Exception as e:
-            self.after(0, self.finish_processing_apple, False, 0, [], str(e))
+            self.after(0, self.finish_processing_apple, 0, [], 0, str(e))
 
-    def finish_processing_apple(self, success, total_files, created_files, err_msg=""):
-        self.prog_bar.set(1.0 if success else 0)
+    def finish_processing_apple(self, total_files, created_files, failed_count=0, err_msg=""):
+        self.prog_bar.set(1.0 if (len(created_files) > 0 and not err_msg) else 0)
         self.btn_run.configure(state="normal", fg_color=ROAST, text="Bắt Đầu Đối Chiếu & Điền Giá (Tạo File _filled)")
 
-        if success:
-            self.set_status_text("✓ Hoàn tất", MOSS, MOSS_SOFT)
-
-            # Determine subtitle message with full path
-            if len(created_files) == 1:
-                sub_text = f"Đã tạo file: {created_files[0]}"
-                target_file_to_reveal = created_files[0]
-            else:
-                lines = [f"• {p}" for p in created_files]
-                sub_text = f"Đã tạo {len(created_files)} file:\n" + "\n".join(lines)
-                target_file_to_reveal = created_files[0] if created_files else ""
-
-            # Render completion banner
-            banner = ctk.CTkFrame(self.results_feed, fg_color=MOSS_SOFT, corner_radius=12, border_width=1, border_color=MOSS)
-            banner.pack(fill="x", padx=10, pady=(8, 4))
-
-            b_left = ctk.CTkFrame(banner, fg_color="transparent")
-            b_left.pack(side="left", fill="x", expand=True, padx=16, pady=12)
-
+        if err_msg:
+            self.set_status_text("❌ Lỗi", DANGER)
+            err_box = ctk.CTkFrame(self.results_feed, fg_color=CARD, corner_radius=10, border_width=1, border_color=DANGER)
+            err_box.pack(fill="x", padx=10, pady=6)
             ctk.CTkLabel(
-                b_left,
-                text=f"🎉 Hoàn tất đối chiếu {total_files} file thành công!",
-                font=ctk.CTkFont(family=FONT_SERIF, size=13, weight="bold"),
-                text_color=ROAST
-            ).pack(anchor="w")
+                err_box,
+                text=f"Đã xảy ra lỗi: {err_msg}",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=DANGER,
+                wraplength=520,
+                justify="left"
+            ).pack(padx=12, pady=10)
+            return
 
+        if failed_count == 0 and len(created_files) > 0:
+            self.set_status_text("✓ Hoàn tất", MOSS, MOSS_SOFT)
+            title_text = f"Đã hoàn tất và điền giá {total_files} file."
+            banner_bg = MOSS_SOFT
+            banner_border = MOSS
+            banner_text_color = ROAST
+        elif len(created_files) > 0:
+            self.set_status_text("Đã hoàn tất một phần", BROWN, SAND)
+            title_text = f"Đã hoàn tất và điền giá {len(created_files)}/{total_files} file ({failed_count} file cần kiểm tra lại)."
+            banner_bg = SAND
+            banner_border = LINE
+            banner_text_color = ROAST
+        else:
+            self.set_status_text("✕ Chưa thể xử lý", DANGER)
+            title_text = "Chưa thể hoàn tất các file đã chọn. Vui lòng xem chi tiết ở danh sách trên."
+            banner_bg = CARD
+            banner_border = DANGER
+            banner_text_color = DANGER
+
+        # Determine subtitle message with paths
+        if len(created_files) == 1:
+            sub_text = f"Đã tạo file: {created_files[0]}"
+            target_file_to_reveal = created_files[0]
+        elif len(created_files) > 1:
+            lines = [f"• {p}" for p in created_files]
+            sub_text = f"Đã tạo {len(created_files)} file:\n" + "\n".join(lines)
+            target_file_to_reveal = created_files[0]
+        else:
+            sub_text = ""
+            target_file_to_reveal = ""
+
+        # Render completion / status banner
+        banner = ctk.CTkFrame(self.results_feed, fg_color=banner_bg, corner_radius=12, border_width=1, border_color=banner_border)
+        banner.pack(fill="x", padx=10, pady=(8, 4))
+
+        b_left = ctk.CTkFrame(banner, fg_color="transparent")
+        b_left.pack(side="left", fill="x", expand=True, padx=16, pady=12)
+
+        ctk.CTkLabel(
+            b_left,
+            text=title_text,
+            font=ctk.CTkFont(family=FONT_SERIF, size=13, weight="bold"),
+            text_color=banner_text_color
+        ).pack(anchor="w")
+
+        if sub_text:
             ctk.CTkLabel(
                 b_left,
                 text=sub_text,
@@ -1371,6 +1578,7 @@ exit
                 justify="left"
             ).pack(anchor="w", pady=(3, 0))
 
+        if target_file_to_reveal:
             ctk.CTkButton(
                 banner,
                 text="📂 Xem File",
@@ -1383,17 +1591,6 @@ exit
                 command=lambda p=target_file_to_reveal: reveal_in_explorer(p)
             ).pack(side="right", padx=16, pady=12)
 
-        else:
-            self.set_status_text("❌ Lỗi", DANGER)
-            err_box = ctk.CTkFrame(self.results_feed, fg_color=CARD, corner_radius=10, border_width=1, border_color=DANGER)
-            err_box.pack(fill="x", padx=10, pady=6)
-            ctk.CTkLabel(
-                err_box,
-                text=f"Đã xảy ra lỗi: {err_msg}",
-                font=ctk.CTkFont(family=FONT_SANS, size=11),
-                text_color=DANGER
-            ).pack(padx=12, pady=10)
-
 if __name__ == "__main__":
-    app = ClaimHelperAppleApp()
+    app = BoringTaskApp()
     app.mainloop()
