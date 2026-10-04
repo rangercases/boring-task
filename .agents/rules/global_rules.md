@@ -78,6 +78,82 @@ Tài liệu quy tắc và tiêu chuẩn kỹ thuật bắt buộc dành cho AI A
 
 ## 🔒 5. BẢO MẬT & BẢO VỆ DỮ LIỆU CÔNG TY
 
-- **Bảo mật tên doanh nghiệp:** Tuyệt đối không để lộ tên các công ty nội bộ (ví dụ: SOFACOMPANY) trong bất kỳ tài liệu nào đăng tải lên GitHub (`README.md`, commit message, code comments).
+- **Bảo mật tên doanh nghiệp:** Tuyệt đối không để lộ tên các công ty nội bộ trong bất kỳ tài liệu nào đăng tải lên GitHub (`README.md`, commit message, code comments).
 - **Loại trừ dữ liệu Excel:** Toàn bộ file dữ liệu (`.xlsx`, `.xls`, `.csv`, `.pkl`) phải nằm trong `.gitignore` để bảo vệ dữ liệu nghiệp vụ không bị đẩy lên mạng.
 - **Quy tắc an toàn thao tác file:** Mọi thao tác sửa hoặc ghi đè file quan trọng phải lập kế hoạch rõ ràng và nhận xác nhận từ người dùng.
+
+---
+
+## 📋 6. QUY TRÌNH BẮT BUỘC: IMPLEMENTATION PLAN & CONFIRMATION
+
+Mục đích: Đảm bảo mọi hành động được lập kế hoạch rõ ràng và có sự xác nhận của người dùng trước khi thực thi.
+
+### Phạm Vi Áp Dụng:
+- Tạo/chỉnh sửa file.
+- Chạy bash/powershell commands hoặc code.
+- Gọi APIs, external tools, hoặc MCP servers.
+- Bất kỳ hành động có tác động đến hệ thống/dữ liệu.
+
+### Quy Trình Bắt Buộc:
+1. **DESCRIBE THE PLAN:** Ghi rõ chi tiết các bước sẽ thực hiện.
+2. **ASK FOR CONFIRMATION:** Yêu cầu người dùng xác nhận bằng câu hỏi:
+   `Xác nhận trước khi tôi tiến hành? (Y/N)`
+3. **WAIT FOR APPROVAL:** Chỉ thực hiện khi nhận được đồng ý rõ ràng.
+4. **EXECUTE:** Thực thi đúng theo plan đã được phê duyệt.
+
+### Ngoại Lệ:
+- Câu hỏi thông tin, giải thích, hoặc tư vấn (không cần xác nhận).
+- Hành động đã được người dùng xác nhận trước đó trong cùng conversation.
+
+### Nguyên Tắc Cốt Lõi Về Thao Tác File & GitHub:
+- ❌ **Không bao giờ tự ý hành động:** MỌI hành động Tạo, Sửa, Ghi đè, Xóa, Gộp file (nhất là trong `D:\OneDrive`) BẮT BUỘC phải lập Plan và hỏi xác nhận.
+- ❌ **Dù người dùng có ghi kèm "và đẩy lên github" trong cùng một câu lệnh**, Agent VẪN PHẢI hỏi xác nhận cho phần thao tác file trước, TUYỆT ĐỐI KHÔNG ĐƯỢC tự ý gộp.
+- ✅ **Ngoại lệ GitHub chỉ áp dụng khi:**
+  - File đã được tạo/sửa xong từ trước và đã có sự đồng ý của người dùng.
+  - Người dùng ra lệnh RIÊNG BIỆT chỉ để đẩy git (ví dụ: "đẩy lên git", "push git"). Lúc đó mới không cần trình bày plan cho các lệnh git add/commit/push thuần túy.
+- ❌ Khi nghi ngờ hoặc câu lệnh có nhiều hành động -> **LUÔN CHỌN HỎI XÁC NHẬN**.
+
+---
+
+## 🛡️ 7. ANTIGRAVITY IDE — AI AGENT SAFETY RULES (WINDOWS)
+
+### 🚫 Vùng Cấm Tuyệt Đối (Critical Protection Zones - Hard Block):
+```text
+C:\Windows\*
+C:\Program Files\*
+C:\Program Files (x86)\*
+C:\ProgramData\*
+C:\System Volume Information\*
+C:\$Recycle.Bin\*
+C:\bootmgr
+C:\pagefile.sys
+C:\hiberfil.sys
+C:\Users\[Username]\AppData\*  (Trừ AppData\Local\BoringTask của ứng dụng)
+C:\Users\[Username]\Saved Games\*
+```
+- **Hành động:** Từ chối ngay lập tức nếu có lệnh xóa, di chuyển hoặc can thiệp registry vào các phân vùng trên.
+
+### 🔐 Bảo Vệ Thư Mục OneDrive (`D:\OneDrive`):
+- **Yêu cầu xác nhận nghiêm ngặt:**
+  - ❌ Xóa bất kỳ file/folder nào trong `D:\OneDrive`.
+  - ❌ Di chuyển file ra khỏi `D:\OneDrive`.
+  - ❌ Đổi tên file/folder trong `D:\OneDrive`.
+  - ❌ Thao tác hàng loạt (Bulk operations).
+- **Thao tác an toàn (Safe operations):**
+  - ✅ Đọc / Xem file (`view_file`, `read_url_content`).
+  - ✅ Copy file từ `D:\OneDrive` sang nơi khác.
+  - ✅ Tạo file mới / sửa file theo plan đã được xác nhận.
+
+### 🚫 Các Mẫu Lệnh Nguy Hiểm Bị Chặn Tức Thì (Instant Refuse):
+```text
+del /s /q ...
+rmdir /s /q ...
+rd /s ...
+move ...\*.* ...
+robocopy ... /MIR
+powershell Remove-Item ... -Recurse -Force
+taskkill /F /IM *
+takeown /F ...
+icacls ... /grant ...
+```
+- Tuyệt đối không dùng ký tự đại diện wildcard (`*`) trong các lệnh xóa hoặc di chuyển file.
