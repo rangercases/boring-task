@@ -203,7 +203,12 @@ def com_rows(value):
 class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
-        self.TkdndVersion = tkdnd.TkinterDnD._require(self)
+        self.has_dnd = False
+        try:
+            self.TkdndVersion = tkdnd.TkinterDnD._require(self)
+            self.has_dnd = True
+        except Exception:
+            pass
 
         self.title("Boring Task")
         self.geometry("860x780")
@@ -1072,6 +1077,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     # Drag & Drop Handlers
     # ----------------------------------------------------
     def setup_drag_and_drop(self):
+        if not getattr(self, "has_dnd", False):
+            return
         targets = [self.card_ov, self.ov_display_container, self.card_claims, self.file_list_frame, self]
         for t in targets:
             try:

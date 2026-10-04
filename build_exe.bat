@@ -6,7 +6,7 @@ echo ========================================================
 echo.
 
 echo [1/3] Đang kiểm tra thư viện...
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt pyinstaller>=6.0.0
 echo.
 
 echo [2/3] Đang đóng gói 1 file BoringTask.exe duy nhất...
