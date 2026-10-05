@@ -45,13 +45,14 @@ goto :download_online
 echo [1/4] Đang sao chép mã nguồn vào thư mục ứng dụng...
 copy /y "%SCRIPT_DIR%boring_task.pyw" "%INSTALL_DIR%\boring_task.pyw" >nul 2>nul
 copy /y "%SCRIPT_DIR%fabric_checker.py" "%INSTALL_DIR%\fabric_checker.py" >nul 2>nul
+copy /y "%SCRIPT_DIR%order_auditor.py" "%INSTALL_DIR%\order_auditor.py" >nul 2>nul
 copy /y "%SCRIPT_DIR%requirements.txt" "%INSTALL_DIR%\requirements.txt" >nul 2>nul
 if exist "%SCRIPT_DIR%assets" xcopy /y /e "%SCRIPT_DIR%assets" "%INSTALL_DIR%\assets\" >nul 2>nul
 goto :check_config
 
 :download_online
 echo [1/4] Đang tải mã nguồn mới nhất từ GitHub...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$installDir = [System.Environment]::GetFolderPath('LocalApplicationData') + '\BoringTask'; $baseUrl = '%GITHUB_RAW%'; $wc = New-Object System.Net.WebClient; $wc.Headers.Add('User-Agent', 'BoringTask-Installer'); $files = 'boring_task.pyw', 'fabric_checker.py', 'requirements.txt', 'assets/app_icon.ico', 'assets/boring_task_banner.png', 'assets/logo.png'; foreach ($f in $files) { $target = Join-Path $installDir $f; $url = $baseUrl + '/' + $f; try { $wc.DownloadFile($url, $target) } catch { Write-Host '  Lỗi tải:' $f } }; Write-Host '  ✓ Đã tải xong mã nguồn và tài nguyên.'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$installDir = [System.Environment]::GetFolderPath('LocalApplicationData') + '\BoringTask'; $baseUrl = '%GITHUB_RAW%'; $wc = New-Object System.Net.WebClient; $wc.Headers.Add('User-Agent', 'BoringTask-Installer'); $files = 'boring_task.pyw', 'fabric_checker.py', 'order_auditor.py', 'requirements.txt', 'assets/app_icon.ico', 'assets/boring_task_banner.png', 'assets/logo.png'; foreach ($f in $files) { $target = Join-Path $installDir $f; $url = $baseUrl + '/' + $f; try { $wc.DownloadFile($url, $target) } catch { Write-Host '  Lỗi tải:' $f } }; Write-Host '  ✓ Đã tải xong mã nguồn và tài nguyên.'"
 goto :check_config
 
 :check_config

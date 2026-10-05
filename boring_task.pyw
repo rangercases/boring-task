@@ -24,8 +24,16 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from PIL import Image
 
-from fabric_checker import FabricRuleManager, check_overview_file
-import order_auditor
+try:
+    from fabric_checker import FabricRuleManager, check_overview_file
+except ImportError:
+    FabricRuleManager = None
+    check_overview_file = None
+
+try:
+    import order_auditor
+except ImportError:
+    order_auditor = None
 
 # Set Windows App User Model ID so Taskbar groups and shows custom icon
 try:
@@ -261,12 +269,12 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         # Fabric Checker state
         curr_dir = os.path.abspath(os.path.dirname(__file__))
-        self.fabric_rule_mgr = FabricRuleManager(curr_dir)
+        self.fabric_rule_mgr = FabricRuleManager(curr_dir) if FabricRuleManager else None
         self.fabric_overview_file = ""
         self.fabric_running = False
 
         # Order Auditor state
-        self.auditor_engine = order_auditor.OrderAuditEngine()
+        self.auditor_engine = order_auditor.OrderAuditEngine() if order_auditor else None
         self.auditor_po_file = ""
         self.auditor_cust_file = ""
         self.auditor_running = False
@@ -390,21 +398,22 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                                         f.write(new_code)
                                     os.replace(tmp_file, curr_file)
 
-                                    # Also ensure fabric_checker.py is kept up to date
-                                    try:
-                                        fc_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/fabric_checker.py"
-                                        fc_req = urllib.request.Request(fc_url, headers={"User-Agent": "BoringTask-App"})
-                                        with urllib.request.urlopen(fc_req, timeout=5) as fc_resp:
-                                            if fc_resp.status == 200:
-                                                fc_code = fc_resp.read()
-                                                if len(fc_code) > 500:
-                                                    fc_path = os.path.join(app_dir, "fabric_checker.py")
-                                                    fc_tmp = fc_path + ".new"
-                                                    with open(fc_tmp, "wb") as f_fc:
-                                                        f_fc.write(fc_code)
-                                                    os.replace(fc_tmp, fc_path)
-                                    except Exception:
-                                        pass
+                                    # Also ensure extra modules (fabric_checker.py, order_auditor.py) are kept up to date
+                                    for extra_mod in ["fabric_checker.py", "order_auditor.py"]:
+                                        try:
+                                            mod_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{extra_mod}"
+                                            mod_req = urllib.request.Request(mod_url, headers={"User-Agent": "BoringTask-App"})
+                                            with urllib.request.urlopen(mod_req, timeout=5) as mod_resp:
+                                                if mod_resp.status == 200:
+                                                    mod_code = mod_resp.read()
+                                                    if len(mod_code) > 200:
+                                                        mod_path = os.path.join(app_dir, extra_mod)
+                                                        mod_tmp = mod_path + ".new"
+                                                        with open(mod_tmp, "wb") as f_mod:
+                                                            f_mod.write(mod_code)
+                                                        os.replace(mod_tmp, mod_path)
+                                        except Exception:
+                                            pass
 
                                     self.after(0, self.set_update_badge, f"✓ Đã tự động cập nhật {latest_tag}")
         except Exception:
