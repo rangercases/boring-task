@@ -3200,7 +3200,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         else:
             ctk.CTkLabel(
                 self.auditor_po_status_box,
-                text="Kéo thả file Purchase Order (.xlsx) vào đây hoặc bấm nút Chọn File ở góc trên",
+                text="Kéo thả file PO của Thuy vào đây",
                 font=ctk.CTkFont(family=FONT_SANS, size=11),
                 text_color=BROWN,
                 pady=18
@@ -3234,7 +3234,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         else:
             ctk.CTkLabel(
                 self.auditor_cust_status_box,
-                text="Kéo thả file Đơn hàng gốc / Master Data (.xlsx) của khách vào đây",
+                text="Kéo thả file của Life vào đây",
                 font=ctk.CTkFont(family=FONT_SANS, size=11),
                 text_color=BROWN,
                 pady=18
@@ -3334,7 +3334,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def auditor_finish_ui(self, total_items, results, out_file, err_msg):
         self.auditor_running = False
-        self.auditor_btn_run.configure(state="normal", fg_color=ROAST, text="Bắt Đầu Kiểm Toán Đơn Hàng (6 Lớp Bảo Vệ)")
+        self.auditor_btn_run.configure(state="normal", fg_color=ROAST, text="Bắt Đầu Kiểm Toán")
         self.auditor_prog.set(1.0 if not err_msg else 0)
 
         for child in self.auditor_feed.winfo_children():
