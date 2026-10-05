@@ -178,12 +178,12 @@ def load_app_mode():
         # Fallback to direct mode string if present
         mode = str(cfg.get("mode", "all")).strip().lower()
         if mode == "all":
-            return ["cost", "fabric", "images"]
-        elif mode in ("cost", "fabric", "images"):
+            return ["cost", "fabric", "images", "auditor"]
+        elif mode in ("cost", "fabric", "images", "auditor"):
             return [mode]
-        return ["cost", "fabric", "images"]
+        return ["cost", "fabric", "images", "auditor"]
     except Exception:
-        return ["cost", "fabric", "images"]
+        return ["cost", "fabric", "images", "auditor"]
 
 def img_url_to_unc(url):
     """Converts a file:// link stored in Excel into a Windows UNC path."""
