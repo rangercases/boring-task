@@ -2942,27 +2942,21 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
 
         # ========================================================
-        # CARD 1: File PO Cần Duyệt (Purchase Order Thủy Lập)
+        # TOP TOOLBAR: Import Model List / Aliases
         # ========================================================
-        self.card_auditor_po = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
-        self.card_auditor_po.pack(fill="x", pady=(0, 20))
-
-        top_po = ctk.CTkFrame(self.card_auditor_po, fg_color="transparent")
-        top_po.pack(fill="x", padx=24, pady=(18, 10))
+        top_bar = ctk.CTkFrame(scroll, fg_color="transparent")
+        top_bar.pack(fill="x", pady=(0, 10))
 
         ctk.CTkLabel(
-            top_po,
-            text="1. FILE PURCHASE ORDER (PO / PI CẦN KIỂM TOÁN)",
+            top_bar,
+            text="KIỂM TOÁN ĐƠN HÀNG (PURCHASE ORDER AUDITOR)",
             font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
             text_color=BROWN
         ).pack(side="left")
 
-        btn_po_box = ctk.CTkFrame(top_po, fg_color="transparent")
-        btn_po_box.pack(side="right")
-
-        self.btn_pick_auditor_po = ctk.CTkButton(
-            btn_po_box,
-            text="+ Chọn File PO...",
+        ctk.CTkButton(
+            top_bar,
+            text="+ Nạp Thêm Model List...",
             font=ctk.CTkFont(family=FONT_SANS, size=11),
             fg_color="transparent",
             text_color=ROAST,
@@ -2970,37 +2964,12 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             border_width=1,
             border_color=LINE,
             corner_radius=14,
-            width=140,
             height=28,
-            command=self.auditor_browse_po_file
-        )
-        self.btn_pick_auditor_po.pack(side="left", padx=4)
-
-        self.btn_clear_auditor_po = ctk.CTkButton(
-            btn_po_box,
-            text="Xóa File",
-            font=ctk.CTkFont(family=FONT_SANS, size=11),
-            fg_color="transparent",
-            text_color=DANGER,
-            hover_color=SAND,
-            border_width=0,
-            corner_radius=14,
-            width=70,
-            height=28,
-            command=self.auditor_clear_po_file
-        )
-        self.btn_clear_auditor_po.pack(side="left", padx=4)
-
-        ctk.CTkFrame(self.card_auditor_po, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
-
-        self.auditor_po_status_box = ctk.CTkFrame(
-            self.card_auditor_po, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
-        )
-        self.auditor_po_status_box.pack(fill="x", padx=24, pady=(0, 20))
-        self.auditor_render_po_status()
+            command=self.auditor_import_model_file
+        ).pack(side="right")
 
         # ========================================================
-        # CARD 2: File Đơn Hàng Gốc Của Khách (Customer Order / Master)
+        # CARD 1: File Đơn Hàng Gốc Của Khách (Customer Order / Master)
         # ========================================================
         self.card_auditor_cust = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
         self.card_auditor_cust.pack(fill="x", pady=(0, 20))
@@ -3010,7 +2979,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         ctk.CTkLabel(
             top_cust,
-            text="2. FILE ĐƠN HÀNG GỐC CỦA KHÁCH (CUSTOMER ORDER / MASTER DATA)",
+            text="1. FILE ĐƠN HÀNG GỐC CỦA KHÁCH (CUSTOMER ORDER / MASTER DATA)",
             font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
             text_color=BROWN
         ).pack(side="left")
@@ -3056,6 +3025,64 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         )
         self.auditor_cust_status_box.pack(fill="x", padx=24, pady=(0, 20))
         self.auditor_render_cust_status()
+
+        # ========================================================
+        # CARD 2: File PO Cần Duyệt (Purchase Order Thủy Lập)
+        # ========================================================
+        self.card_auditor_po = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_auditor_po.pack(fill="x", pady=(0, 20))
+
+        top_po = ctk.CTkFrame(self.card_auditor_po, fg_color="transparent")
+        top_po.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top_po,
+            text="2. FILE PURCHASE ORDER (PO / PI CẦN KIỂM TOÁN)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_po_box = ctk.CTkFrame(top_po, fg_color="transparent")
+        btn_po_box.pack(side="right")
+
+        self.btn_pick_auditor_po = ctk.CTkButton(
+            btn_po_box,
+            text="+ Chọn File PO...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=140,
+            height=28,
+            command=self.auditor_browse_po_file
+        )
+        self.btn_pick_auditor_po.pack(side="left", padx=4)
+
+        self.btn_clear_auditor_po = ctk.CTkButton(
+            btn_po_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
+            command=self.auditor_clear_po_file
+        )
+        self.btn_clear_auditor_po.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_auditor_po, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.auditor_po_status_box = ctk.CTkFrame(
+            self.card_auditor_po, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.auditor_po_status_box.pack(fill="x", padx=24, pady=(0, 20))
+        self.auditor_render_po_status()
 
         # ========================================================
         # ACTION BUTTON & PROGRESS
@@ -3238,6 +3265,18 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def auditor_clear_cust_file(self):
         self.auditor_cust_file = ""
         self.auditor_render_cust_status()
+
+    def auditor_import_model_file(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file Model List để nạp thêm (Model List All.xlsx)",
+            filetypes=[("Excel Files", "*.xlsx *.xls")]
+        )
+        if path:
+            try:
+                count = self.auditor_engine.model_kb.import_models_from_excel(path)
+                messagebox.showinfo("Thành công", f"Đã nạp thêm {count} models vào cơ sở dữ liệu kiểm toán!")
+            except Exception as e:
+                messagebox.showerror("Lỗi", f"Không thể đọc file Model List: {e}")
 
     def auditor_on_drop_po(self, event):
         paths = [p for p in parse_drop_paths(event.data) if os.path.isfile(p)]

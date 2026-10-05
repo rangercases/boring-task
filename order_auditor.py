@@ -85,6 +85,40 @@ class ModelKnowledgeBase:
         except Exception as e:
             print(f"[ModelKnowledgeBase] Error saving custom rules: {e}")
 
+    def import_models_from_excel(self, excel_path: str) -> int:
+        """Đọc và nạp thêm các model mới từ file Excel (Model List All.xlsx)."""
+        if not os.path.exists(excel_path):
+            raise FileNotFoundError(f"Không tìm thấy file {excel_path}")
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        sheet = wb.active
+        # Tìm sheet có tên Export hoặc sheet đầu
+        if "Export" in wb.sheetnames:
+            sheet = wb["Export"]
+        added = 0
+        for i, row in enumerate(sheet.iter_rows(values_only=True)):
+            if i == 0:
+                continue
+            status = row[0] if len(row) > 0 else 'Active'
+            num = row[1] if len(row) > 1 else None
+            name = row[2] if len(row) > 2 else None
+            if num and name:
+                norm_k = self.normalize_key(str(num))
+                self.models[norm_k] = {
+                    "number": str(num).strip(),
+                    "name": str(name).strip(),
+                    "status": str(status).strip() if status else 'Active'
+                }
+                added += 1
+        wb.close()
+        self.save_custom_rules()
+        return added
+
+    def add_alias(self, model_num: str, standard_name: str):
+        """Thêm bí danh mới, ví dụ MD 1723 -> Astha."""
+        norm = self.normalize_key(model_num)
+        self.aliases[norm] = standard_name.strip()
+        self.save_custom_rules()
+
     def get_model_info(self, model_num: str) -> Optional[Tuple[str, str]]:
         """Trả về (expected_name, status)."""
         norm = self.normalize_key(model_num)
@@ -420,12 +454,12 @@ class AuditResultItem:
 
     def set_layer(self, layer_name: str, status: str, detail: str):
         self.layers[layer_name] = (status, detail)
-        if status == "ERROR":
-            self.overall_status = "ERROR"
-            self.summary_reasons.append(f"[{layer_name}] {detail}")
-        elif status == "REVIEW" and self.overall_status != "ERROR":
-            self.overall_status = "REVIEW"
-            self.summary_reasons.append(f"[{layer_name}] {detail}")
+        if status in ("ERROR", "REVIEW"):
+            if status == "ERROR":
+                self.overall_status = "ERROR"
+            elif status == "REVIEW" and self.overall_status != "ERROR":
+                self.overall_status = "REVIEW"
+            self.summary_reasons.append(f"• {detail}")
 
 
 class OrderAuditEngine:
@@ -462,16 +496,14 @@ class OrderAuditEngine:
             audit_item.matched_customer_entry = matched_entry
 
             if matched_entry:
-                audit_item.set_layer("Layer 1: SKU", "PASS", f"Matched Customer SKU: {matched_entry.get('sku')} (ID: {matched_entry.get('internal_id')})")
+                audit_item.set_layer("Layer 1: SKU", "PASS", f"Matched Customer SKU: {matched_entry.get('sku')}")
             elif lookup_code:
-                # Nếu có mã Art No nhưng không tìm thấy trong Master Data khách
-                # Lưu ý: Không vội kết luận ERROR nếu Customer Catalog không có sheet Master Data đầy đủ
                 if customer_catalog.sku_map:
-                    audit_item.set_layer("Layer 1: SKU", "REVIEW", f"Art No '{lookup_code}' not found in provided Customer Master Data")
+                    audit_item.set_layer("Layer 1: SKU", "REVIEW", f"Art No '{lookup_code}' not in Customer Master Data")
                 else:
                     audit_item.set_layer("Layer 1: SKU", "PASS", f"PO Art No: {lookup_code}")
             else:
-                audit_item.set_layer("Layer 1: SKU", "REVIEW", "Missing Customer Art No in PO description")
+                audit_item.set_layer("Layer 1: SKU", "REVIEW", "Missing Art No in PO description")
 
             # ---------------------------------------------------------
             # LỚP 2 – MODEL VERIFICATION (MODEL NUMBER ↔ MODEL NAME)
@@ -480,8 +512,6 @@ class OrderAuditEngine:
                 model_info = self.model_kb.get_model_info(po_item.md_number)
                 if model_info:
                     exp_name, exp_status = model_info
-                    # Kiểm tra xem tên model mong đợi có xuất hiện trong mô tả hoặc tên hàng không
-                    # Chuẩn hóa bỏ dấu câu, chữ hoa thường
                     exp_clean = exp_name.lower().replace("by sls", "").strip()
                     desc_low = combined_text.lower()
 
@@ -489,41 +519,37 @@ class OrderAuditEngine:
                         if exp_status.lower() in ["discontinue", "deleted", "inactive"]:
                             audit_item.set_layer("Layer 2: Model", "REVIEW", f"{po_item.md_number} is {exp_name} ({exp_status} model)")
                         else:
-                            audit_item.set_layer("Layer 2: Model", "PASS", f"{po_item.md_number} correctly matches '{exp_name}'")
+                            audit_item.set_layer("Layer 2: Model", "PASS", f"{po_item.md_number} matches '{exp_name}'")
                     else:
-                        audit_item.set_layer("Layer 2: Model", "ERROR", f"{po_item.md_number} standard model is '{exp_name}', but not found in PO item description!")
+                        audit_item.set_layer("Layer 2: Model", "ERROR", f"Model mismatch: {po_item.md_number} standard name is '{exp_name}', not matching PO description")
                 else:
-                    audit_item.set_layer("Layer 2: Model", "REVIEW", f"{po_item.md_number} not recognized in standard Model List")
+                    audit_item.set_layer("Layer 2: Model", "REVIEW", f"{po_item.md_number} not found in standard Model List")
             else:
-                audit_item.set_layer("Layer 2: Model", "PASS", "Non-MD item / General component")
+                audit_item.set_layer("Layer 2: Model", "PASS", "General component / Non-MD item")
 
             # ---------------------------------------------------------
             # LỚP 3 – FABRIC / COLOR VERIFICATION
             # ---------------------------------------------------------
-            # Bóc tách màu/vải từ description
-            fabric_status, fabric_msg = "PASS", "Fabric/Color check standard"
-            # Kiểm tra trường hợp Dune, Boucle, Velvet, Soap, Black, Natural
+            fabric_status, fabric_msg = "PASS", "Fabric / Color verified"
             if "dune" in combined_text.lower():
-                # Phân biệt chặt chẽ dòng Dune
                 if "pasha dune" in combined_text.lower() or "padu" in combined_text.lower():
-                    fabric_status, fabric_msg = "PASS", "Pasha Dune recognized (Fabric Pasha 058 Dune)"
+                    fabric_status, fabric_msg = "PASS", "Pasha Dune verified (Fabric Pasha 058 Dune)"
                 elif "free dune" in combined_text.lower():
-                    fabric_status, fabric_msg = "PASS", "Free Dune recognized (Fabric Free 058 Dune)"
+                    fabric_status, fabric_msg = "PASS", "Free Dune verified (Fabric Free 058 Dune)"
                 elif "vega" in combined_text.lower() or "sand dune" in combined_text.lower():
-                    fabric_status, fabric_msg = "PASS", "Vega Sand Dune recognized (Fabric Venga Recycle 004 Mole)"
+                    fabric_status, fabric_msg = "PASS", "Vega Sand Dune verified (Fabric Venga Recycle 004 Mole)"
 
             audit_item.set_layer("Layer 3: Fabric", fabric_status, fabric_msg)
 
             # ---------------------------------------------------------
             # LỚP 4 – PRODUCT CONFIGURATION & ORIENTATION
             # ---------------------------------------------------------
-            # LEF / RHF / LHF / RIG
             orientation_m = re.search(r'\b(LEF|RIG|LHF|RHF|LEFT|RIGHT)\b', combined_text, re.IGNORECASE)
             if orientation_m:
                 orient = orientation_m.group(1).upper()
-                audit_item.set_layer("Layer 4: Config", "REVIEW", f"Orientation '{orient}' detected without engineering drawing. Please review BOM/Spec.")
+                audit_item.set_layer("Layer 4: Config", "REVIEW", f"Orientation '{orient}': Please verify with Spec/Drawing")
             else:
-                audit_item.set_layer("Layer 4: Config", "PASS", "Standard configuration")
+                audit_item.set_layer("Layer 4: Config", "PASS", "Standard config")
 
             # ---------------------------------------------------------
             # LỚP 5 – SET VERIFICATION (SPLIT 1/2 VÀ 2/2)
@@ -531,27 +557,25 @@ class OrderAuditEngine:
             split_m = re.search(r'\b([12])/2\b', combined_text)
             if split_m:
                 part = f"{split_m.group(1)}/2"
-                # Tạo base key loại bỏ 1/2 và 2/2
                 base_name = re.sub(r'\b[12]/2\b', '', combined_text).strip()
                 base_key = re.sub(r'\s+', ' ', base_name.lower())[:40]
                 if base_key not in sets_tracking:
                     sets_tracking[base_key] = {"1/2": 0.0, "2/2": 0.0, "items": []}
                 sets_tracking[base_key][part] += po_item.qty
                 sets_tracking[base_key]["items"].append(audit_item)
-                audit_item.set_layer("Layer 5: Set", "PASS", f"Split part {part} tracked")
+                audit_item.set_layer("Layer 5: Set", "PASS", f"Split unit {part}")
             else:
-                audit_item.set_layer("Layer 5: Set", "PASS", "Single / Standalone unit")
+                audit_item.set_layer("Layer 5: Set", "PASS", "Standalone unit")
 
             # ---------------------------------------------------------
             # LỚP 6 – COMMERCIAL CHECK (QTY, UNIT, PRICE)
             # ---------------------------------------------------------
             if po_item.qty <= 0:
-                audit_item.set_layer("Layer 6: Commercial", "ERROR", "Quantity must be greater than 0")
+                audit_item.set_layer("Layer 6: Commercial", "ERROR", "Quantity is 0 or invalid")
             elif po_item.price == 0.0:
-                # Giá = 0 KHÔNG TỰ ĐỘNG BÁO LỖI mà là REVIEW
-                audit_item.set_layer("Layer 6: Commercial", "REVIEW", "Price is 0 (Free sample / Warranty / Included parts - confirm commercial policy)")
+                audit_item.set_layer("Layer 6: Commercial", "REVIEW", "Price = 0 (Free sample / Warranty / Spareparts)")
             else:
-                audit_item.set_layer("Layer 6: Commercial", "PASS", f"Valid Qty={po_item.qty}, Price={po_item.price}")
+                audit_item.set_layer("Layer 6: Commercial", "PASS", f"Qty={po_item.qty}, Price={po_item.price}")
 
             results.append(audit_item)
 
@@ -564,7 +588,7 @@ class OrderAuditEngine:
                     item.set_layer(
                         "Layer 5: Set",
                         "ERROR",
-                        f"Imbalanced Set! Part 1/2 Qty={qty_1} vs Part 2/2 Qty={qty_2}. Missing companion split unit!"
+                        f"Imbalanced Set: 1/2 Qty ({qty_1}) != 2/2 Qty ({qty_2})"
                     )
 
         return results
@@ -648,7 +672,7 @@ def export_audit_excel(audit_results: List[AuditResultItem], output_path: str, s
         for r_idx in range(header_row + 1, target_sheet.max_row + 1):
             if r_idx in res_by_row:
                 item = res_by_row[r_idx]
-                reasons_text = "; ".join(item.summary_reasons) if item.summary_reasons else "✓ Khớp tất cả 6 lớp"
+                reasons_text = "\n".join(item.summary_reasons) if item.summary_reasons else "✓ All standard"
 
                 cell_status = target_sheet.cell(r_idx, col_status, value=item.overall_status)
                 cell_status.border = border_thin
