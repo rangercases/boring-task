@@ -3282,11 +3282,11 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
             results = self.auditor_engine.audit(po_doc, cust_catalog)
 
-            # Export Excel
+            # Export Excel directly annotated on PO copy
             po_dir = os.path.dirname(self.auditor_po_file)
-            po_base = os.path.splitext(os.path.basename(self.auditor_po_file))[0]
-            out_fn = os.path.join(po_dir, f"Audit_Report - {po_base}.xlsx")
-            order_auditor.export_audit_excel(results, out_fn)
+            po_base, po_ext = os.path.splitext(os.path.basename(self.auditor_po_file))
+            out_fn = os.path.join(po_dir, f"{po_base}_audited{po_ext}")
+            order_auditor.export_audit_excel(results, out_fn, source_po_path=self.auditor_po_file)
             self.auditor_last_report = out_fn
 
             self.after(0, self.auditor_finish_ui, len(results), results, out_fn, "")
