@@ -25,6 +25,7 @@ from openpyxl.utils import get_column_letter
 from PIL import Image
 
 from fabric_checker import FabricRuleManager, check_overview_file
+import order_auditor
 
 # Set Windows App User Model ID so Taskbar groups and shows custom icon
 try:
@@ -42,13 +43,13 @@ STATE_FILE_NAME = ".app_state.json"
 
 # Per-machine module visibility (controlled centrally by code & local config.json)
 CONFIG_FILE_NAME = "config.json"
-APP_MODES = ("all", "cost", "images", "fabric")
+APP_MODES = ("all", "cost", "images", "fabric", "auditor")
 
 # BẢNG PHÂN QUYỀN TẬP TRUNG (Sửa tại đây để phân quyền từ xa qua Git update)
 USER_PERMISSIONS = {
-    "nhung": ["cost"],                       # Ms Nhung: chỉ xem Purchase Cost
-    "thuy":  ["fabric"],                     # Ms Thuy: chỉ xem Fabric Checker
-    "admin": ["cost", "fabric", "images"],   # Admin: xem tất cả các module
+    "nhung": ["cost"],                                   # Ms Nhung: chỉ xem Purchase Cost
+    "thuy":  ["fabric", "auditor"],                      # Ms Thuy: Fabric Checker & Order Auditor
+    "admin": ["cost", "fabric", "images", "auditor"],   # Admin: toàn quyền xem tất cả các module
 }
 
 # Image Inserter module
@@ -263,6 +264,13 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.fabric_rule_mgr = FabricRuleManager(curr_dir)
         self.fabric_overview_file = ""
         self.fabric_running = False
+
+        # Order Auditor state
+        self.auditor_engine = order_auditor.OrderAuditEngine()
+        self.auditor_po_file = ""
+        self.auditor_cust_file = ""
+        self.auditor_running = False
+        self.auditor_last_report = ""
         saved_state = self.load_saved_state()
 
         if saved_state is not None:
@@ -467,6 +475,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.claim_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.image_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.fabric_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.auditor_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
 
         self.build_home()
         self.build_feature_nav(self.claim_view, "Purchase Cost Auto-Filled")
@@ -738,6 +747,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             self.build_image_inserter()
         if "fabric" in self.app_mode:
             self.build_fabric_checker()
+        if "auditor" in self.app_mode:
+            self.build_order_auditor()
 
         self.show_home()
 
@@ -780,6 +791,13 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 "title": "Fabric Checker",
                 "subtitle": "Mapping & Validate",
                 "command": lambda: self.show_feature(self.fabric_view, "Fabric Checker"),
+            })
+        if "auditor" in self.app_mode:
+            features.append({
+                "icon": "⚖️",
+                "title": "Order Auditor",
+                "subtitle": "Multi-Layer PO Check",
+                "command": lambda: self.show_feature(self.auditor_view, "Order Auditor"),
             })
 
         cols = 3
@@ -910,6 +928,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.claim_view.pack_forget()
         self.image_view.pack_forget()
         self.fabric_view.pack_forget()
+        self.auditor_view.pack_forget()
         self.home_view.pack(fill="both", expand=True)
         self.current_view = self.home_view
         self.title("Boring Task")
@@ -2913,6 +2932,498 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     text_color=FAINT
                 ).pack(padx=16, pady=(4, 8), anchor="w")
 
+    # ====================================================
+    # MODULE: Order Auditor (Multi-Layer PO Verification)
+    # ====================================================
+    def build_order_auditor(self):
+        self.build_feature_nav(self.auditor_view, "Order Auditor")
+
+        scroll = ctk.CTkScrollableFrame(self.auditor_view, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
+
+        # ========================================================
+        # CARD 1: File PO Cần Duyệt (Purchase Order Thủy Lập)
+        # ========================================================
+        self.card_auditor_po = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_auditor_po.pack(fill="x", pady=(0, 20))
+
+        top_po = ctk.CTkFrame(self.card_auditor_po, fg_color="transparent")
+        top_po.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top_po,
+            text="1. FILE PURCHASE ORDER (PO / PI CẦN KIỂM TOÁN)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_po_box = ctk.CTkFrame(top_po, fg_color="transparent")
+        btn_po_box.pack(side="right")
+
+        self.btn_pick_auditor_po = ctk.CTkButton(
+            btn_po_box,
+            text="+ Chọn File PO...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=140,
+            height=28,
+            command=self.auditor_browse_po_file
+        )
+        self.btn_pick_auditor_po.pack(side="left", padx=4)
+
+        self.btn_clear_auditor_po = ctk.CTkButton(
+            btn_po_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
+            command=self.auditor_clear_po_file
+        )
+        self.btn_clear_auditor_po.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_auditor_po, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.auditor_po_status_box = ctk.CTkFrame(
+            self.card_auditor_po, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.auditor_po_status_box.pack(fill="x", padx=24, pady=(0, 20))
+        self.auditor_render_po_status()
+
+        # ========================================================
+        # CARD 2: File Đơn Hàng Gốc Của Khách (Customer Order / Master)
+        # ========================================================
+        self.card_auditor_cust = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_auditor_cust.pack(fill="x", pady=(0, 20))
+
+        top_cust = ctk.CTkFrame(self.card_auditor_cust, fg_color="transparent")
+        top_cust.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top_cust,
+            text="2. FILE ĐƠN HÀNG GỐC CỦA KHÁCH (CUSTOMER ORDER / MASTER DATA)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_cust_box = ctk.CTkFrame(top_cust, fg_color="transparent")
+        btn_cust_box.pack(side="right")
+
+        self.btn_pick_auditor_cust = ctk.CTkButton(
+            btn_cust_box,
+            text="+ Chọn File Khách...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=150,
+            height=28,
+            command=self.auditor_browse_cust_file
+        )
+        self.btn_pick_auditor_cust.pack(side="left", padx=4)
+
+        self.btn_clear_auditor_cust = ctk.CTkButton(
+            btn_cust_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
+            command=self.auditor_clear_cust_file
+        )
+        self.btn_clear_auditor_cust.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_auditor_cust, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.auditor_cust_status_box = ctk.CTkFrame(
+            self.card_auditor_cust, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.auditor_cust_status_box.pack(fill="x", padx=24, pady=(0, 20))
+        self.auditor_render_cust_status()
+
+        # ========================================================
+        # ACTION BUTTON & PROGRESS
+        # ========================================================
+        action_wrap = ctk.CTkFrame(scroll, fg_color="transparent")
+        action_wrap.pack(fill="x", pady=(0, 20))
+
+        self.auditor_btn_run = ctk.CTkButton(
+            action_wrap,
+            text="Bắt Đầu Kiểm Toán Đơn Hàng (6 Lớp Bảo Vệ)",
+            font=ctk.CTkFont(family=FONT_SERIF, size=14, weight="bold"),
+            fg_color=ROAST,
+            text_color=IVORY,
+            hover_color=MOSS,
+            height=46,
+            corner_radius=23,
+            command=self.auditor_start_process
+        )
+        self.auditor_btn_run.pack(fill="x", pady=(0, 8))
+
+        self.auditor_prog = ctk.CTkProgressBar(
+            action_wrap,
+            height=3,
+            fg_color=LINE,
+            progress_color=MOSS,
+            corner_radius=2
+        )
+        self.auditor_prog.pack(fill="x")
+        self.auditor_prog.set(0)
+
+        # ========================================================
+        # CARD 3: Results Feed
+        # ========================================================
+        self.card_auditor_results = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_auditor_results.pack(fill="both", expand=True, pady=(0, 8))
+
+        r_head = ctk.CTkFrame(self.card_auditor_results, fg_color="transparent")
+        r_head.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            r_head,
+            text="TIẾN ĐỘ & KẾT QUẢ KIỂM TOÁN",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        self.auditor_status_lbl = ctk.CTkLabel(
+            r_head,
+            text="Sẵn sàng",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN
+        )
+        self.auditor_status_lbl.pack(side="right")
+
+        ctk.CTkFrame(self.card_auditor_results, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.auditor_feed = ctk.CTkFrame(
+            self.card_auditor_results, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.auditor_feed.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.auditor_render_initial_feed()
+
+        # Setup Drag and Drop for Order Auditor
+        if getattr(self, "has_dnd", False):
+            for t in [self.card_auditor_po, self.auditor_po_status_box]:
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', lambda e: self.auditor_on_drop_po(e))
+                except Exception:
+                    pass
+            for t in [self.card_auditor_cust, self.auditor_cust_status_box]:
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', lambda e: self.auditor_on_drop_cust(e))
+                except Exception:
+                    pass
+
+    def auditor_render_initial_feed(self):
+        for child in self.auditor_feed.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(
+            self.auditor_feed,
+            text="Chọn file PO và file Đơn hàng của khách rồi bấm 'Bắt Đầu Kiểm Toán'.\nHệ thống sẽ đối chiếu 6 lớp: SKU, Model, Fabric, Config, Set 1/2-2/2 và Giá bán.",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN,
+            justify="center",
+            pady=32
+        ).pack(fill="both", expand=True)
+
+    def auditor_render_po_status(self):
+        for child in self.auditor_po_status_box.winfo_children():
+            child.destroy()
+        if self.auditor_po_file and os.path.exists(self.auditor_po_file):
+            sz = format_file_size(os.path.getsize(self.auditor_po_file))
+            fn = os.path.basename(self.auditor_po_file)
+            row = ctk.CTkFrame(self.auditor_po_status_box, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=12)
+
+            ctk.CTkLabel(
+                row, text="📄", font=ctk.CTkFont(size=16), text_color=ROAST
+            ).pack(side="left", padx=(0, 8))
+
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="x", expand=True)
+
+            ctk.CTkLabel(
+                info_box, text=fn, font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+                text_color=ROAST, anchor="w"
+            ).pack(anchor="w")
+
+            ctk.CTkLabel(
+                info_box, text=f"Kích thước: {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN, anchor="w"
+            ).pack(anchor="w")
+        else:
+            ctk.CTkLabel(
+                self.auditor_po_status_box,
+                text="Kéo thả file Purchase Order (.xlsx) vào đây hoặc bấm nút Chọn File ở góc trên",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=BROWN,
+                pady=18
+            ).pack(fill="both", expand=True)
+
+    def auditor_render_cust_status(self):
+        for child in self.auditor_cust_status_box.winfo_children():
+            child.destroy()
+        if self.auditor_cust_file and os.path.exists(self.auditor_cust_file):
+            sz = format_file_size(os.path.getsize(self.auditor_cust_file))
+            fn = os.path.basename(self.auditor_cust_file)
+            row = ctk.CTkFrame(self.auditor_cust_status_box, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=12)
+
+            ctk.CTkLabel(
+                row, text="📂", font=ctk.CTkFont(size=16), text_color=ROAST
+            ).pack(side="left", padx=(0, 8))
+
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="x", expand=True)
+
+            ctk.CTkLabel(
+                info_box, text=fn, font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+                text_color=ROAST, anchor="w"
+            ).pack(anchor="w")
+
+            ctk.CTkLabel(
+                info_box, text=f"Kích thước: {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN, anchor="w"
+            ).pack(anchor="w")
+        else:
+            ctk.CTkLabel(
+                self.auditor_cust_status_box,
+                text="Kéo thả file Đơn hàng gốc / Master Data (.xlsx) của khách vào đây",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=BROWN,
+                pady=18
+            ).pack(fill="both", expand=True)
+
+    def auditor_browse_po_file(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file Purchase Order",
+            filetypes=[("Excel Files", "*.xlsx *.xls")]
+        )
+        if path:
+            self.auditor_po_file = os.path.abspath(path)
+            self.auditor_render_po_status()
+
+    def auditor_clear_po_file(self):
+        self.auditor_po_file = ""
+        self.auditor_render_po_status()
+
+    def auditor_browse_cust_file(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file Đơn hàng gốc của khách",
+            filetypes=[("Excel Files", "*.xlsx *.xls")]
+        )
+        if path:
+            self.auditor_cust_file = os.path.abspath(path)
+            self.auditor_render_cust_status()
+
+    def auditor_clear_cust_file(self):
+        self.auditor_cust_file = ""
+        self.auditor_render_cust_status()
+
+    def auditor_on_drop_po(self, event):
+        paths = [p for p in parse_drop_paths(event.data) if os.path.isfile(p)]
+        if paths:
+            self.auditor_po_file = paths[0]
+            self.auditor_render_po_status()
+
+    def auditor_on_drop_cust(self, event):
+        paths = [p for p in parse_drop_paths(event.data) if os.path.isfile(p)]
+        if paths:
+            self.auditor_cust_file = paths[0]
+            self.auditor_render_cust_status()
+
+    def auditor_start_process(self):
+        if self.auditor_running:
+            return
+        if not self.auditor_po_file or not os.path.exists(self.auditor_po_file):
+            messagebox.showwarning("Thiếu file", "Vui lòng chọn File Purchase Order (PO) cần kiểm toán.")
+            return
+        if not self.auditor_cust_file or not os.path.exists(self.auditor_cust_file):
+            messagebox.showwarning("Thiếu file", "Vui lòng chọn File Đơn hàng gốc của khách.")
+            return
+
+        self.auditor_running = True
+        self.auditor_btn_run.configure(state="disabled", fg_color=FAINT, text="Đang kiểm toán đa nguồn...")
+        self.auditor_prog.set(0.15)
+        self.auditor_status_lbl.configure(text="Đang xử lý...", text_color=MOSS)
+
+        # Clear feed
+        for child in self.auditor_feed.winfo_children():
+            child.destroy()
+
+        threading.Thread(target=self.auditor_worker, daemon=True).start()
+
+    def auditor_worker(self):
+        try:
+            self.auditor_prog.set(0.3)
+            po_doc = order_auditor.POParsedDoc(self.auditor_po_file)
+            self.auditor_prog.set(0.6)
+            cust_catalog = order_auditor.CustomerCatalog(self.auditor_cust_file)
+            self.auditor_prog.set(0.85)
+
+            results = self.auditor_engine.audit(po_doc, cust_catalog)
+
+            # Export Excel
+            po_dir = os.path.dirname(self.auditor_po_file)
+            po_base = os.path.splitext(os.path.basename(self.auditor_po_file))[0]
+            out_fn = os.path.join(po_dir, f"Audit_Report - {po_base}.xlsx")
+            order_auditor.export_audit_excel(results, out_fn)
+            self.auditor_last_report = out_fn
+
+            self.after(0, self.auditor_finish_ui, len(results), results, out_fn, "")
+        except Exception as e:
+            self.after(0, self.auditor_finish_ui, 0, [], "", str(e))
+
+    def auditor_finish_ui(self, total_items, results, out_file, err_msg):
+        self.auditor_running = False
+        self.auditor_btn_run.configure(state="normal", fg_color=ROAST, text="Bắt Đầu Kiểm Toán Đơn Hàng (6 Lớp Bảo Vệ)")
+        self.auditor_prog.set(1.0 if not err_msg else 0)
+
+        for child in self.auditor_feed.winfo_children():
+            child.destroy()
+
+        if err_msg:
+            self.auditor_status_lbl.configure(text="✕ Lỗi xử lý", text_color=DANGER)
+            err_box = ctk.CTkFrame(self.auditor_feed, fg_color=CARD, corner_radius=10, border_width=1, border_color=DANGER)
+            err_box.pack(fill="x", padx=10, pady=10)
+            ctk.CTkLabel(
+                err_box, text=f"Lỗi: {err_msg}", font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=DANGER, wraplength=520, justify="left"
+            ).pack(padx=12, pady=10)
+            return
+
+        pass_c = sum(1 for r in results if r.overall_status == "PASS")
+        rev_c = sum(1 for r in results if r.overall_status == "REVIEW")
+        err_c = sum(1 for r in results if r.overall_status == "ERROR")
+
+        if err_c > 0:
+            self.auditor_status_lbl.configure(text=f"Phát hiện {err_c} lỗi", text_color=DANGER)
+            b_bg, b_border = CARD, DANGER
+        elif rev_c > 0:
+            self.auditor_status_lbl.configure(text=f"Cần xem lại {rev_c} mục", text_color=BROWN)
+            b_bg, b_border = SAND, LINE
+        else:
+            self.auditor_status_lbl.configure(text="✓ Khớp 100%", text_color=MOSS)
+            b_bg, b_border = MOSS_SOFT, MOSS
+
+        # Summary Banner
+        banner = ctk.CTkFrame(self.auditor_feed, fg_color=b_bg, corner_radius=12, border_width=1, border_color=b_border)
+        banner.pack(fill="x", padx=10, pady=10)
+
+        b_left = ctk.CTkFrame(banner, fg_color="transparent")
+        b_left.pack(side="left", fill="x", expand=True, padx=16, pady=12)
+
+        ctk.CTkLabel(
+            b_left,
+            text=f"Đã kiểm toán {total_items} dòng sản phẩm",
+            font=ctk.CTkFont(family=FONT_SERIF, size=13, weight="bold"),
+            text_color=ROAST
+        ).pack(anchor="w")
+
+        stats_str = f"🟢 PASS: {pass_c} dòng  |  🟡 REVIEW: {rev_c} dòng  |  🔴 ERROR: {err_c} dòng"
+        ctk.CTkLabel(
+            b_left, text=stats_str,
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(anchor="w", pady=(3, 2))
+
+        ctk.CTkLabel(
+            b_left, text=f"File báo cáo: {os.path.basename(out_file)}",
+            font=ctk.CTkFont(family=FONT_SANS, size=10),
+            text_color=FAINT, wraplength=420, justify="left"
+        ).pack(anchor="w")
+
+        # Action buttons
+        btn_box = ctk.CTkFrame(banner, fg_color="transparent")
+        btn_box.pack(side="right", padx=16, pady=12)
+
+        ctk.CTkButton(
+            btn_box, text="Mở Báo Cáo",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            fg_color=ROAST, text_color=IVORY, hover_color=MOSS,
+            corner_radius=16, height=32, width=105,
+            command=lambda p=out_file: os.startfile(p)
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            btn_box, text="📂 Xem File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            fg_color=CARD, text_color=ROAST, hover_color=SAND,
+            border_width=1, border_color=LINE,
+            corner_radius=16, height=32, width=96,
+            command=lambda p=out_file: reveal_in_explorer(p)
+        ).pack(side="left", padx=4)
+
+        # Highlight Errors & Reviews list
+        flagged = [r for r in results if r.overall_status in ["ERROR", "REVIEW"]]
+        if flagged:
+            list_card = ctk.CTkFrame(self.auditor_feed, fg_color=CARD, corner_radius=12, border_width=1, border_color=LINE)
+            list_card.pack(fill="x", padx=10, pady=(0, 10))
+
+            lh = ctk.CTkFrame(list_card, fg_color="transparent")
+            lh.pack(fill="x", padx=16, pady=(10, 6))
+
+            ctk.CTkLabel(
+                lh,
+                text=f"DANH SÁCH CHI TIẾT CÁC ĐIỂM CẦN LƯU Ý ({len(flagged)} mục)",
+                font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                text_color=DANGER if err_c > 0 else BROWN
+            ).pack(side="left")
+
+            # Show top 6 items
+            for item in flagged[:6]:
+                p = item.po_item
+                t_row = ctk.CTkFrame(list_card, fg_color="transparent")
+                t_row.pack(fill="x", padx=16, pady=4)
+
+                badge_color = "#ffc7ce" if item.overall_status == "ERROR" else "#ffeb9c"
+                badge_text_color = "#9c0006" if item.overall_status == "ERROR" else "#9c6500"
+
+                ctk.CTkLabel(
+                    t_row,
+                    text=f" {item.overall_status} ",
+                    font=ctk.CTkFont(family=FONT_SANS, size=9, weight="bold"),
+                    fg_color=badge_color,
+                    text_color=badge_text_color,
+                    corner_radius=4
+                ).pack(side="left", padx=(0, 8))
+
+                summary_reason = item.summary_reasons[0] if item.summary_reasons else ""
+                label_text = f"Dòng {p.row_idx} ({p.md_number or p.item_no}): {summary_reason}"
+                ctk.CTkLabel(
+                    t_row, text=label_text,
+                    font=ctk.CTkFont(family=FONT_SANS, size=10),
+                    text_color=ROAST, anchor="w", wraplength=520, justify="left"
+                ).pack(side="left", fill="x", expand=True)
+
+            if len(flagged) > 6:
+                ctk.CTkLabel(
+                    list_card,
+                    text=f"...và {len(flagged) - 6} mục khác (vui lòng mở file Báo Cáo Excel để xem toàn bộ chi tiết).",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, slant="italic"),
+                    text_color=FAINT
+                ).pack(padx=16, pady=(4, 8), anchor="w")
+
 if __name__ == "__main__":
     app = BoringTaskApp()
     app.mainloop()
+
