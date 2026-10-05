@@ -24,6 +24,8 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from PIL import Image
 
+from fabric_checker import FabricRuleManager, check_overview_file
+
 # Set Windows App User Model ID so Taskbar groups and shows custom icon
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("rangercases.boringtask.v1")
@@ -38,10 +40,16 @@ GITHUB_REPO = "rangercases/claim-helper"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
 
-# Per-machine module visibility (NOT tracked by git, never overwritten by updater)
-# {"mode": "all"} | {"mode": "cost"} | {"mode": "images"}
+# Per-machine module visibility (controlled centrally by code & local config.json)
 CONFIG_FILE_NAME = "config.json"
-APP_MODES = ("all", "cost", "images")
+APP_MODES = ("all", "cost", "images", "fabric")
+
+# BẢNG PHÂN QUYỀN TẬP TRUNG (Sửa tại đây để phân quyền từ xa qua Git update)
+USER_PERMISSIONS = {
+    "nhung": ["cost"],                       # Ms Nhung: chỉ xem Purchase Cost
+    "thuy":  ["fabric"],                     # Ms Thuy: chỉ xem Fabric Checker
+    "admin": ["cost", "fabric", "images"],   # Admin: xem tất cả các module
+}
 
 # Image Inserter module
 IMAGE_CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "BoringTask", "ImageCache")
@@ -153,13 +161,28 @@ def get_config_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE_NAME)
 
 def load_app_mode():
-    """Reads which modules this machine may see. Missing/invalid config -> 'all'."""
+    """Reads which modules this machine may see.
+    Supports both user mapping (USER_PERMISSIONS) and legacy mode strings.
+    Lightning-fast local read (<1ms).
+    """
     try:
         with open(get_config_path(), "r", encoding="utf-8") as f:
-            mode = str(json.load(f).get("mode", "all")).strip().lower()
-        return mode if mode in APP_MODES else "all"
+            cfg = json.load(f)
+        
+        # Check user key first (Ms Nhung / Ms Thuy / Admin)
+        user = str(cfg.get("user", "")).strip().lower()
+        if user in USER_PERMISSIONS:
+            return USER_PERMISSIONS[user]
+        
+        # Fallback to direct mode string if present
+        mode = str(cfg.get("mode", "all")).strip().lower()
+        if mode == "all":
+            return ["cost", "fabric", "images"]
+        elif mode in ("cost", "fabric", "images"):
+            return [mode]
+        return ["cost", "fabric", "images"]
     except Exception:
-        return "all"
+        return ["cost", "fabric", "images"]
 
 def img_url_to_unc(url):
     """Converts a file:// link stored in Excel into a Windows UNC path."""
@@ -235,7 +258,11 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.img_running = False
         self.img_active_step = -1
 
+        # Fabric Checker state
         curr_dir = os.path.abspath(os.path.dirname(__file__))
+        self.fabric_rule_mgr = FabricRuleManager(curr_dir)
+        self.fabric_overview_file = ""
+        self.fabric_running = False
         saved_state = self.load_saved_state()
 
         if saved_state is not None:
@@ -349,10 +376,28 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                                 new_code = raw_resp.read()
                                 if len(new_code) > 1000 and (b"BoringTask" in new_code or b"ClaimHelper" in new_code):
                                     curr_file = os.path.abspath(__file__)
+                                    app_dir = os.path.dirname(curr_file)
                                     tmp_file = curr_file + ".new"
                                     with open(tmp_file, "wb") as f:
                                         f.write(new_code)
                                     os.replace(tmp_file, curr_file)
+
+                                    # Also ensure fabric_checker.py is kept up to date
+                                    try:
+                                        fc_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/fabric_checker.py"
+                                        fc_req = urllib.request.Request(fc_url, headers={"User-Agent": "BoringTask-App"})
+                                        with urllib.request.urlopen(fc_req, timeout=5) as fc_resp:
+                                            if fc_resp.status == 200:
+                                                fc_code = fc_resp.read()
+                                                if len(fc_code) > 500:
+                                                    fc_path = os.path.join(app_dir, "fabric_checker.py")
+                                                    fc_tmp = fc_path + ".new"
+                                                    with open(fc_tmp, "wb") as f_fc:
+                                                        f_fc.write(fc_code)
+                                                    os.replace(fc_tmp, fc_path)
+                                    except Exception:
+                                        pass
+
                                     self.after(0, self.set_update_badge, f"✓ Đã tự động cập nhật {latest_tag}")
         except Exception:
             pass
@@ -421,6 +466,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.home_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.claim_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.image_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.fabric_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
 
         self.build_home()
         self.build_feature_nav(self.claim_view, "Purchase Cost Auto-Filled")
@@ -688,8 +734,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             text_color=FAINT
         ).pack(side="left")
 
-        if self.app_mode in ("all", "images"):
+        if "images" in self.app_mode:
             self.build_image_inserter()
+        if "fabric" in self.app_mode:
+            self.build_fabric_checker()
 
         self.show_home()
 
@@ -712,19 +760,26 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         # To add a new feature: append one entry here (gated by config.json mode).
         features = []
-        if self.app_mode in ("all", "cost"):
+        if "cost" in self.app_mode:
             features.append({
                 "icon": "📋",
                 "title": "Purchase Cost",
                 "subtitle": "Auto-Filled",
                 "command": lambda: self.show_feature(self.claim_view, "Purchase Cost Auto-Filled"),
             })
-        if self.app_mode in ("all", "images"):
+        if "images" in self.app_mode:
             features.append({
                 "icon": "🖼️",
                 "title": "Image Inserter",
                 "subtitle": "Place in Cell",
                 "command": lambda: self.show_feature(self.image_view, "Image Inserter"),
+            })
+        if "fabric" in self.app_mode:
+            features.append({
+                "icon": "🧵",
+                "title": "Fabric Checker",
+                "subtitle": "Mapping & Validate",
+                "command": lambda: self.show_feature(self.fabric_view, "Fabric Checker"),
             })
 
         cols = 3
@@ -854,6 +909,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def show_home(self):
         self.claim_view.pack_forget()
         self.image_view.pack_forget()
+        self.fabric_view.pack_forget()
         self.home_view.pack(fill="both", expand=True)
         self.current_view = self.home_view
         self.title("Boring Task")
@@ -1132,6 +1188,37 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     t.dnd_bind('<<Drop>>', self.on_drop_image)
                     t.dnd_bind('<<DropEnter>>', on_img_enter)
                     t.dnd_bind('<<DropLeave>>', on_img_leave)
+                except Exception:
+                    pass
+
+        # Fabric Checker drop zones
+        if hasattr(self, "fabric_rule_status_box"):
+            def on_fabric_rule_enter(e):
+                self.fabric_rule_status_box.configure(border_color=MOSS, fg_color=MOSS_SOFT)
+            def on_fabric_rule_leave(e):
+                self.fabric_rule_status_box.configure(border_color=FAINT, fg_color=SAND)
+
+            for t in (self.card_fabric_rule, self.fabric_rule_status_box):
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', self.on_drop_fabric_rule)
+                    t.dnd_bind('<<DropEnter>>', on_fabric_rule_enter)
+                    t.dnd_bind('<<DropLeave>>', on_fabric_rule_leave)
+                except Exception:
+                    pass
+
+        if hasattr(self, "fabric_ov_drop_zone"):
+            def on_fabric_ov_enter(e):
+                self.fabric_ov_drop_zone.configure(border_color=MOSS, fg_color=MOSS_SOFT)
+            def on_fabric_ov_leave(e):
+                self.fabric_ov_drop_zone.configure(border_color=FAINT, fg_color=SAND)
+
+            for t in (self.card_fabric_ov, self.fabric_ov_drop_zone):
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', self.on_drop_fabric_overview)
+                    t.dnd_bind('<<DropEnter>>', on_fabric_ov_enter)
+                    t.dnd_bind('<<DropLeave>>', on_fabric_ov_leave)
                 except Exception:
                     pass
 
@@ -2220,6 +2307,611 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             os.startfile(out_file)
         except Exception:
             pass
+
+    # ====================================================
+    # MODULE: Fabric Mapping Checker
+    # ====================================================
+    def build_fabric_checker(self):
+        self.build_feature_nav(self.fabric_view, "Fabric Checker")
+
+        scroll = ctk.CTkScrollableFrame(self.fabric_view, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
+
+        # ========================================================
+        # CARD 1: Rule File (Fabric_name.xlsx)
+        # ========================================================
+        self.card_fabric_rule = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_fabric_rule.pack(fill="x", pady=(0, 20))
+
+        top_rule = ctk.CTkFrame(self.card_fabric_rule, fg_color="transparent")
+        top_rule.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top_rule,
+            text="FILE QUY TẮC VẢI (FABRIC RULES)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_rule_box = ctk.CTkFrame(top_rule, fg_color="transparent")
+        btn_rule_box.pack(side="right")
+
+        self.btn_pick_rule = ctk.CTkButton(
+            btn_rule_box,
+            text="+ Chọn File Quy Tắc...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=165,
+            height=28,
+            command=self.fabric_browse_rule_file
+        )
+        self.btn_pick_rule.pack(side="left", padx=4)
+
+        self.btn_clear_rule = ctk.CTkButton(
+            btn_rule_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
+            command=self.fabric_clear_rule_file
+        )
+        self.btn_clear_rule.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_fabric_rule, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.fabric_rule_status_box = ctk.CTkFrame(
+            self.card_fabric_rule, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.fabric_rule_status_box.pack(fill="x", padx=24, pady=(0, 20))
+        self.fabric_render_rule_status()
+
+        # ========================================================
+        # CARD 2: File Overview Cần Kiểm Tra
+        # ========================================================
+        self.card_fabric_ov = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_fabric_ov.pack(fill="x", pady=(0, 20))
+
+        top_ov = ctk.CTkFrame(self.card_fabric_ov, fg_color="transparent")
+        top_ov.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top_ov,
+            text="FILE OVERVIEW CẦN KIỂM TRA",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_ov_box = ctk.CTkFrame(top_ov, fg_color="transparent")
+        btn_ov_box.pack(side="right")
+
+        self.btn_pick_fabric_ov = ctk.CTkButton(
+            btn_ov_box,
+            text="+ Chọn File Overview...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=165,
+            height=28,
+            command=self.fabric_browse_overview_file
+        )
+        self.btn_pick_fabric_ov.pack(side="left", padx=4)
+
+        self.btn_clear_fabric_ov = ctk.CTkButton(
+            btn_ov_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
+            command=self.fabric_clear_overview_file
+        )
+        self.btn_clear_fabric_ov.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_fabric_ov, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.fabric_ov_drop_zone = ctk.CTkFrame(
+            self.card_fabric_ov, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.fabric_ov_drop_zone.pack(fill="x", padx=24, pady=(0, 20))
+        self.fabric_render_overview_file()
+
+        # ========================================================
+        # ACTION BUTTON & PROGRESS
+        # ========================================================
+        act = ctk.CTkFrame(scroll, fg_color="transparent")
+        act.pack(fill="x", pady=(4, 14))
+
+        self.fabric_btn_run = ctk.CTkButton(
+            act,
+            text="Bắt Đầu Kiểm Tra Khớp Vải (Tạo File _checked)",
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            fg_color=ROAST,
+            hover_color=MOSS,
+            text_color=IVORY,
+            corner_radius=24,
+            height=48,
+            command=self.fabric_start_check
+        )
+        self.fabric_btn_run.pack(fill="x")
+
+        self.fabric_prog = ctk.CTkProgressBar(scroll, progress_color=MOSS, fg_color=LINE, height=3, corner_radius=2)
+        self.fabric_prog.set(0)
+        self.fabric_prog.pack(fill="x", pady=(0, 20))
+
+        # ========================================================
+        # CARD 3: TIẾN ĐỘ & KẾT QUẢ
+        # ========================================================
+        card_res = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        card_res.pack(fill="both", expand=True, pady=(0, 8))
+
+        head = ctk.CTkFrame(card_res, fg_color="transparent")
+        head.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            head,
+            text="TIẾN ĐỘ & KẾT QUẢ",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        self.fabric_status_lbl = ctk.CTkLabel(
+            head, text="Sẵn sàng",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN
+        )
+        self.fabric_status_lbl.pack(side="right")
+
+        ctk.CTkFrame(card_res, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.fabric_feed = ctk.CTkFrame(card_res, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT)
+        self.fabric_feed.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.fabric_render_initial_feed()
+
+    # ---------- Fabric Checker Renderers & Handlers ----------
+    def fabric_render_rule_status(self, delta_info=None):
+        for child in self.fabric_rule_status_box.winfo_children():
+            child.destroy()
+
+        rules = self.fabric_rule_mgr.rules
+        if rules:
+            self.btn_clear_rule.configure(state="normal", text_color=DANGER)
+            row = ctk.CTkFrame(self.fabric_rule_status_box, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+            row.pack(fill="x", padx=10, pady=10)
+
+            ctk.CTkLabel(row, text="📖", font=ctk.CTkFont(size=14), text_color=CARAMEL).pack(side="left", padx=(12, 8), pady=8)
+
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True, pady=6)
+
+            title_row = ctk.CTkFrame(info, fg_color="transparent")
+            title_row.pack(anchor="w")
+
+            src_file = self.fabric_rule_mgr.meta.get("source_file", "Fabric_name.xlsx")
+            ctk.CTkLabel(
+                title_row,
+                text=src_file,
+                font=ctk.CTkFont(family=FONT_SERIF, size=12, weight="bold"),
+                text_color=ROAST
+            ).pack(side="left")
+
+            # Pill Badge matching Purchase Cost
+            ctk.CTkLabel(
+                title_row,
+                text=f"  ✓ ĐÃ GHI NHỚ ({len(rules)} cặp)  ",
+                font=ctk.CTkFont(family=FONT_SANS, size=9, weight="bold"),
+                fg_color=MOSS_SOFT,
+                text_color=MOSS,
+                corner_radius=6
+            ).pack(side="left", padx=(8, 0))
+
+            updated_at = self.fabric_rule_mgr.meta.get("updated_at", "Chưa rõ")
+            sub_msg = f"Cập nhật lúc: {updated_at}"
+            if delta_info:
+                add_cnt = delta_info.get("added_count", 0)
+                if add_cnt > 0:
+                    sub_msg += f"  •  Vừa thêm {add_cnt} cặp mới"
+
+            ctk.CTkLabel(
+                info,
+                text=sub_msg,
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN,
+                anchor="w"
+            ).pack(anchor="w", pady=(2, 0))
+
+            # Inline Delete Button
+            ctk.CTkButton(
+                row,
+                text="✕",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="transparent",
+                text_color=BROWN,
+                hover_color=SAND,
+                border_width=0,
+                corner_radius=12,
+                width=24,
+                height=24,
+                command=self.fabric_clear_rule_file
+            ).pack(side="right", padx=(4, 12), pady=8)
+        else:
+            self.btn_clear_rule.configure(state="disabled", text_color=FAINT)
+            ctk.CTkLabel(
+                self.fabric_rule_status_box,
+                text="📥  Kéo thả file Fabric_name.xlsx vào đây để lưu quy tắc",
+                font=ctk.CTkFont(family=FONT_SANS, size=12),
+                text_color=BROWN,
+                pady=20
+            ).pack(fill="both", expand=True)
+
+    def fabric_browse_rule_file(self):
+        if self.fabric_running:
+            return
+        path = filedialog.askopenfilename(
+            title="Chọn file quy tắc vải (Fabric_name.xlsx)",
+            filetypes=[("Excel Files", "*.xlsx *.xlsm")]
+        )
+        if path:
+            self.fabric_load_rule_file(path)
+
+    def fabric_load_rule_file(self, path):
+        if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in (".xlsx", ".xlsm"):
+            messagebox.showwarning("Định dạng không hợp lệ", "Vui lòng chọn file Excel quy tắc (.xlsx hoặc .xlsm).")
+            return
+        try:
+            delta = self.fabric_rule_mgr.import_rule_file(path)
+            self.fabric_render_rule_status(delta_info=delta)
+            self.fabric_set_status("Đã cập nhật quy tắc", MOSS, MOSS_SOFT)
+        except Exception as e:
+            messagebox.showerror("Lỗi đọc file quy tắc", f"Không thể đọc file quy tắc:\n{e}")
+
+    def fabric_clear_rule_file(self):
+        if self.fabric_running:
+            return
+        self.fabric_rule_mgr.rules = []
+        self.fabric_rule_mgr.meta = {}
+        self.fabric_rule_mgr.save_rules()
+        self.fabric_render_rule_status()
+        self.fabric_set_status("Sẵn sàng", BROWN)
+
+    def on_drop_fabric_rule(self, event):
+        self.fabric_rule_status_box.configure(border_color=FAINT, fg_color=SAND)
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if os.path.isfile(p) and p.lower().endswith((".xlsx", ".xlsm")):
+                self.fabric_load_rule_file(p)
+                return
+
+    def fabric_render_overview_file(self):
+        for child in self.fabric_ov_drop_zone.winfo_children():
+            child.destroy()
+
+        if self.fabric_overview_file and os.path.exists(self.fabric_overview_file):
+            self.btn_clear_fabric_ov.configure(state="normal", text_color=DANGER)
+            row = ctk.CTkFrame(self.fabric_ov_drop_zone, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+            row.pack(fill="x", padx=10, pady=10)
+
+            ctk.CTkLabel(row, text="📊", font=ctk.CTkFont(size=14), text_color=CARAMEL).pack(side="left", padx=(12, 8), pady=8)
+
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True, pady=6)
+
+            title_row = ctk.CTkFrame(info, fg_color="transparent")
+            title_row.pack(anchor="w")
+
+            ctk.CTkLabel(
+                title_row, text=os.path.basename(self.fabric_overview_file),
+                font=ctk.CTkFont(family=FONT_SERIF, size=12, weight="bold"),
+                text_color=ROAST
+            ).pack(side="left")
+
+            ctk.CTkLabel(
+                title_row,
+                text="  SẴN SÀNG  ",
+                font=ctk.CTkFont(family=FONT_SANS, size=9, weight="bold"),
+                fg_color=MOSS_SOFT,
+                text_color=MOSS,
+                corner_radius=6
+            ).pack(side="left", padx=(8, 0))
+
+            ctk.CTkLabel(
+                info, text=f"{self.fabric_overview_file}  •  {format_file_size(os.path.getsize(self.fabric_overview_file))}",
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN, anchor="w"
+            ).pack(anchor="w", pady=(2, 0))
+
+            ctk.CTkButton(
+                row, text="✕",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="transparent", text_color=BROWN, hover_color=SAND,
+                border_width=0, corner_radius=12, width=24, height=24,
+                command=self.fabric_clear_overview_file
+            ).pack(side="right", padx=(4, 12), pady=8)
+        else:
+            self.btn_clear_fabric_ov.configure(state="disabled", text_color=FAINT)
+            ctk.CTkLabel(
+                self.fabric_ov_drop_zone,
+                text="📥  Kéo thả file Overview.xlsx vào đây",
+                font=ctk.CTkFont(family=FONT_SANS, size=12),
+                text_color=BROWN,
+                pady=20
+            ).pack(fill="both", expand=True)
+
+    def fabric_browse_overview_file(self):
+        if self.fabric_running:
+            return
+        path = filedialog.askopenfilename(
+            title="Chọn file Overview cần kiểm tra",
+            filetypes=[("Excel Files", "*.xlsx *.xlsm")]
+        )
+        if path:
+            self.fabric_set_overview_file(path)
+
+    def fabric_set_overview_file(self, path):
+        if self.fabric_running:
+            return
+        if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in (".xlsx", ".xlsm"):
+            messagebox.showwarning("Định dạng không hợp lệ", "Vui lòng chọn file Excel (.xlsx hoặc .xlsm).")
+            return
+        self.fabric_overview_file = os.path.abspath(path)
+        self.fabric_render_overview_file()
+        self.fabric_render_initial_feed()
+        self.fabric_prog.set(0)
+        self.fabric_set_status("Sẵn sàng", BROWN)
+
+    def fabric_clear_overview_file(self):
+        if self.fabric_running:
+            return
+        self.fabric_overview_file = ""
+        self.fabric_render_overview_file()
+        self.fabric_render_initial_feed()
+        self.fabric_prog.set(0)
+        self.fabric_set_status("Sẵn sàng", BROWN)
+
+    def on_drop_fabric_overview(self, event):
+        self.fabric_ov_drop_zone.configure(border_color=FAINT, fg_color=SAND)
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if os.path.isfile(p) and p.lower().endswith((".xlsx", ".xlsm")):
+                self.fabric_set_overview_file(p)
+                return
+
+    def fabric_set_status(self, text, color, bg="transparent"):
+        self.fabric_status_lbl.configure(text=f"  {text}  " if bg != "transparent" else text, text_color=color, fg_color=bg)
+
+    def fabric_render_initial_feed(self):
+        for child in self.fabric_feed.winfo_children():
+            child.destroy()
+        hint = ctk.CTkLabel(
+            self.fabric_feed,
+            text="Kết quả kiểm tra khớp vải và báo cáo thống kê sẽ hiển thị tại đây.",
+            font=ctk.CTkFont(family=FONT_SANS, size=12),
+            text_color=BROWN,
+            pady=24
+        )
+        hint.pack(fill="both", expand=True)
+
+    def fabric_start_check(self):
+        if self.fabric_running:
+            return
+        if not self.fabric_overview_file or not os.path.exists(self.fabric_overview_file):
+            messagebox.showwarning("Thiếu file Overview", "Vui lòng chọn hoặc kéo thả file Overview.xlsx trước.")
+            return
+        if not self.fabric_rule_mgr.rules:
+            messagebox.showwarning("Thiếu quy tắc vải", "Chưa có quy tắc vải nào được nạp. Vui lòng nạp file Fabric_name.xlsx trước.")
+            return
+
+        self.fabric_running = True
+        self.fabric_btn_run.configure(state="disabled", text="Đang So Khớp Dữ Liệu Vải...")
+        self.btn_pick_fabric_ov.configure(state="disabled")
+        self.btn_clear_fabric_ov.configure(state="disabled")
+        self.btn_pick_rule.configure(state="disabled")
+        self.btn_clear_rule.configure(state="disabled")
+        self.fabric_prog.set(0.05)
+        self.fabric_set_status("Đang kiểm tra...", MOSS)
+
+        for child in self.fabric_feed.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(
+            self.fabric_feed,
+            text="⏳ Đang phân tích so khớp từng dòng...",
+            font=ctk.CTkFont(family=FONT_SANS, size=12),
+            text_color=BROWN,
+            pady=20
+        ).pack(fill="both", expand=True)
+
+        threading.Thread(target=self.fabric_worker, daemon=True).start()
+
+    def fabric_worker(self):
+        try:
+            def on_progress(current, total):
+                if total > 0:
+                    pct = 0.05 + 0.90 * (current / total)
+                    self.after(0, self.fabric_prog.set, pct)
+
+            stats = check_overview_file(
+                overview_path=self.fabric_overview_file,
+                rule_manager=self.fabric_rule_mgr,
+                fuzzy_threshold=0.85,
+                progress_callback=on_progress
+            )
+            self.after(0, self.fabric_finish, stats, "")
+        except PermissionError:
+            self.after(0, self.fabric_finish, {}, "File Overview đang mở trong Excel hoặc ứng dụng khác. Vui lòng đóng file rồi thử lại.")
+        except Exception as e:
+            self.after(0, self.fabric_finish, {}, str(e))
+
+    def fabric_finish(self, stats, err_msg=""):
+        self.fabric_running = False
+        self.fabric_btn_run.configure(state="normal", text="Bắt Đầu Kiểm Tra Khớp Vải (Tạo File _checked)")
+        self.btn_pick_fabric_ov.configure(state="normal")
+        self.btn_clear_fabric_ov.configure(state="normal")
+        self.btn_pick_rule.configure(state="normal")
+        self.btn_clear_rule.configure(state="normal")
+
+        for child in self.fabric_feed.winfo_children():
+            child.destroy()
+
+        if err_msg:
+            self.fabric_prog.set(0)
+            self.fabric_set_status("❌ Lỗi", DANGER)
+            err_box = ctk.CTkFrame(self.fabric_feed, fg_color=CARD, corner_radius=10, border_width=1, border_color=DANGER)
+            err_box.pack(fill="x", padx=10, pady=10)
+            ctk.CTkLabel(
+                err_box, text=f"Đã xảy ra lỗi: {err_msg}",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=DANGER, wraplength=520, justify="left"
+            ).pack(padx=14, pady=12, anchor="w")
+            return
+
+        self.fabric_prog.set(1.0)
+        self.fabric_set_status("✓ Hoàn tất", MOSS, MOSS_SOFT)
+
+        # 1. Summary Metrics Banner
+        banner = ctk.CTkFrame(self.fabric_feed, fg_color=CARD, corner_radius=12, border_width=1, border_color=LINE)
+        banner.pack(fill="x", padx=10, pady=(10, 8))
+
+        top_b = ctk.CTkFrame(banner, fg_color="transparent")
+        top_b.pack(fill="x", padx=16, pady=(12, 6))
+
+        ctk.CTkLabel(
+            top_b,
+            text=f"Hoàn tất kiểm tra {stats['total_rows']} dòng dữ liệu",
+            font=ctk.CTkFont(family=FONT_SERIF, size=14, weight="bold"),
+            text_color=ROAST
+        ).pack(side="left")
+
+        # 3 Pills: OK / PARTIAL / ERROR
+        pills_box = ctk.CTkFrame(top_b, fg_color="transparent")
+        pills_box.pack(side="right")
+
+        ctk.CTkLabel(
+            pills_box,
+            text=f"  ✓ OK: {stats['ok']} ({stats['ok_pct']:.1f}%)  ",
+            font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+            fg_color="#c6efce", text_color="#006100", corner_radius=10
+        ).pack(side="left", padx=3)
+
+        ctk.CTkLabel(
+            pills_box,
+            text=f"  ⚠ PARTIAL: {stats['partial']} ({stats['partial_pct']:.1f}%)  ",
+            font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+            fg_color="#ffeb9c", text_color="#9c6500", corner_radius=10
+        ).pack(side="left", padx=3)
+
+        ctk.CTkLabel(
+            pills_box,
+            text=f"  ✗ ERROR: {stats['error']} ({stats['error_pct']:.1f}%)  ",
+            font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+            fg_color="#ffc7ce", text_color="#9c0006", corner_radius=10
+        ).pack(side="left", padx=3)
+
+        # Divider
+        ctk.CTkFrame(banner, height=1, fg_color=LINE).pack(fill="x", padx=16, pady=4)
+
+        # Breakdown info & action buttons
+        mid_b = ctk.CTkFrame(banner, fg_color="transparent")
+        mid_b.pack(fill="x", padx=16, pady=(4, 12))
+
+        b_info = ctk.CTkFrame(mid_b, fg_color="transparent")
+        b_info.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkLabel(
+            b_info,
+            text=f"• Chưa điền tên vải (- / trống): {stats['empty_fabric']} dòng\n• ERROR thật sự (có vải nhưng không khớp): {stats['real_error']} dòng",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN, justify="left", anchor="w"
+        ).pack(anchor="w")
+
+        out_f = stats.get("output_file", "")
+        btn_box = ctk.CTkFrame(mid_b, fg_color="transparent")
+        btn_box.pack(side="right")
+
+        if out_f:
+            ctk.CTkButton(
+                btn_box, text="Mở File",
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                fg_color=ROAST, text_color=IVORY, hover_color=MOSS,
+                corner_radius=16, height=32, width=96,
+                command=lambda p=out_f: os.startfile(p)
+            ).pack(side="left", padx=4)
+
+            ctk.CTkButton(
+                btn_box, text="📂 Xem File",
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                fg_color=CARD, text_color=ROAST, hover_color=SAND,
+                border_width=1, border_color=LINE,
+                corner_radius=16, height=32, width=96,
+                command=lambda p=out_f: reveal_in_explorer(p)
+            ).pack(side="left", padx=4)
+
+        # 2. Missing Fabrics Table (if real errors exist)
+        missing_counts = stats.get("missing_fabrics", {})
+        if missing_counts:
+            miss_box = ctk.CTkFrame(self.fabric_feed, fg_color=CARD, corner_radius=12, border_width=1, border_color=LINE)
+            miss_box.pack(fill="x", padx=10, pady=(0, 10))
+
+            miss_head = ctk.CTkFrame(miss_box, fg_color="transparent")
+            miss_head.pack(fill="x", padx=16, pady=(10, 6))
+
+            ctk.CTkLabel(
+                miss_head,
+                text="DANH SÁCH TÊN VẢI LỖI THẬT SỰ (CẦN BỔ SUNG VÀO QUY TẮC)",
+                font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                text_color=DANGER
+            ).pack(side="left")
+
+            ctk.CTkLabel(
+                miss_head,
+                text=f"{len(missing_counts)} loại vải chưa có trong mapping",
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN
+            ).pack(side="right")
+
+            # Table rows
+            for fab_name, count in missing_counts.most_common(8):
+                t_row = ctk.CTkFrame(miss_box, fg_color="transparent")
+                t_row.pack(fill="x", padx=16, pady=4)
+
+                ctk.CTkLabel(
+                    t_row, text=f"• {fab_name}",
+                    font=ctk.CTkFont(family=FONT_SANS, size=11),
+                    text_color=ROAST, anchor="w"
+                ).pack(side="left")
+
+                ctk.CTkLabel(
+                    t_row,
+                    text=f"  {count} lần  ",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                    fg_color="#ffc7ce",
+                    text_color="#9c0006",
+                    corner_radius=6
+                ).pack(side="right")
+
+            if len(missing_counts) > 8:
+                ctk.CTkLabel(
+                    miss_box,
+                    text=f"...và {len(missing_counts) - 8} loại vải khác (xem chi tiết trong file Excel đã tạo).",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, slant="italic"),
+                    text_color=FAINT
+                ).pack(padx=16, pady=(4, 8), anchor="w")
 
 if __name__ == "__main__":
     app = BoringTaskApp()
