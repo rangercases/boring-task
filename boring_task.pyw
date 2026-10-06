@@ -1946,8 +1946,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     latest_sha = data.get("sha", "")
                     
                     if latest_sha and latest_sha != curr_sha:
-                        # Fetch latest boring_task.pyw
-                        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/boring_task.pyw"
+                        # Fetch latest boring_task.pyw using exact SHA to bypass GitHub Raw CDN cache (5-min TTL)
+                        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{latest_sha}/boring_task.pyw"
                         req_raw = urllib.request.Request(raw_url, headers={"User-Agent": "BoringTask-App"})
                         with urllib.request.urlopen(req_raw, timeout=5) as raw_resp:
                             if raw_resp.status == 200:
