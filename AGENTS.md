@@ -1,6 +1,6 @@
 # ⚡ BORING TASK — GLOBAL AGENT RULES & PROJECT STANDARDS
 
-Tài liệu quy tắc và tiêu chuẩn kỹ thuật bắt buộc dành cho AI Agent và nhà phát triển khi làm việc trên dự án **Boring Task** (`rangercases/claim-helper`).
+Tài liệu quy tắc và tiêu chuẩn kỹ thuật bắt buộc dành cho AI Agent và nhà phát triển khi làm việc trên dự án **Boring Task** (`rangercases/boring-task`).
 
 ---
 

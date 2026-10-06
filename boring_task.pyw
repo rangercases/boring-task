@@ -1442,7 +1442,7 @@ def analyze_assortment_file(file_path, output_path=None):
 # MAIN BORING TASK APPLICATION CORE
 # ==============================================================================
 APP_VERSION = "v1.2"
-GITHUB_REPO = "rangercases/claim-helper"
+GITHUB_REPO = "rangercases/boring-task"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
 

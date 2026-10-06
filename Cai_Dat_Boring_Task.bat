@@ -4,7 +4,7 @@ title Cài đặt Boring Task
 
 set "SCRIPT_DIR=%~dp0"
 set "INSTALL_DIR=%LOCALAPPDATA%\BoringTask"
-set "GITHUB_RAW=https://raw.githubusercontent.com/rangercases/claim-helper/main"
+set "GITHUB_RAW=https://raw.githubusercontent.com/rangercases/boring-task/main"
 
 echo ========================================================
 echo          CÀI ĐẶT PHẦN MỀM BORING TASK
