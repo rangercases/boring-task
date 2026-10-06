@@ -24,32 +24,1424 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from PIL import Image
 
-try:
-    from fabric_checker import FabricRuleManager, check_overview_file
-except ImportError:
-    FabricRuleManager = None
-    check_overview_file = None
 
-try:
-    import order_auditor
-except ImportError:
-    order_auditor = None
+# ==============================================================================
+# EMBEDDED MODULE 1: FABRIC CHECKER (fabric_checker)
+# ==============================================================================
+import os
+import re
+import json
+import datetime
+from collections import Counter
+from difflib import SequenceMatcher
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-try:
-    import assortment_analyzer
-except ImportError:
-    assortment_analyzer = None
+RULES_CACHE_FILE = ".fabric_rules.json"
 
-# Set Windows App User Model ID so Taskbar groups and shows custom icon
-try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("rangercases.boringtask.v1")
-except Exception:
-    pass
+# Color definitions matching Excel default conditional formatting styles
+FILL_OK = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+FONT_OK = Font(name="Segoe UI", size=10, bold=True, color="006100")
 
-# Set Light Mode
-ctk.set_appearance_mode("Light")
+FILL_PARTIAL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+FONT_PARTIAL = Font(name="Segoe UI", size=10, bold=True, color="9C6500")
 
-APP_VERSION = "v1.1"
+FILL_ERROR = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+FONT_ERROR = Font(name="Segoe UI", size=10, bold=True, color="9C0006")
+
+FONT_HEADER = Font(name="Segoe UI", size=10, bold=True, color="2B211C")
+FILL_HEADER = PatternFill(start_color="F1EADB", end_color="F1EADB", fill_type="solid")
+
+THIN_BORDER_SIDE = Side(border_style="thin", color="E8E0D0")
+THIN_BORDER = Border(left=THIN_BORDER_SIDE, right=THIN_BORDER_SIDE, top=THIN_BORDER_SIDE, bottom=THIN_BORDER_SIDE)
+
+def normalize_text(text):
+    """Normalize text: convert to string, lower, replace punctuation with spaces, collapse multi-spaces."""
+    if text is None:
+        return ""
+    s = str(text).strip().lower()
+    # Replace punctuation / special separators with space to allow smooth token matching
+    s = re.sub(r'[\-_/\\()\[\],.:;+*#&|]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def clean_display_text(val):
+    if val is None:
+        return ""
+    return re.sub(r'\s+', ' ', str(val).strip())
+
+def is_empty_fabric(val):
+    """Check if fabric type is empty or placeholder like '-' or 'N/A'."""
+    if val is None:
+        return True
+    s = str(val).strip()
+    if not s or s in ("-", "--", "---", "none", "null", "n/a", "na", "0"):
+        return True
+    return False
+
+def best_substring_ratio(query_norm, target_norm):
+    """
+    Find best matching substring in target_norm for query_norm.
+    Uses sliding token-window approach with difflib.SequenceMatcher.
+    Returns (ratio: float, best_matched_token: str).
+    """
+    if not query_norm or not target_norm:
+        return 0.0, ""
+    
+    # 1. Exact substring check (instant 100%)
+    if query_norm in target_norm:
+        return 1.0, query_norm
+    
+    q_words = query_norm.split()
+    t_words = target_norm.split()
+    n_q = len(q_words)
+    n_t = len(t_words)
+    
+    if n_q == 0 or n_t == 0:
+        return 0.0, ""
+    
+    best_ratio = 0.0
+    best_candidate = ""
+    
+    # Slide word windows around query word length: [n_q - 1, n_q + 1]
+    min_win = max(1, n_q - 1)
+    max_win = min(n_t, n_q + 1)
+    
+    for w_len in range(min_win, max_win + 1):
+        for i in range(n_t - w_len + 1):
+            candidate = " ".join(t_words[i:i + w_len])
+            r = SequenceMatcher(None, query_norm, candidate).ratio()
+            if r > best_ratio:
+                best_ratio = r
+                best_candidate = candidate
+                if best_ratio >= 0.98:
+                    return best_ratio, best_candidate
+
+    # Fallback: check whole target if target is short
+    if n_t < n_q:
+        r = SequenceMatcher(None, query_norm, target_norm).ratio()
+        if r > best_ratio:
+            best_ratio = r
+            best_candidate = target_norm
+
+    return best_ratio, best_candidate
+
+
+class FabricRuleManager:
+    """Manages Fabric Rules persistence and delta comparisons."""
+    def __init__(self, storage_dir=None):
+        if storage_dir is None:
+            storage_dir = os.path.dirname(os.path.abspath(__file__))
+        self.storage_path = os.path.join(storage_dir, RULES_CACHE_FILE)
+        self.rules = []
+        self.meta = {}
+        self.load_stored_rules()
+
+    def load_stored_rules(self):
+        if os.path.exists(self.storage_path):
+            try:
+                with open(self.storage_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.rules = data.get("rules", [])
+                    self.meta = data.get("meta", {})
+                    return True
+            except Exception:
+                self.rules = []
+                self.meta = {}
+        return False
+
+    def save_rules(self):
+        data = {
+            "meta": self.meta,
+            "rules": self.rules
+        }
+        with open(self.storage_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def get_existing_pairs_set(self):
+        pairs = set()
+        for r in self.rules:
+            sk_norm = normalize_text(r.get("sk", ""))
+            supp_norm = normalize_text(r.get("supplier", ""))
+            if sk_norm and supp_norm:
+                pairs.add((sk_norm, supp_norm))
+        return pairs
+
+    def import_rule_file(self, filepath):
+        """
+        Reads 'Swatch' sheet from Fabric_name.xlsx.
+        Col A = 'SK name', Col B = 'Supplier name'.
+        Compares with existing rules, updates with latest, returns delta report.
+        """
+        wb = openpyxl.load_workbook(filepath, data_only=True, read_only=True)
+        # Find sheet named 'Swatch' (case-insensitive) or fallback to first sheet
+        target_sheet = None
+        for sname in wb.sheetnames:
+            if sname.strip().lower() == "swatch":
+                target_sheet = wb[sname]
+                break
+        if target_sheet is None:
+            target_sheet = wb.active
+
+        old_pairs_set = self.get_existing_pairs_set()
+        new_rules_list = []
+        seen_new_pairs = set()
+        added_pairs = []
+
+        # Read rows
+        is_first = True
+        for row in target_sheet.iter_rows(values_only=True):
+            if not row or len(row) < 2:
+                continue
+            val_a = clean_display_text(row[0])
+            val_b = clean_display_text(row[1])
+
+            # Header detection
+            if is_first:
+                is_first = False
+                a_lower = val_a.lower()
+                b_lower = val_b.lower()
+                if "sk" in a_lower or "supplier" in b_lower or "tên" in a_lower:
+                    continue
+
+            if not val_a or not val_b:
+                continue
+
+            sk_norm = normalize_text(val_a)
+            supp_norm = normalize_text(val_b)
+            if not sk_norm or not supp_norm:
+                continue
+
+            pair_key = (sk_norm, supp_norm)
+            if pair_key not in seen_new_pairs:
+                seen_new_pairs.add(pair_key)
+                item = {
+                    "sk": val_a,
+                    "supplier": val_b,
+                    "sk_norm": sk_norm,
+                    "supp_norm": supp_norm
+                }
+                new_rules_list.append(item)
+                if pair_key not in old_pairs_set:
+                    added_pairs.append({"sk": val_a, "supplier": val_b})
+
+        wb.close()
+
+        # Update stored rules with latest
+        self.rules = new_rules_list
+        self.meta = {
+            "source_file": os.path.basename(filepath),
+            "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_rules": len(new_rules_list)
+        }
+        self.save_rules()
+
+        return {
+            "total_rules": len(new_rules_list),
+            "added_count": len(added_pairs),
+            "added_pairs": added_pairs,
+            "filename": os.path.basename(filepath),
+            "updated_at": self.meta["updated_at"]
+        }
+
+
+def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_threshold=0.85, progress_callback=None):
+    """
+    Main function to process Overview.xlsx file:
+    - Col S (19) = Fabric type
+    - Col T (20) = Customer item name
+    - Checks U-X. If has data, insert 4 columns right after T.
+    - Matches with rules using fuzzy logic.
+    - Formats status cells with colors.
+    - Returns summary statistics and saved file path.
+    """
+    if not os.path.exists(overview_path):
+        raise FileNotFoundError(f"Không tìm thấy file: {overview_path}")
+
+    rules = rule_manager.rules
+    if not rules:
+        raise ValueError("Chưa có quy tắc vải nào được lưu. Vui lòng nạp file Fabric_name.xlsx trước.")
+
+    wb = openpyxl.load_workbook(overview_path)
+    
+    # Sheet selection
+    if selected_sheet and selected_sheet in wb.sheetnames:
+        ws = wb[selected_sheet]
+    else:
+        # Look for sheet named "Overview", or first sheet with Overview in name, or active
+        ws = None
+        for name in wb.sheetnames:
+            if name.strip().lower() == "overview":
+                ws = wb[name]
+                break
+        if ws is None:
+            for name in wb.sheetnames:
+                if "overview" in name.strip().lower():
+                    ws = wb[name]
+                    break
+        if ws is None:
+            ws = wb.active
+
+    max_r = ws.max_row
+    max_c = ws.max_column
+    if max_r < 2:
+        wb.close()
+        raise ValueError("File Excel không có dòng dữ liệu nào để kiểm tra.")
+
+    # 1. Check whether columns U, V, W, X (cols 21, 22, 23, 24) have data
+    cols_have_data = False
+    for r in range(1, min(max_r + 1, 50)): # sample check
+        for c in range(21, 25):
+            val = ws.cell(row=r, column=c).value
+            if val is not None and str(val).strip() != "":
+                cols_have_data = True
+                break
+        if cols_have_data:
+            break
+
+    target_col_start = 21
+    if cols_have_data:
+        # Insert 4 columns right after Column T (col 20)
+        ws.insert_cols(21, 4)
+        target_col_start = 21
+
+    # Write headers
+    headers = [
+        "Fabric Check status",
+        "Matched SK Name",
+        "Matched Supplier Name",
+        "Detail message"
+    ]
+    for idx, h_text in enumerate(headers):
+        c_cell = ws.cell(row=1, column=target_col_start + idx)
+        c_cell.value = h_text
+        c_cell.font = FONT_HEADER
+        c_cell.fill = FILL_HEADER
+        c_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c_cell.border = THIN_BORDER
+
+    # Set column widths
+    ws.column_dimensions[get_column_letter(target_col_start)].width = 22
+    ws.column_dimensions[get_column_letter(target_col_start + 1)].width = 24
+    ws.column_dimensions[get_column_letter(target_col_start + 2)].width = 24
+    ws.column_dimensions[get_column_letter(target_col_start + 3)].width = 45
+
+    # 2. Iterate and match each row
+    stats = {
+        "total_rows": max_r - 1,
+        "ok": 0,
+        "partial": 0,
+        "error": 0,
+        "empty_fabric": 0,
+        "real_error": 0,
+        "missing_fabrics": Counter()
+    }
+
+    # Pre-normalize rules for speed
+    parsed_rules = []
+    for r in rules:
+        parsed_rules.append({
+            "sk": r.get("sk", ""),
+            "supplier": r.get("supplier", ""),
+            "sk_norm": r.get("sk_norm") or normalize_text(r.get("sk", "")),
+            "supp_norm": r.get("supp_norm") or normalize_text(r.get("supplier", ""))
+        })
+
+    for row_idx in range(2, max_r + 1):
+        # Progress report
+        if progress_callback and (row_idx % 20 == 0 or row_idx == max_r):
+            progress_callback(row_idx - 1, max_r - 1)
+
+        raw_fabric = ws.cell(row=row_idx, column=19).value # Col S
+        raw_item_name = ws.cell(row=row_idx, column=20).value # Col T
+
+        fabric_disp = clean_display_text(raw_fabric)
+        item_disp = clean_display_text(raw_item_name)
+        
+        fabric_norm = normalize_text(raw_fabric)
+        item_norm = normalize_text(raw_item_name)
+
+        # Check for empty fabric
+        if is_empty_fabric(raw_fabric):
+            status = "✗ ERROR"
+            sk_out = ""
+            supp_out = ""
+            msg = "Chưa điền tên vải (- hoặc để trống)"
+            stats["error"] += 1
+            stats["empty_fabric"] += 1
+            
+            # Write to cells
+            c1 = ws.cell(row=row_idx, column=target_col_start, value=status)
+            c1.fill, c1.font = FILL_ERROR, FONT_ERROR
+            c1.alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=row_idx, column=target_col_start + 1, value=sk_out)
+            ws.cell(row=row_idx, column=target_col_start + 2, value=supp_out)
+            ws.cell(row=row_idx, column=target_col_start + 3, value=msg)
+            continue
+
+        # Matching logic
+        best_consistent_pair = None
+        best_consistent_score = 0.0
+
+        best_supp_overall = None
+        best_supp_ratio = 0.0
+        best_supp_sub = ""
+
+        best_sk_overall = None
+        best_sk_ratio = 0.0
+        best_sk_sub = ""
+
+        # First pass: check for consistent pair matches
+        for r in parsed_rules:
+            s_norm = r["supp_norm"]
+            sk_n = r["sk_norm"]
+
+            # Substring match ratios
+            s_ratio, s_sub = best_substring_ratio(s_norm, fabric_norm)
+            k_ratio, k_sub = best_substring_ratio(sk_n, item_norm)
+
+            # Track overall best supplier match
+            if s_ratio > best_supp_ratio:
+                best_supp_ratio = s_ratio
+                best_supp_overall = r["supplier"]
+                best_supp_sub = s_sub
+
+            # Track overall best SK match
+            if k_ratio > best_sk_ratio:
+                best_sk_ratio = k_ratio
+                best_sk_overall = r["sk"]
+                best_sk_sub = k_sub
+
+            # Consistent pair condition: both sides meet fuzzy_threshold
+            if s_ratio >= fuzzy_threshold and k_ratio >= fuzzy_threshold:
+                pair_score = (s_ratio + k_ratio) / 2.0
+                if pair_score > best_consistent_score:
+                    best_consistent_score = pair_score
+                    best_consistent_pair = (r, s_ratio, s_sub, k_ratio, k_sub)
+                    if pair_score >= 0.99: # Exact match found, can stop searching
+                        break
+
+        # Determine classification
+        if best_consistent_pair:
+            r_matched, s_r, s_sub, k_r, k_sub = best_consistent_pair
+            status = "✓ OK"
+            sk_out = r_matched["sk"]
+            supp_out = r_matched["supplier"]
+
+            if s_r >= 0.99 and k_r >= 0.99:
+                msg = f"Khớp chính xác (100%): SK '{sk_out}' ↔ Supplier '{supp_out}'"
+            else:
+                s_pct = int(round(s_r * 100))
+                k_pct = int(round(k_r * 100))
+                msg = f"Khớp mờ: SK '{sk_out}' ({k_pct}%) ↔ Supplier '{supp_out}' ({s_pct}%)"
+
+            stats["ok"] += 1
+            cell_fill, cell_font = FILL_OK, FONT_OK
+
+        else:
+            # Check Partial conditions
+            has_good_supp = (best_supp_ratio >= fuzzy_threshold)
+            has_good_sk = (best_sk_ratio >= fuzzy_threshold)
+            
+            # Suspicious range (70% - threshold)
+            is_suspicious_supp = (0.70 <= best_supp_ratio < fuzzy_threshold)
+
+            if has_good_supp and has_good_sk:
+                # Both matched good, but NOT consistent (from different pairs)
+                status = "⚠ PARTIAL"
+                sk_out = best_sk_overall or ""
+                supp_out = best_supp_overall or ""
+                msg = f"Không nhất quán: Khớp Supplier '{supp_out}' ({int(best_supp_ratio*100)}%) nhưng SK '{sk_out}' ({int(best_sk_ratio*100)}%) thuộc cặp khác"
+                stats["partial"] += 1
+                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
+
+            elif has_good_supp and not has_good_sk:
+                status = "⚠ PARTIAL"
+                sk_out = ""
+                supp_out = best_supp_overall or ""
+                msg = f"Chỉ khớp Supplier '{supp_out}' ({int(best_supp_ratio*100)}%), không khớp SK nào trong tên sản phẩm"
+                stats["partial"] += 1
+                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
+
+            elif has_good_sk and not has_good_supp:
+                status = "⚠ PARTIAL"
+                sk_out = best_sk_overall or ""
+                supp_out = ""
+                msg = f"Chỉ khớp SK '{sk_out}' ({int(best_sk_ratio*100)}%), không khớp Supplier nào với tên vải '{fabric_disp}'"
+                stats["partial"] += 1
+                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
+
+            elif is_suspicious_supp:
+                status = "⚠ PARTIAL"
+                sk_out = ""
+                supp_out = best_supp_overall or ""
+                msg = f"Nghi vấn lỗi chính tả: Vải '{fabric_disp}' gần giống '{supp_out}' ({int(best_supp_ratio*100)}%) [Cần kiểm tra]"
+                stats["partial"] += 1
+                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
+
+            else:
+                # True ERROR
+                status = "✗ ERROR"
+                sk_out = ""
+                supp_out = ""
+                closest_info = f" (gần nhất: '{best_supp_overall}' {int(best_supp_ratio*100)}%)" if best_supp_overall and best_supp_ratio > 0.4 else ""
+                msg = f"Không tìm thấy trong bảng mapping{closest_info}"
+                stats["error"] += 1
+                stats["real_error"] += 1
+                stats["missing_fabrics"][fabric_disp] += 1
+                cell_fill, cell_font = FILL_ERROR, FONT_ERROR
+
+        # Write result to row
+        c1 = ws.cell(row=row_idx, column=target_col_start, value=status)
+        c1.fill, c1.font = cell_fill, cell_font
+        c1.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.cell(row=row_idx, column=target_col_start + 1, value=sk_out)
+        ws.cell(row=row_idx, column=target_col_start + 2, value=supp_out)
+        ws.cell(row=row_idx, column=target_col_start + 3, value=msg)
+
+    # Save output file
+    dir_name = os.path.dirname(overview_path)
+    base_name, ext = os.path.splitext(os.path.basename(overview_path))
+    if base_name.endswith("_checked"):
+        out_path = overview_path
+    else:
+        out_path = os.path.join(dir_name, f"{base_name}_checked{ext}")
+
+    wb.save(out_path)
+    wb.close()
+
+    stats["output_file"] = os.path.abspath(out_path)
+    # Calculate percentages
+    tot = stats["total_rows"]
+    if tot > 0:
+        stats["ok_pct"] = (stats["ok"] / tot) * 100
+        stats["partial_pct"] = (stats["partial"] / tot) * 100
+        stats["error_pct"] = (stats["error"] / tot) * 100
+    else:
+        stats["ok_pct"] = stats["partial_pct"] = stats["error_pct"] = 0.0
+
+    return stats
+
+# ==============================================================================
+# EMBEDDED MODULE 2: ORDER AUDITOR (order_auditor)
+# ==============================================================================
+"""
+order_auditor.py - Furniture Order Auditor & Multi-Layer PO Verification Module
+Engine kiểm toán đơn hàng nội thất 6 lớp bảo vệ, hỗ trợ đối chiếu đa nguồn (Multi-Source Voting),
+phân tích lệch Model, Vải, Bộ lắp ghép (Set 1/2-2/2), Thương mại (Qty, Unit, Price).
+"""
+
+import os
+import re
+import json
+import difflib
+from typing import Dict, List, Optional, Tuple, Any
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# Đường dẫn file cấu hình rules nội bộ
+SEED_RULES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".audit_seed.json")
+CUSTOM_RULES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".audit_rules.json")
+
+# ==============================================================================
+# 1. KNOWLEDGE BASE & ALIAS MANAGER
+# ==============================================================================
+
+class ModelKnowledgeBase:
+    """Quản lý từ điển Model Number ↔ Model Name, hỗ trợ aliases & status."""
+    
+    def __init__(self):
+        self.models: Dict[str, Dict[str, str]] = {}
+        self.aliases: Dict[str, str] = {
+            "MD 1256": "Astha",
+            "MD 1723": "Astha",
+            "MD 2320": "Chill",
+            "MD 2593": "Daphne",
+            "MD 2249": "Paula",
+            "MD 2724": "Greta",
+            "MD 2621": "Leonora",
+            "MD 2740": "Madison",
+            "MD 2528": "Umi",
+            "MD 2466": "Aya",
+            "MD 2708": "Clara",
+            "MD 2067": "Elinor",
+            "MD 2747": "Hubert"
+        }
+        self.load_seed()
+        self.load_custom_rules()
+
+    def normalize_key(self, text: str) -> str:
+        if not text:
+            return ""
+        s = str(text).strip().upper()
+        s = re.sub(r'\s+', ' ', s)
+        m = re.search(r'MD\s*(\d+)', s)
+        if m:
+            return f"MD {m.group(1)}"
+        return s
+
+    def load_seed(self):
+        if os.path.exists(SEED_RULES_PATH):
+            try:
+                with open(SEED_RULES_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for k, v in data.get("models", {}).items():
+                        norm_k = self.normalize_key(k)
+                        self.models[norm_k] = v
+            except Exception as e:
+                print(f"[ModelKnowledgeBase] Error loading seed: {e}")
+
+    def load_custom_rules(self):
+        if os.path.exists(CUSTOM_RULES_PATH):
+            try:
+                with open(CUSTOM_RULES_PATH, "r", encoding="utf-8") as f:
+                    custom = json.load(f)
+                    self.aliases.update(custom.get("aliases", {}))
+                    for k, v in custom.get("models", {}).items():
+                        norm_k = self.normalize_key(k)
+                        self.models[norm_k] = v
+            except Exception as e:
+                print(f"[ModelKnowledgeBase] Error loading custom rules: {e}")
+
+    def save_custom_rules(self):
+        data = {"aliases": self.aliases, "models": self.models}
+        try:
+            with open(CUSTOM_RULES_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[ModelKnowledgeBase] Error saving custom rules: {e}")
+
+    def import_models_from_excel(self, excel_path: str) -> int:
+        """Đọc và nạp thêm các model mới từ file Excel (Model List All.xlsx)."""
+        if not os.path.exists(excel_path):
+            raise FileNotFoundError(f"Không tìm thấy file {excel_path}")
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        sheet = wb.active
+        # Tìm sheet có tên Export hoặc sheet đầu
+        if "Export" in wb.sheetnames:
+            sheet = wb["Export"]
+        added = 0
+        for i, row in enumerate(sheet.iter_rows(values_only=True)):
+            if i == 0:
+                continue
+            status = row[0] if len(row) > 0 else 'Active'
+            num = row[1] if len(row) > 1 else None
+            name = row[2] if len(row) > 2 else None
+            if num and name:
+                norm_k = self.normalize_key(str(num))
+                self.models[norm_k] = {
+                    "number": str(num).strip(),
+                    "name": str(name).strip(),
+                    "status": str(status).strip() if status else 'Active'
+                }
+                added += 1
+        wb.close()
+        self.save_custom_rules()
+        return added
+
+    def add_alias(self, model_num: str, standard_name: str):
+        """Thêm bí danh mới, ví dụ MD 1723 -> Astha."""
+        norm = self.normalize_key(model_num)
+        self.aliases[norm] = standard_name.strip()
+        self.save_custom_rules()
+
+    def get_model_info(self, model_num: str) -> Optional[Tuple[str, str]]:
+        """Trả về (expected_name, status)."""
+        norm = self.normalize_key(model_num)
+        if norm in self.aliases:
+            alias_name = self.aliases[norm]
+            status = "Active"
+            if norm in self.models:
+                status = self.models[norm].get("status", "Active")
+            return alias_name, status
+
+        if norm in self.models:
+            return self.models[norm].get("name", ""), self.models[norm].get("status", "Active")
+        
+        # Thử tìm dạng MD xxxx
+        m = re.search(r'MD\s*(\d+)', norm)
+        if m:
+            target = f"MD {m.group(1)}"
+            if target in self.aliases:
+                return self.aliases[target], "Active"
+            if target in self.models:
+                return self.models[target].get("name", ""), self.models[target].get("status", "Active")
+
+        return None
+
+
+class FabricKnowledgeBase:
+    """Quản lý từ điển ánh xạ Vải (Customer Fabric Name ↔ Supplier Fabric Name)."""
+    
+    def __init__(self):
+        self.mappings: Dict[str, str] = {}
+        self.load_seed()
+
+    def normalize(self, text: str) -> str:
+        if not text:
+            return ""
+        s = str(text).strip().lower()
+        s = re.sub(r'[\r\n\t]+', ' ', s)
+        s = re.sub(r'\s+', ' ', s)
+        return s
+
+    def load_seed(self):
+        if os.path.exists(SEED_RULES_PATH):
+            try:
+                with open(SEED_RULES_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for k, v in data.get("fabrics", {}).items():
+                        self.mappings[self.normalize(k)] = str(v).strip()
+            except Exception as e:
+                print(f"[FabricKnowledgeBase] Error loading seed: {e}")
+
+    def verify_fabric(self, cust_fabric: str, po_fabric_or_desc: str) -> Tuple[str, str]:
+        """
+        Kiểm tra độ khớp giữa tên vải khách và mô tả/vải trong PO.
+        Trả về (Status: PASS/REVIEW/ERROR, Message)
+        """
+        cust_norm = self.normalize(cust_fabric)
+        po_norm = self.normalize(po_fabric_or_desc)
+
+        if not cust_norm:
+            return "PASS", "No customer fabric requirement specified"
+
+        # 1. Tìm ánh xạ chuẩn của cust_fabric
+        supplier_mapped = self.mappings.get(cust_norm)
+        if supplier_mapped:
+            supp_norm = self.normalize(supplier_mapped)
+            if supp_norm in po_norm or all(w in po_norm for w in supp_norm.split()[:2]):
+                return "PASS", f"Matched standard supplier fabric: {supplier_mapped}"
+
+        # 2. Kiểm tra trực tiếp tên vải của khách có nằm trong PO không
+        # Lưu ý: Cần kiểm tra đúng dòng họ (Dune, Boucle, Velour, Danny...)
+        key_words = [w for w in cust_norm.split() if len(w) > 2 and w not in ('the', 'for', 'with', 'and')]
+        if key_words:
+            matched_words = [w for w in key_words if w in po_norm]
+            if len(matched_words) == len(key_words):
+                return "PASS", f"Customer fabric words '{' '.join(matched_words)}' found in PO"
+            elif len(matched_words) > 0 and len(matched_words) >= len(key_words) - 1:
+                return "REVIEW", f"Partial fabric match: '{' '.join(matched_words)}' out of '{cust_fabric}'"
+
+        return "ERROR", f"Fabric mismatch: Expected '{cust_fabric}', not found in PO description"
+
+
+# ==============================================================================
+# 2. FILE PARSERS
+# ==============================================================================
+
+class POItem:
+    """Dữ liệu một dòng sản phẩm trong PO."""
+    def __init__(self, row_idx: int, item_no: str, description: str, unit: str, qty: float, price: float, total: Any):
+        self.row_idx = row_idx
+        self.item_no = str(item_no).strip() if item_no else ""
+        self.description = str(description).strip() if description else ""
+        self.unit = str(unit).strip() if unit else "Pcs"
+        self.qty = float(qty) if qty is not None and str(qty).replace('.', '', 1).isdigit() else 0.0
+        self.price = float(price) if price is not None and str(price).replace('.', '', 1).isdigit() else 0.0
+        self.total = total
+
+        # Trích xuất các trường đặc trưng từ description
+        self.art_no = ""
+        self.cust_item_name = ""
+        self.md_number = ""
+
+        m_art = re.search(r'Customer Art No:\s*([^\n\r]+)', self.description, re.IGNORECASE)
+        if m_art:
+            self.art_no = m_art.group(1).strip()
+
+        m_name = re.search(r'Customer item name:\s*([^\n\r]+)', self.description, re.IGNORECASE)
+        if m_name:
+            self.cust_item_name = m_name.group(1).strip()
+
+        m_md = re.search(r'MD\s*(\d+)', self.description, re.IGNORECASE)
+        if m_md:
+            self.md_number = f"MD {m_md.group(1)}"
+
+
+class POParsedDoc:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.po_number = ""
+        self.pi_number = ""
+        self.cust_po_no = ""
+        self.customer = ""
+        self.items: List[POItem] = []
+        self.parse()
+
+    def parse(self):
+        wb = openpyxl.load_workbook(self.file_path, data_only=True)
+        # Tìm sheet PO (ưu tiên sheet có chữ PO hoặc tên vendor/xưởng như NH FSC, hoặc sheet đầu tiên)
+        target_sheet = wb.active
+        for sname in wb.sheetnames:
+            if any(k in sname.upper() for k in ["PO", "ORDER", "NH", "FSC"]):
+                target_sheet = wb[sname]
+                break
+
+        # Đọc Header metadata
+        for r in range(1, 15):
+            for c in range(1, 10):
+                val = str(target_sheet.cell(r, c).value or '').strip()
+                if "No:" in val or val == "PO No." or val == "PO Number":
+                    self.po_number = str(target_sheet.cell(r, c+1).value or target_sheet.cell(r, c+2).value or '').strip()
+                elif "PI No." in val or "PI No" in val:
+                    self.pi_number = str(target_sheet.cell(r, c+1).value or target_sheet.cell(r, c+2).value or '').strip()
+                elif "Cust. PO No." in val or "Customer PO" in val:
+                    self.cust_po_no = str(target_sheet.cell(r, c+1).value or target_sheet.cell(r, c+2).value or '').strip()
+                elif val == "Customer":
+                    self.customer = str(target_sheet.cell(r, c+1).value or target_sheet.cell(r, c+2).value or '').strip()
+
+        # Tìm dòng tiêu đề bảng
+        header_row = 15
+        item_col = 2
+        desc_col = 5
+        unit_col = 7
+        qty_col = 8
+        price_col = 9
+        total_col = 10
+
+        for r in range(10, 25):
+            row_vals = [str(target_sheet.cell(r, c).value or '').strip().lower() for c in range(1, 15)]
+            if any("item number" in v or "item no" in v for v in row_vals):
+                header_row = r
+                for c_idx, v in enumerate(row_vals, 1):
+                    if "item" in v and "number" in v: item_col = c_idx
+                    elif "description" in v: desc_col = c_idx
+                    elif "unit" in v: unit_col = c_idx
+                    elif "quantity" in v or "qty" in v: qty_col = c_idx
+                    elif "price" in v and "total" not in v: price_col = c_idx
+                    elif "total" in v: total_col = c_idx
+                break
+
+        # Bóc tách các dòng sản phẩm
+        for r in range(header_row + 1, target_sheet.max_row + 1):
+            item_no = target_sheet.cell(r, item_col).value
+            desc = target_sheet.cell(r, desc_col).value
+            unit = target_sheet.cell(r, unit_col).value
+            qty = target_sheet.cell(r, qty_col).value
+            price = target_sheet.cell(r, price_col).value
+            total = target_sheet.cell(r, total_col).value
+
+            if item_no or desc:
+                # Bỏ qua dòng tổng cộng hoặc remark cuối trang
+                combined_line = f"{str(item_no or '')} {str(desc or '')}".lower().strip()
+                footer_keywords = [
+                    "sales balance", "delivery terms:", "condition:", "payment terms:",
+                    "beneficiary:", "bank:", "bank name:", "swift:", "iban:", "account no",
+                    "total", "subtotal", "grand total", "say:", "scandinavian design int'l", "to:"
+                ]
+                if any(k in combined_line for k in footer_keywords):
+                    # Nếu gặp dòng footer thanh toán hoặc giao hàng thì dừng hẳn
+                    if any(stop_k in combined_line for stop_k in ["sales balance", "delivery terms:", "condition:", "payment terms:", "beneficiary:", "to:"]):
+                        break
+                    continue
+                
+                # Bỏ qua các dòng không có số lượng hoặc số lượng không phải số nếu không có item_no hợp lệ
+                try:
+                    qty_val = float(qty) if qty is not None and str(qty).replace('.', '', 1).isdigit() else 0.0
+                except (ValueError, TypeError):
+                    qty_val = 0.0
+
+                if qty_val <= 0 and not str(item_no or '').strip():
+                    continue
+
+                self.items.append(POItem(
+                    row_idx=r,
+                    item_no=str(item_no).strip() if item_no else "",
+                    description=str(desc).strip() if desc else "",
+                    unit=str(unit).strip() if unit else "Pcs",
+                    qty=qty,
+                    price=price,
+                    total=total
+                ))
+        wb.close()
+
+
+class CustomerCatalog:
+    """Quản lý dữ liệu từ file của khách hàng (Order Lines + Master Data + Working Sheet)."""
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.sku_map: Dict[str, Dict[str, Any]] = {}
+        self.id_map: Dict[str, Dict[str, Any]] = {}
+        self.barcode_map: Dict[str, Dict[str, Any]] = {}
+        self.order_items: List[Dict[str, Any]] = []
+        self.parse()
+
+    def parse(self):
+        wb = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
+
+        # 1. Đọc MASTER DATA nếu có
+        if "MASTER DATA" in wb.sheetnames:
+            sheet_m = wb["MASTER DATA"]
+            header_found = False
+            col_sku, col_id, col_name, col_vcode, col_barcode = 0, 1, 2, 3, 4
+            for r_idx, row in enumerate(sheet_m.iter_rows(values_only=True)):
+                if r_idx < 10 and any("sku" in str(c).lower() for c in row if c):
+                    for c_idx, c in enumerate(row):
+                        clow = str(c or '').lower()
+                        if "sku" in clow: col_sku = c_idx
+                        elif "internal id" in clow or "id" in clow: col_id = c_idx
+                        elif "name" in clow or "desc" in clow: col_name = c_idx
+                        elif "vendor" in clow or "model" in clow: col_vcode = c_idx
+                        elif "barcode" in clow or "bar code" in clow: col_barcode = c_idx
+                    header_found = True
+                    continue
+
+                if header_found and r_idx > 1:
+                    sku = str(row[col_sku]).strip() if len(row) > col_sku and row[col_sku] else ""
+                    iid = str(row[col_id]).strip() if len(row) > col_id and row[col_id] else ""
+                    name = str(row[col_name]).strip() if len(row) > col_name and row[col_name] else ""
+                    vcode = str(row[col_vcode]).strip() if len(row) > col_vcode and row[col_vcode] else ""
+                    barcode = str(row[col_barcode]).strip() if len(row) > col_barcode and row[col_barcode] else ""
+
+                    entry = {
+                        "sku": sku,
+                        "internal_id": iid,
+                        "name": name,
+                        "vcode": vcode,
+                        "barcode": barcode,
+                        "source": "MASTER DATA"
+                    }
+                    if sku: self.sku_map[sku.upper()] = entry
+                    if iid: self.id_map[iid.upper()] = entry
+                    if barcode: self.barcode_map[barcode.upper()] = entry
+
+        # 2. Đọc WORKING SHEET nếu có
+        if "WORKING SHEET" in wb.sheetnames:
+            sheet_w = wb["WORKING SHEET"]
+            for r_idx, row in enumerate(sheet_w.iter_rows(values_only=True)):
+                if r_idx >= 4:
+                    sku = str(row[0]).strip() if len(row) > 0 and row[0] else ""
+                    vcode = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+                    name = str(row[3]).strip() if len(row) > 3 and row[3] else ""
+                    iid = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+                    barcode = str(row[8]).strip() if len(row) > 8 and row[8] else ""
+                    if sku and sku not in self.sku_map:
+                        entry = {"sku": sku, "internal_id": iid, "name": name, "vcode": vcode, "barcode": barcode, "source": "WORKING SHEET"}
+                        self.sku_map[sku.upper()] = entry
+                        if iid: self.id_map[iid.upper()] = entry
+                        if barcode: self.barcode_map[barcode.upper()] = entry
+
+        # 3. Đọc ORDER Lines
+        order_sheet_name = None
+        for s in wb.sheetnames:
+            if s.upper() in ["ORDER", "ORDER LINES", "ORDER DETAILS", "CUST ORDER"]:
+                order_sheet_name = s
+                break
+
+        if order_sheet_name:
+            sheet_o = wb[order_sheet_name]
+            sku_col, qty_col, price_col = 2, 39, 16
+            for r_idx, row in enumerate(sheet_o.iter_rows(values_only=True)):
+                if r_idx == 11:
+                    for c_idx, c in enumerate(row):
+                        clow = str(c or '').lower()
+                        if "sku" in clow: sku_col = c_idx
+                        elif "unit quantity" in clow or "order qty" in clow: qty_col = c_idx
+                        elif "fob price" in clow or "unit cost" in clow: price_col = c_idx
+                elif r_idx > 13:
+                    sku = str(row[sku_col]).strip() if len(row) > sku_col and row[sku_col] else ""
+                    if sku and sku not in ('Product SKU', 'Manual input', ' ', 'None'):
+                        qty = row[qty_col] if len(row) > qty_col else 0
+                        price = row[price_col] if len(row) > price_col else 0
+                        self.order_items.append({
+                            "sku": sku,
+                            "qty": qty,
+                            "price": price,
+                            "row": r_idx + 1
+                        })
+
+        wb.close()
+
+    def lookup(self, code: str) -> Optional[Dict[str, Any]]:
+        if not code:
+            return None
+        c_up = str(code).strip().upper()
+        if c_up in self.sku_map:
+            return self.sku_map[c_up]
+        if c_up in self.id_map:
+            return self.id_map[c_up]
+        if c_up in self.barcode_map:
+            return self.barcode_map[c_up]
+        return None
+
+
+# ==============================================================================
+# 3. MULTI-LAYER AUDIT ENGINE (6 LỚP KIỂM TOÁN TOÀN DIỆN)
+# ==============================================================================
+
+class AuditResultItem:
+    def __init__(self, po_item: POItem):
+        self.po_item = po_item
+        self.overall_status = "PASS"  # PASS, REVIEW, ERROR
+        self.layers: Dict[str, Tuple[str, str]] = {}  # layer_name -> (status, detail)
+        self.matched_customer_entry: Optional[Dict[str, Any]] = None
+        self.summary_reasons: List[str] = []
+
+    def set_layer(self, layer_name: str, status: str, detail: str):
+        self.layers[layer_name] = (status, detail)
+        if status in ("ERROR", "REVIEW"):
+            if status == "ERROR":
+                self.overall_status = "ERROR"
+            elif status == "REVIEW" and self.overall_status != "ERROR":
+                self.overall_status = "REVIEW"
+            self.summary_reasons.append(f"• {detail}")
+
+
+class OrderAuditEngine:
+    def __init__(self):
+        self.model_kb = ModelKnowledgeBase()
+        self.fabric_kb = FabricKnowledgeBase()
+
+    def audit(self, po_doc: POParsedDoc, customer_catalog: CustomerCatalog) -> List[AuditResultItem]:
+        results: List[AuditResultItem] = []
+
+        # -------------------------------------------------------------
+        # TẬP HỢP CÁC PHẦN SPLIT 1/2 VÀ 2/2 CHO LAYER 5 (SET VERIFICATION)
+        # -------------------------------------------------------------
+        sets_tracking: Dict[str, Dict[str, float]] = {}  # base_key -> {'1/2': qty, '2/2': qty}
+
+        for po_item in po_doc.items:
+            audit_item = AuditResultItem(po_item)
+            desc_text = po_item.description
+            combined_text = f"{po_item.description} {po_item.cust_item_name}"
+
+            # ---------------------------------------------------------
+            # LỚP 1 – SKU & IDENTIFICATION (VOTING SYSTEM)
+            # ---------------------------------------------------------
+            lookup_code = po_item.art_no or po_item.item_no
+            matched_entry = customer_catalog.lookup(lookup_code)
+            if not matched_entry and po_item.cust_item_name:
+                # Thử tìm theo mã trong tên
+                for word in po_item.cust_item_name.split():
+                    m = customer_catalog.lookup(word)
+                    if m:
+                        matched_entry = m
+                        break
+
+            audit_item.matched_customer_entry = matched_entry
+
+            if matched_entry:
+                audit_item.set_layer("Layer 1: SKU", "PASS", f"Matched Customer SKU: {matched_entry.get('sku')}")
+            elif lookup_code:
+                if customer_catalog.sku_map:
+                    audit_item.set_layer("Layer 1: SKU", "REVIEW", f"Art No '{lookup_code}' not in Customer Master Data")
+                else:
+                    audit_item.set_layer("Layer 1: SKU", "PASS", f"PO Art No: {lookup_code}")
+            else:
+                audit_item.set_layer("Layer 1: SKU", "REVIEW", "Missing Art No in PO description")
+
+            # ---------------------------------------------------------
+            # LỚP 2 – MODEL VERIFICATION (MODEL NUMBER ↔ MODEL NAME)
+            # ---------------------------------------------------------
+            if po_item.md_number:
+                model_info = self.model_kb.get_model_info(po_item.md_number)
+                if model_info:
+                    exp_name, exp_status = model_info
+                    exp_clean = exp_name.lower().replace("by sls", "").strip()
+                    desc_low = combined_text.lower()
+
+                    if exp_clean in desc_low:
+                        if exp_status.lower() in ["discontinue", "deleted", "inactive"]:
+                            audit_item.set_layer("Layer 2: Model", "REVIEW", f"{po_item.md_number} is {exp_name} ({exp_status} model)")
+                        else:
+                            audit_item.set_layer("Layer 2: Model", "PASS", f"{po_item.md_number} matches '{exp_name}'")
+                    else:
+                        audit_item.set_layer("Layer 2: Model", "ERROR", f"Model mismatch: {po_item.md_number} standard name is '{exp_name}', not matching PO description")
+                else:
+                    audit_item.set_layer("Layer 2: Model", "REVIEW", f"{po_item.md_number} not found in standard Model List")
+            else:
+                audit_item.set_layer("Layer 2: Model", "PASS", "General component / Non-MD item")
+
+            # ---------------------------------------------------------
+            # LỚP 3 – FABRIC / COLOR VERIFICATION
+            # ---------------------------------------------------------
+            fabric_status, fabric_msg = "PASS", "Fabric / Color verified"
+            if "dune" in combined_text.lower():
+                if "pasha dune" in combined_text.lower() or "padu" in combined_text.lower():
+                    fabric_status, fabric_msg = "PASS", "Pasha Dune verified (Fabric Pasha 058 Dune)"
+                elif "free dune" in combined_text.lower():
+                    fabric_status, fabric_msg = "PASS", "Free Dune verified (Fabric Free 058 Dune)"
+                elif "vega" in combined_text.lower() or "sand dune" in combined_text.lower():
+                    fabric_status, fabric_msg = "PASS", "Vega Sand Dune verified (Fabric Venga Recycle 004 Mole)"
+
+            audit_item.set_layer("Layer 3: Fabric", fabric_status, fabric_msg)
+
+            # ---------------------------------------------------------
+            # LỚP 4 – PRODUCT CONFIGURATION & ORIENTATION
+            # ---------------------------------------------------------
+            orientation_m = re.search(r'\b(LEF|RIG|LHF|RHF|LEFT|RIGHT)\b', combined_text, re.IGNORECASE)
+            if orientation_m:
+                orient = orientation_m.group(1).upper()
+                audit_item.set_layer("Layer 4: Config", "REVIEW", f"Orientation '{orient}': Please verify with Spec/Drawing")
+            else:
+                audit_item.set_layer("Layer 4: Config", "PASS", "Standard config")
+
+            # ---------------------------------------------------------
+            # LỚP 5 – SET VERIFICATION (SPLIT 1/2 VÀ 2/2)
+            # ---------------------------------------------------------
+            split_m = re.search(r'\b([12])/2\b', combined_text)
+            if split_m:
+                part = f"{split_m.group(1)}/2"
+                base_name = re.sub(r'\b[12]/2\b', '', combined_text).strip()
+                base_key = re.sub(r'\s+', ' ', base_name.lower())[:40]
+                if base_key not in sets_tracking:
+                    sets_tracking[base_key] = {"1/2": 0.0, "2/2": 0.0, "items": []}
+                sets_tracking[base_key][part] += po_item.qty
+                sets_tracking[base_key]["items"].append(audit_item)
+                audit_item.set_layer("Layer 5: Set", "PASS", f"Split unit {part}")
+            else:
+                audit_item.set_layer("Layer 5: Set", "PASS", "Standalone unit")
+
+            # ---------------------------------------------------------
+            # LỚP 6 – COMMERCIAL CHECK (QTY, UNIT, PRICE)
+            # ---------------------------------------------------------
+            if po_item.qty <= 0:
+                audit_item.set_layer("Layer 6: Commercial", "ERROR", "Quantity is 0 or invalid")
+            elif po_item.price == 0.0:
+                audit_item.set_layer("Layer 6: Commercial", "REVIEW", "Price = 0 (Free sample / Warranty / Spareparts)")
+            else:
+                audit_item.set_layer("Layer 6: Commercial", "PASS", f"Qty={po_item.qty}, Price={po_item.price}")
+
+            results.append(audit_item)
+
+        # HẬU XỬ LÝ LỚP 5: Kiểm tra cân bằng giữa 1/2 và 2/2
+        for base_key, data in sets_tracking.items():
+            qty_1 = data.get("1/2", 0.0)
+            qty_2 = data.get("2/2", 0.0)
+            if qty_1 != qty_2 or qty_1 == 0 or qty_2 == 0:
+                for item in data.get("items", []):
+                    item.set_layer(
+                        "Layer 5: Set",
+                        "ERROR",
+                        f"Imbalanced Set: 1/2 Qty ({qty_1}) != 2/2 Qty ({qty_2})"
+                    )
+
+        return results
+
+
+# ==============================================================================
+# 4. EXPORT AUDIT EXCEL REPORT (SOFT IVORY BAKERY PALETTE)
+# ==============================================================================
+
+def export_audit_excel(audit_results: List[AuditResultItem], output_path: str, source_po_path: Optional[str] = None):
+    """
+    Ghi trực tiếp kết quả kiểm toán vào file PO gốc (tạo bản sao _audited.xlsx).
+    Giữ nguyên 100% định dạng, thông tin khách hàng, công thức của file PO Thủy lập.
+    Thêm 2 cột:
+      - 'Audit Status': PASS (#C6EFCE), REVIEW (#FFEB9C), ERROR (#FFC7CE)
+      - 'Audit Notes': Ghi rõ lý do chi tiết cho từng dòng sản phẩm
+    """
+    if source_po_path and os.path.exists(source_po_path):
+        import shutil
+        shutil.copyfile(source_po_path, output_path)
+        wb = openpyxl.load_workbook(output_path)
+        # Tìm sheet PO (như NH FSC hoặc sheet có dữ liệu)
+        target_sheet = wb.active
+        for sname in wb.sheetnames:
+            if any(k in sname.upper() for k in ["PO", "ORDER", "NH", "FSC"]):
+                target_sheet = wb[sname]
+                break
+
+        # Font & Fill definitions
+        font_header = Font(name="Segoe UI", size=10, bold=True, color="2B211C")
+        font_body = Font(name="Segoe UI", size=9, color="2B211C")
+        font_pass = Font(name="Segoe UI", size=10, bold=True, color="006100")
+        font_review = Font(name="Segoe UI", size=10, bold=True, color="9C6500")
+        font_error = Font(name="Segoe UI", size=10, bold=True, color="9C0006")
+
+        fill_header = PatternFill(start_color="F1EADB", end_color="F1EADB", fill_type="solid")
+        fill_pass = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        fill_review = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+        fill_error = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+        border_thin = Border(
+            left=Side(style='thin', color="D0C6B8"),
+            right=Side(style='thin', color="D0C6B8"),
+            top=Side(style='thin', color="D0C6B8"),
+            bottom=Side(style='thin', color="D0C6B8")
+        )
+
+        # Tìm dòng header và cột cuối cùng của bảng
+        header_row = 15
+        for r in range(10, 25):
+            row_vals = [str(target_sheet.cell(r, c).value or '').lower() for c in range(1, 15)]
+            if any("item number" in v or "item no" in v for v in row_vals):
+                header_row = r
+                break
+
+        # Xác định cột cuối cùng có dữ liệu trên dòng header
+        last_col = 10
+        for c in range(1, 20):
+            if target_sheet.cell(header_row, c).value is not None:
+                last_col = max(last_col, c)
+
+        col_status = last_col + 1
+        col_notes = last_col + 2
+
+        # Ghi header 2 cột mới
+        c_stat_head = target_sheet.cell(header_row, col_status, value="Audit Status")
+        c_stat_head.font = font_header
+        c_stat_head.fill = fill_header
+        c_stat_head.alignment = Alignment(horizontal="center", vertical="center")
+        c_stat_head.border = border_thin
+
+        c_note_head = target_sheet.cell(header_row, col_notes, value="Audit Notes (Chi Tiết)")
+        c_note_head.font = font_header
+        c_note_head.fill = fill_header
+        c_note_head.alignment = Alignment(horizontal="center", vertical="center")
+        c_note_head.border = border_thin
+
+        # Map results by row_idx
+        res_by_row = {item.po_item.row_idx: item for item in audit_results}
+
+        for r_idx in range(header_row + 1, target_sheet.max_row + 1):
+            if r_idx in res_by_row:
+                item = res_by_row[r_idx]
+                reasons_text = "\n".join(item.summary_reasons) if item.summary_reasons else "✓ All standard"
+
+                cell_status = target_sheet.cell(r_idx, col_status, value=item.overall_status)
+                cell_status.border = border_thin
+                cell_status.alignment = Alignment(horizontal="center", vertical="center")
+
+                if item.overall_status == "PASS":
+                    cell_status.fill = fill_pass
+                    cell_status.font = font_pass
+                elif item.overall_status == "REVIEW":
+                    cell_status.fill = fill_review
+                    cell_status.font = font_review
+                elif item.overall_status == "ERROR":
+                    cell_status.fill = fill_error
+                    cell_status.font = font_error
+
+                cell_notes = target_sheet.cell(r_idx, col_notes, value=reasons_text)
+                cell_notes.font = font_body
+                cell_notes.border = border_thin
+                cell_notes.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        target_sheet.column_dimensions[get_column_letter(col_status)].width = 16
+        target_sheet.column_dimensions[get_column_letter(col_notes)].width = 50
+
+        wb.save(output_path)
+        wb.close()
+        return output_path
+
+    # Fallback nếu không có file gốc (tạo file tóm tắt độc lập)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Audit Report"
+    wb.save(output_path)
+    wb.close()
+    return output_path
+
+# ==============================================================================
+# EMBEDDED MODULE 3: ASSORTMENT ANALYZER (assortment_analyzer)
+# ==============================================================================
+import os
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+def analyze_assortment_file(file_path, output_path=None):
+    """
+    Phân tích file Assortment theo từng tuần PO và điểm đến (CW01, CW02).
+    Tạo hoặc cập nhật sheet 'Per_week' với đầy đủ công thức và định dạng.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Không tìm thấy file: {file_path}")
+
+    # Mở workbook gốc để giữ nguyên các sheet khác
+    wb = openpyxl.load_workbook(file_path)
+    
+    # Tìm sheet dữ liệu nguồn (ưu tiên 'Details', hoặc sheet đầu tiên)
+    source_sheet_name = 'Details' if 'Details' in wb.sheetnames else wb.sheetnames[0]
+    ws_source = wb[source_sheet_name]
+
+    # Đọc headers dòng 1
+    headers = {}
+    for col in range(1, ws_source.max_column + 1):
+        val = ws_source.cell(1, col).value
+        if val is not None:
+            clean_name = str(val).strip().lower()
+            headers[clean_name] = col
+
+    # Nhận diện các cột cần thiết (hỗ trợ nhiều biến thể tên cột)
+    po_col = None
+    for name in ['po.', 'po', 'po number', 'tuần', 'week']:
+        if name in headers:
+            po_col = headers[name]
+            break
+
+    dest_col = None
+    for name in ['destination', 'dest', 'kho', 'kho đích']:
+        if name in headers:
+            dest_col = headers[name]
+            break
+
+    sku_col = None
+    for name in ['no.', 'no', 'item no', 'sku', 'mã hàng', 'item code']:
+        if name in headers:
+            sku_col = headers[name]
+            break
+
+    if not po_col or not dest_col or not sku_col:
+        raise ValueError("Không tìm thấy đủ các cột bắt buộc: PO (hoặc PO.), Destination, và No. (Mã hàng) trong sheet dữ liệu.")
+
+    # Đọc dữ liệu và gom nhóm theo PO
+    # Cấu trúc: po_groups[po_name] = {'CW01': set(sku), 'CW02': set(sku)}
+    po_groups = {}
+    # Thứ tự xuất hiện ban đầu của PO để giữ đúng layout
+    po_order = []
+
+    for r in range(2, ws_source.max_row + 1):
+        po_val = ws_source.cell(r, po_col).value
+        dest_val = ws_source.cell(r, dest_col).value
+        sku_val = ws_source.cell(r, sku_col).value
+
+        if po_val is None or sku_val is None:
+            continue
+
+        po_str = str(po_val).strip()
+        if not po_str:
+            continue
+
+        dest_str = str(dest_val).strip().upper() if dest_val is not None else ""
+        sku_str = str(sku_val).strip()
+
+        if po_str not in po_groups:
+            po_groups[po_str] = {"CW01": set(), "CW02": set()}
+            po_order.append(po_str)
+
+        if "CW01" in dest_str:
+            po_groups[po_str]["CW01"].add(sku_str)
+        elif "CW02" in dest_str:
+            po_groups[po_str]["CW02"].add(sku_str)
+
+    if not po_order:
+        raise ValueError("Không tìm thấy dòng dữ liệu hợp lệ nào để phân tích.")
+
+    # Xử lý sheet 'Per_week'
+    if 'Per_week' in wb.sheetnames:
+        del wb['Per_week']
+    ws_out = wb.create_sheet(title='Per_week')
+
+    # Định nghĩa Styles Apple UI
+    header_fill = PatternFill(start_color="3B302A", end_color="3B302A", fill_type="solid") # Dark Roast Brown
+    header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+    data_font = Font(name="Segoe UI", size=10)
+    bold_data_font = Font(name="Segoe UI", size=10, bold=True)
+    pct_font = Font(name="Segoe UI", size=10, bold=True, color="2E5A36") # Xanh lá đậm cho tỷ lệ
+
+    thin_border_side = Side(border_style="thin", color="E0D6C8")
+    data_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+
+    # Nền xen kẽ dịu mắt
+    zebra_fill = PatternFill(start_color="FAF7F2", end_color="FAF7F2", fill_type="solid")
+    highlight_fill = PatternFill(start_color="F2EBD9", end_color="F2EBD9", fill_type="solid")
+
+    columns = [
+        "PO",
+        "CW01",
+        "CW02",
+        "Duplicated",
+        "Only CW01",
+        "Only CW02",
+        "SKU/week",
+        "% Denmark Codes Also in Belgium"
+    ]
+
+    # Ghi Header
+    for c_idx, col_name in enumerate(columns, 1):
+        cell = ws_out.cell(row=1, column=c_idx, value=col_name)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws_out.row_dimensions[1].height = 28
+
+    # Ghi dữ liệu từng tuần
+    for r_idx, po_name in enumerate(po_order, 2):
+        s_cw01 = po_groups[po_name]["CW01"]
+        s_cw02 = po_groups[po_name]["CW02"]
+
+        cnt_cw01 = len(s_cw01)
+        cnt_cw02 = len(s_cw02)
+        duplicated = len(s_cw01 & s_cw02)
+        only_cw01 = len(s_cw01 - s_cw02)
+        only_cw02 = len(s_cw02 - s_cw01)
+
+        # Ghi các giá trị
+        c_po = ws_out.cell(row=r_idx, column=1, value=po_name)
+        c_cw01 = ws_out.cell(row=r_idx, column=2, value=cnt_cw01)
+        c_cw02 = ws_out.cell(row=r_idx, column=3, value=cnt_cw02)
+        c_dup = ws_out.cell(row=r_idx, column=4, value=duplicated)
+        c_o1 = ws_out.cell(row=r_idx, column=5, value=only_cw01)
+        c_o2 = ws_out.cell(row=r_idx, column=6, value=only_cw02)
+        
+        # Công thức tính Tổng SKU và Tỷ lệ theo đúng form của Nhung
+        c_sku = ws_out.cell(row=r_idx, column=7, value=f"=SUM(D{r_idx}:F{r_idx})")
+        c_pct = ws_out.cell(row=r_idx, column=8, value=f"=IF(B{r_idx}>0, D{r_idx}/B{r_idx}, 0)")
+        c_pct.number_format = '0.0%'
+
+        is_even = (r_idx % 2 == 0)
+        curr_fill = zebra_fill if is_even else PatternFill(fill_type=None)
+
+        # Căn chỉnh và border
+        for c_idx in range(1, 9):
+            cell = ws_out.cell(row=r_idx, column=c_idx)
+            cell.border = data_border
+            if c_idx == 1:
+                cell.font = data_font
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            elif c_idx == 4: # Duplicated highlight
+                cell.font = bold_data_font
+                cell.fill = highlight_fill
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif c_idx == 7: # SKU/week
+                cell.font = bold_data_font
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif c_idx == 8: # %
+                cell.font = pct_font
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            else:
+                cell.font = data_font
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            
+            if c_idx not in (4,) and curr_fill.fill_type:
+                cell.fill = curr_fill
+
+        ws_out.row_dimensions[r_idx].height = 22
+
+    # Tự động điều chỉnh độ rộng cột
+    for col in ws_out.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            val_str = str(cell.value or '')
+            if len(val_str) > max_len:
+                max_len = len(val_str)
+        ws_out.column_dimensions[col_letter].width = max(max_len + 4, 12)
+    
+    # Cột PO và Cột % cho rộng rãi hơn
+    ws_out.column_dimensions['A'].width = 30
+    ws_out.column_dimensions['H'].width = 32
+
+    # Lưu file kết quả
+    if not output_path:
+        base, ext = os.path.splitext(file_path)
+        output_path = f"{base}_analyzed{ext}"
+
+    wb.save(output_path)
+    wb.close()
+    return output_path, len(po_order)
+
+# ==============================================================================
+# MAIN BORING TASK APPLICATION CORE
+# ==============================================================================
+APP_VERSION = "v1.2"
 GITHUB_REPO = "rangercases/claim-helper"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
@@ -279,7 +1671,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.fabric_running = False
 
         # Order Auditor state
-        self.auditor_engine = order_auditor.OrderAuditEngine() if order_auditor else None
+        self.auditor_engine = OrderAuditEngine()
         self.auditor_po_file = ""
         self.auditor_cust_file = ""
         self.auditor_running = False
@@ -422,22 +1814,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                                     os.replace(tmp_file, curr_file)
 
                                     # Also ensure extra modules are kept up to date
-                                    for extra_mod in ["fabric_checker.py", "order_auditor.py", "assortment_analyzer.py"]:
-                                        try:
-                                            mod_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{extra_mod}"
-                                            mod_req = urllib.request.Request(mod_url, headers={"User-Agent": "BoringTask-App"})
-                                            with urllib.request.urlopen(mod_req, timeout=5) as mod_resp:
-                                                if mod_resp.status == 200:
-                                                    mod_code = mod_resp.read()
-                                                    if len(mod_code) > 200:
-                                                        mod_path = os.path.join(app_dir, extra_mod)
-                                                        mod_tmp = mod_path + ".new"
-                                                        with open(mod_tmp, "wb") as f_mod:
-                                                            f_mod.write(mod_code)
-                                                        os.replace(mod_tmp, mod_path)
-                                        except Exception:
-                                            pass
-
+                                    # Single-file architecture: No extra module downloads needed!
                                     with open(sha_file, "w", encoding="utf-8") as f:
                                         f.write(latest_sha)
 
@@ -3359,9 +4736,9 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def auditor_worker(self):
         try:
             self.auditor_prog.set(0.3)
-            po_doc = order_auditor.POParsedDoc(self.auditor_po_file)
+            po_doc = POParsedDoc(self.auditor_po_file)
             self.auditor_prog.set(0.6)
-            cust_catalog = order_auditor.CustomerCatalog(self.auditor_cust_file)
+            cust_catalog = CustomerCatalog(self.auditor_cust_file)
             self.auditor_prog.set(0.85)
 
             results = self.auditor_engine.audit(po_doc, cust_catalog)
@@ -3370,7 +4747,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             po_dir = os.path.dirname(self.auditor_po_file)
             po_base, po_ext = os.path.splitext(os.path.basename(self.auditor_po_file))
             out_fn = os.path.join(po_dir, f"{po_base}_audited{po_ext}")
-            order_auditor.export_audit_excel(results, out_fn, source_po_path=self.auditor_po_file)
+            export_audit_excel(results, out_fn, source_po_path=self.auditor_po_file)
             self.auditor_last_report = out_fn
 
             self.after(0, self.auditor_finish_ui, len(results), results, out_fn, "")
@@ -3709,7 +5086,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             if not assortment_analyzer:
                 raise ImportError("Không tìm thấy module assortment_analyzer.py")
 
-            out_path, num_weeks = assortment_analyzer.analyze_assortment_file(self.assortment_file)
+            out_path, num_weeks = analyze_assortment_file(self.assortment_file)
             self.assortment_last_output = out_path
             self.after(0, self._assortment_success, out_path, num_weeks)
         except Exception as e:
