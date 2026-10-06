@@ -50,21 +50,19 @@ goto :check_config
 
 :download_online
 echo [1/4] Đang tải mã nguồn mới nhất từ GitHub...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$installDir = [System.Environment]::GetFolderPath('LocalApplicationData') + '\BoringTask'; $baseUrl = '%GITHUB_RAW%'; $wc = New-Object System.Net.WebClient; $wc.Headers.Add('User-Agent', 'BoringTask-Installer'); $files = 'boring_task.pyw', 'requirements.txt', 'assets/app_icon.ico', 'assets/boring_task_banner.png', 'assets/logo.png'; foreach ($f in $files) { $target = Join-Path $installDir $f; $url = $baseUrl + '/' + $f; try { $wc.DownloadFile($url, $target) } catch { Write-Host '  Lỗi tải:' $f } }; Write-Host '  ✓ Đã tải xong mã nguồn và tài nguyên.'"
+%PY_CMD% -c "import urllib.request, os; base='%GITHUB_RAW%'; idir=r'%INSTALL_DIR%'; os.makedirs(os.path.join(idir, 'assets'), exist_ok=True); [urllib.request.urlretrieve(f'{base}/{f}', os.path.join(idir, f)) for f in ['boring_task.pyw', 'requirements.txt', 'assets/app_icon.ico', 'assets/boring_task_banner.png', 'assets/logo.png']]; print('  ✓ Đã tải xong mã nguồn và tài nguyên.')"
 goto :check_config
 
 :check_config
-if exist "%INSTALL_DIR%\config.json" goto :install_requirements
-
 echo.
 echo ========================================================
 echo  CHỌN NGƯỜI DÙNG CÀI ĐẶT:
-echo  1. Ms Nhung (Purchase Cost)
-echo  2. Ms Thuy  (Fabric Checker)
-echo  3. Bản Đầy Đủ (Admin - Xem tất cả)
+echo  1. Ms Nhung - Purchase Cost ^& Assortment
+echo  2. Ms Thuy  - Fabric Checker ^& Order Auditor
+echo  3. Bản Đầy Đủ - Admin
 echo ========================================================
 set "USER_CHOICE=1"
-set /p "USER_CHOICE=Nhập số (1, 2 hoặc 3) [Mặc định: 1]: "
+set /p "USER_CHOICE=Nhập số 1, 2 hoặc 3 [Mặc định: 1]: "
 
 if "%USER_CHOICE%"=="2" goto :set_thuy
 if "%USER_CHOICE%"=="3" goto :set_admin
@@ -72,17 +70,17 @@ goto :set_nhung
 
 :set_thuy
 echo {"user": "thuy"} > "%INSTALL_DIR%\config.json"
-echo   - Đã thiết lập tài khoản: Ms Thuy (Fabric Checker).
+echo   - Đã thiết lập tài khoản: Ms Thuy.
 goto :install_requirements
 
 :set_nhung
 echo {"user": "nhung"} > "%INSTALL_DIR%\config.json"
-echo   - Đã thiết lập tài khoản: Ms Nhung (Purchase Cost).
+echo   - Đã thiết lập tài khoản: Ms Nhung.
 goto :install_requirements
 
 :set_admin
 echo {"user": "admin"} > "%INSTALL_DIR%\config.json"
-echo   - Đã thiết lập tài khoản: Admin (Bản Đầy Đủ).
+echo   - Đã thiết lập tài khoản: Admin.
 goto :install_requirements
 
 :install_requirements

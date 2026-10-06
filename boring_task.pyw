@@ -1584,6 +1584,8 @@ def load_app_mode():
         mode = str(cfg.get("mode", "all")).strip().lower()
         if mode == "all":
             return ["cost", "fabric", "images", "auditor", "assortment"]
+        elif mode == "cost":
+            return ["cost", "assortment"]
         elif mode in ("cost", "fabric", "images", "auditor", "assortment"):
             return [mode]
         return ["cost", "fabric", "images", "auditor", "assortment"]
