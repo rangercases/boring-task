@@ -25,3 +25,5 @@ dist/
 scratch/
 .system_generated/
 boring_task.py
+desktop.ini
+graphify-out/

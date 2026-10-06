@@ -1245,58 +1245,175 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+def find_assortment_source_sheet(wb):
+    """
+    Quét thông minh toàn bộ các sheet và 15 dòng đầu của mỗi sheet:
+    - Bỏ qua các sheet nháp, sheet kết quả (Per_week), ghi chú.
+    - Tìm dòng tiêu đề thực tế (header_row) dựa trên bộ 6 cột Master chuẩn:
+      1. Date, 2. PO, 3. Destination, 4. No./SKU, 5. Description, 6. Quantity.
+    - Hoàn toàn bỏ qua các cột tự tạo tay khác (Check, Ghi chú, Note, Status...).
+    - Chọn sheet có dữ liệu thực tế đầy đủ nhất.
+    """
+    candidates = []
+    skip_keywords = ['per_week', 'per week', 'per-week', 'summary', 'tổng hợp', 'chart', 'note', 'ghi chú', 'hướng dẫn', 'draft', 'nháp', 'temp', 'test']
+
+    for sheet_name in wb.sheetnames:
+        clean_sname = sheet_name.strip().lower()
+        if clean_sname in ('per_week', 'per week', 'per-week'):
+            continue
+
+        ws = wb[sheet_name]
+        if ws.max_row < 2 or ws.max_column < 2:
+            continue
+
+        base_score = 0
+        if any(k in clean_sname for k in ['detail', 'data', 'assortment', 'master', 'po', 'order', 'export', 'raw', 'list']):
+            base_score += 150
+        elif any(k in clean_sname for k in skip_keywords):
+            base_score -= 200
+
+        # Quét các dòng từ 1 đến 15 để tìm header row
+        for r in range(1, min(16, ws.max_row + 1)):
+            po_cols, dest_cols, sku_cols = [], [], []
+            matched_master_count = 0
+
+            for c in range(1, min(45, ws.max_column + 1)):
+                val = ws.cell(r, c).value
+                if val is None:
+                    continue
+                header_raw = str(val).strip().lower()
+                clean_h = re.sub(r'[\r\n\t]+', ' ', header_raw)
+                clean_h = re.sub(r'\s+', ' ', clean_h).strip()
+
+                is_master_col = False
+
+                # 1. Date
+                if re.search(r'^(date|ngày|etd\s*date)', clean_h):
+                    matched_master_count += 1
+                    is_master_col = True
+
+                # 2. PO
+                if re.search(r'^(po[\.\#\s]?|p[\.\/\s]?o|purchase\s*order|order\s*no|tuần|week|etd|assortment|so[\.\#\s]?)', clean_h) or any(k in clean_h for k in ['po number', 'po no', 'mã po', 'số po', 'order number']):
+                    po_cols.append(c)
+                    if not is_master_col:
+                        matched_master_count += 1
+                        is_master_col = True
+
+                # 3. Destination (Kho đích)
+                if re.search(r'^(destination|dest|warehouse|kho|whs?|ship\s*to|cảng|port|delivery)', clean_h) or any(k in clean_h for k in ['kho đích', 'kho hàng', 'destination', 'dest']):
+                    dest_cols.append(c)
+                    if not is_master_col:
+                        matched_master_count += 1
+                        is_master_col = True
+
+                # 4. No. / SKU
+                if re.search(r'^(no\.?$|item\s*no|item|sku|mã\s*hàng|mã\s*sp|mã\s*sản\s*phẩm|article|product\s*code|part\s*no)', clean_h) or clean_h in ('no', 'no.', 'item', 'sku', 'code', 'item code', 'product no', 'article no', 'item#', 'mã hàng'):
+                    sku_cols.append(c)
+                    if not is_master_col:
+                        matched_master_count += 1
+                        is_master_col = True
+
+                # 5. Description
+                if re.search(r'^(description|desc|tên\s*hàng|tên\s*sp|tên\s*sản\s*phẩm|mô\s*tả|product\s*name)', clean_h):
+                    if not is_master_col:
+                        matched_master_count += 1
+                        is_master_col = True
+
+                # 6. Quantity
+                if re.search(r'^(quantity|qty|số\s*lượng|sl\b|pcs\b)', clean_h):
+                    if not is_master_col:
+                        matched_master_count += 1
+                        is_master_col = True
+
+            # Yêu cầu bắt buộc phải có ít nhất 3 cột phục vụ thống kê (PO, Destination, SKU)
+            if po_cols and dest_cols and sku_cols:
+                valid_data_rows = 0
+                sample_end = min(r + 30, ws.max_row + 1)
+                for test_r in range(r + 1, sample_end):
+                    p_val = ws.cell(test_r, po_cols[0]).value
+                    s_val = ws.cell(test_r, sku_cols[0]).value
+                    if p_val is not None and s_val is not None and str(p_val).strip() and str(s_val).strip():
+                        valid_data_rows += 1
+
+                score = base_score + (matched_master_count * 100) + (valid_data_rows * 20) + ws.max_row
+                candidates.append({
+                    'sheet': ws,
+                    'sheet_name': sheet_name,
+                    'header_row': r,
+                    'po_col': po_cols[0],
+                    'dest_col': dest_cols[0],
+                    'sku_col': sku_cols[0],
+                    'matched_master_count': matched_master_count,
+                    'score': score,
+                    'data_rows': valid_data_rows
+                })
+
+    if not candidates:
+        scanned_sheets = [s for s in wb.sheetnames if s.lower() not in ('per_week', 'per week')]
+        raise ValueError(
+            f"Không tìm thấy Sheet Master hợp lệ chứa các cột bắt buộc (PO, Destination, No./SKU).\n"
+            f"Đã quét các sheet: {scanned_sheets}.\n"
+            f"Vui lòng đảm bảo bảng dữ liệu có các cột: PO (hoặc Tuần), Destination (Kho đích), và No. (Mã hàng/SKU)."
+        )
+
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    best = candidates[0]
+    return best['sheet'], best['header_row'], best['po_col'], best['dest_col'], best['sku_col']
+def load_workbook_safe(file_path):
+    """
+    Mở file Excel an toàn. Nếu file đang được mở trong Microsoft Excel,
+    tự động dùng Windows shared-handle (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+    để đọc trực tiếp từ bộ nhớ mà người dùng KHÔNG CẦN PHẢI ĐÓNG EXCEL.
+    """
+    try:
+        return openpyxl.load_workbook(file_path)
+    except PermissionError:
+        try:
+            import ctypes, msvcrt, io
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_ALL = 7 # READ (1) | WRITE (2) | DELETE (4)
+            OPEN_EXISTING = 3
+            h = ctypes.windll.kernel32.CreateFileW(
+                os.path.abspath(file_path),
+                GENERIC_READ,
+                FILE_SHARE_ALL,
+                None,
+                OPEN_EXISTING,
+                0,
+                None
+            )
+            if h != -1:
+                fd = msvcrt.open_osfhandle(h, 0)
+                with open(fd, 'rb') as f:
+                    content = f.read()
+                return openpyxl.load_workbook(io.BytesIO(content))
+        except Exception:
+            pass
+        fname = os.path.basename(file_path)
+        raise ValueError(f"File '{fname}' đang được mở và khóa bởi ứng dụng khác. Vui lòng đóng file lại rồi thử lại.")
+
 def analyze_assortment_file(file_path, output_path=None):
     """
     Phân tích file Assortment theo từng tuần PO và điểm đến (CW01, CW02).
-    Tạo hoặc cập nhật sheet 'Per_week' với đầy đủ công thức và định dạng.
+    Tự động quét thông minh qua tất cả các sheet, bỏ qua sheet nháp/tự tạo,
+    chỉ tập trung vào 3 cột master (PO, Destination, SKU/No.).
+    Tạo hoặc cập nhật sheet 'Per_week' với đầy đủ công thức và định dạng chuẩn.
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Không tìm thấy file: {file_path}")
 
-    # Mở workbook gốc để giữ nguyên các sheet khác
-    wb = openpyxl.load_workbook(file_path)
+    # Mở workbook (hỗ trợ đọc trực tiếp kể cả khi file đang mở trong Excel)
+    wb = load_workbook_safe(file_path)
     
-    # Tìm sheet dữ liệu nguồn (ưu tiên 'Details', hoặc sheet đầu tiên)
-    source_sheet_name = 'Details' if 'Details' in wb.sheetnames else wb.sheetnames[0]
-    ws_source = wb[source_sheet_name]
-
-    # Đọc headers dòng 1
-    headers = {}
-    for col in range(1, ws_source.max_column + 1):
-        val = ws_source.cell(1, col).value
-        if val is not None:
-            clean_name = str(val).strip().lower()
-            headers[clean_name] = col
-
-    # Nhận diện các cột cần thiết (hỗ trợ nhiều biến thể tên cột)
-    po_col = None
-    for name in ['po.', 'po', 'po number', 'tuần', 'week']:
-        if name in headers:
-            po_col = headers[name]
-            break
-
-    dest_col = None
-    for name in ['destination', 'dest', 'kho', 'kho đích']:
-        if name in headers:
-            dest_col = headers[name]
-            break
-
-    sku_col = None
-    for name in ['no.', 'no', 'item no', 'sku', 'mã hàng', 'item code']:
-        if name in headers:
-            sku_col = headers[name]
-            break
-
-    if not po_col or not dest_col or not sku_col:
-        raise ValueError("Không tìm thấy đủ các cột bắt buộc: PO (hoặc PO.), Destination, và No. (Mã hàng) trong sheet dữ liệu.")
+    # Tìm sheet dữ liệu nguồn và định vị các cột master linh hoạt
+    ws_source, header_row, po_col, dest_col, sku_col = find_assortment_source_sheet(wb)
 
     # Đọc dữ liệu và gom nhóm theo PO
     # Cấu trúc: po_groups[po_name] = {'CW01': set(sku), 'CW02': set(sku)}
     po_groups = {}
-    # Thứ tự xuất hiện ban đầu của PO để giữ đúng layout
     po_order = []
 
-    for r in range(2, ws_source.max_row + 1):
+    for r in range(header_row + 1, ws_source.max_row + 1):
         po_val = ws_source.cell(r, po_col).value
         dest_val = ws_source.cell(r, dest_col).value
         sku_val = ws_source.cell(r, sku_col).value
@@ -1305,23 +1422,37 @@ def analyze_assortment_file(file_path, output_path=None):
             continue
 
         po_str = str(po_val).strip()
-        if not po_str:
+        sku_str = str(sku_val).strip()
+
+        if not po_str or not sku_str:
+            continue
+
+        low_po = po_str.lower()
+        low_sku = sku_str.lower()
+
+        # Bỏ qua dòng tổng cộng hoặc tiêu đề phụ thừa
+        if any(bad in low_po for bad in ['total', 'grand total', 'tổng cộng', 'tổng', 'count', 'sum']):
+            continue
+        if any(bad in low_sku for bad in ['total', 'grand total', 'tổng cộng']):
+            continue
+        if sku_str in ('-', '--', 'N/A', 'NA', 'None', '0'):
             continue
 
         dest_str = str(dest_val).strip().upper() if dest_val is not None else ""
-        sku_str = str(sku_val).strip()
+        clean_dest = re.sub(r'[^a-zA-Z0-9]', '', dest_str).upper()
 
         if po_str not in po_groups:
             po_groups[po_str] = {"CW01": set(), "CW02": set()}
             po_order.append(po_str)
 
-        if "CW01" in dest_str:
+        # Nhận diện linh hoạt kho đích
+        if "CW01" in clean_dest or clean_dest in ("CW1", "DK", "DENMARK") or "DENMARK" in dest_str:
             po_groups[po_str]["CW01"].add(sku_str)
-        elif "CW02" in dest_str:
+        elif "CW02" in clean_dest or clean_dest in ("CW2", "BE", "BELGIUM") or "BELGIUM" in dest_str:
             po_groups[po_str]["CW02"].add(sku_str)
 
     if not po_order:
-        raise ValueError("Không tìm thấy dòng dữ liệu hợp lệ nào để phân tích.")
+        raise ValueError(f"Không tìm thấy dòng dữ liệu PO / Mã hàng hợp lệ nào trong sheet '{ws_source.title}'.")
 
     # Xử lý sheet 'Per_week'
     if 'Per_week' in wb.sheetnames:
@@ -1434,7 +1565,19 @@ def analyze_assortment_file(file_path, output_path=None):
         base, ext = os.path.splitext(file_path)
         output_path = f"{base}_analyzed{ext}"
 
-    wb.save(output_path)
+    try:
+        wb.save(output_path)
+    except PermissionError:
+        import time
+        ts = time.strftime("%H%M%S")
+        base, ext = os.path.splitext(output_path)
+        alt_path = f"{base}_{ts}{ext}"
+        try:
+            wb.save(alt_path)
+            output_path = alt_path
+        except Exception:
+            out_name = os.path.basename(output_path)
+            raise ValueError(f"File kết quả '{out_name}' đang được mở trong Excel. Vui lòng lưu/đóng file đó lại rồi bấm chạy lại.")
     wb.close()
     return output_path, len(po_order)
 
@@ -5085,9 +5228,6 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def _assortment_worker(self):
         try:
-            if not assortment_analyzer:
-                raise ImportError("Không tìm thấy module assortment_analyzer.py")
-
             out_path, num_weeks = analyze_assortment_file(self.assortment_file)
             self.assortment_last_output = out_path
             self.after(0, self._assortment_success, out_path, num_weeks)
