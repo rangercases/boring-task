@@ -735,8 +735,9 @@ class FabricKnowledgeBase:
 
 class POItem:
     """Dữ liệu một dòng sản phẩm trong PO."""
-    def __init__(self, row_idx: int, item_no: str, description: str, unit: str, qty: float, price: float, total: Any):
+    def __init__(self, row_idx: int, item_no: str, description: str, unit: str, qty: float, price: float, total: Any, source_file: str = ""):
         self.row_idx = row_idx
+        self.source_file = source_file
         self.item_no = str(item_no).strip() if item_no else ""
         self.description = str(description).strip() if description else ""
         self.unit = str(unit).strip() if unit else "Pcs"
@@ -763,8 +764,13 @@ class POItem:
 
 
 class POParsedDoc:
-    def __init__(self, file_path: str):
-        self.file_path = file_path
+    def __init__(self, file_paths):
+        if isinstance(file_paths, str):
+            self.file_paths = [file_paths]
+        elif isinstance(file_paths, list):
+            self.file_paths = file_paths
+        else:
+            self.file_paths = []
         self.po_number = ""
         self.pi_number = ""
         self.cust_po_no = ""
@@ -773,7 +779,11 @@ class POParsedDoc:
         self.parse()
 
     def parse(self):
-        wb = openpyxl.load_workbook(self.file_path, data_only=True)
+        for fp in self.file_paths:
+            self._parse_single(fp)
+
+    def _parse_single(self, file_path: str):
+        wb = openpyxl.load_workbook(file_path, data_only=True)
         # Tìm sheet PO (ưu tiên sheet có chữ PO hoặc tên vendor/xưởng như NH FSC, hoặc sheet đầu tiên)
         target_sheet = wb.active
         for sname in wb.sheetnames:
@@ -855,7 +865,8 @@ class POParsedDoc:
                     unit=str(unit).strip() if unit else "Pcs",
                     qty=qty,
                     price=price,
-                    total=total
+                    total=total,
+                    source_file=file_path
                 ))
         wb.close()
 
@@ -1127,7 +1138,7 @@ class OrderAuditEngine:
 # 4. EXPORT AUDIT EXCEL REPORT (SOFT IVORY BAKERY PALETTE)
 # ==============================================================================
 
-def export_audit_excel(audit_results: List[AuditResultItem], output_path: str, source_po_path: Optional[str] = None):
+def export_audit_excel(audit_results: List[AuditResultItem], output_path: str, source_po_path=None):
     """
     Ghi trực tiếp kết quả kiểm toán vào file PO gốc (tạo bản sao _audited.xlsx).
     Giữ nguyên 100% định dạng, thông tin khách hàng, công thức của file PO Thủy lập.
@@ -1135,6 +1146,17 @@ def export_audit_excel(audit_results: List[AuditResultItem], output_path: str, s
       - 'Audit Status': PASS (#C6EFCE), REVIEW (#FFEB9C), ERROR (#FFC7CE)
       - 'Audit Notes': Ghi rõ lý do chi tiết cho từng dòng sản phẩm
     """
+    if isinstance(source_po_path, list):
+        out_paths = []
+        for po_file in source_po_path:
+            res_for_po = [r for r in audit_results if getattr(r.po_item, 'source_file', None) == po_file]
+            po_dir = os.path.dirname(po_file)
+            po_base, po_ext = os.path.splitext(os.path.basename(po_file))
+            spec_out = os.path.join(po_dir, f"{po_base}_audited{po_ext}")
+            export_audit_excel(res_for_po, spec_out, source_po_path=po_file)
+            out_paths.append(spec_out)
+        return out_paths
+
     if source_po_path and os.path.exists(source_po_path):
         import shutil
         shutil.copyfile(source_po_path, output_path)
@@ -1817,7 +1839,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         # Order Auditor state
         self.auditor_engine = OrderAuditEngine()
-        self.auditor_po_file = ""
+        self.auditor_po_files = []
         self.auditor_cust_file = ""
         self.auditor_running = False
         self.auditor_last_report = ""
@@ -4742,28 +4764,30 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def auditor_render_po_status(self):
         for child in self.auditor_po_status_box.winfo_children():
             child.destroy()
-        if self.auditor_po_file and os.path.exists(self.auditor_po_file):
-            sz = format_file_size(os.path.getsize(self.auditor_po_file))
-            fn = os.path.basename(self.auditor_po_file)
-            row = ctk.CTkFrame(self.auditor_po_status_box, fg_color="transparent")
-            row.pack(fill="x", padx=16, pady=12)
+        if hasattr(self, 'auditor_po_files') and self.auditor_po_files:
+            for pofile in self.auditor_po_files:
+                if not os.path.exists(pofile): continue
+                sz = format_file_size(os.path.getsize(pofile))
+                fn = os.path.basename(pofile)
+                row = ctk.CTkFrame(self.auditor_po_status_box, fg_color="transparent")
+                row.pack(fill="x", padx=16, pady=2)
 
-            ctk.CTkLabel(
-                row, text="📄", font=ctk.CTkFont(size=16), text_color=ROAST
-            ).pack(side="left", padx=(0, 8))
+                ctk.CTkLabel(
+                    row, text="📄", font=ctk.CTkFont(size=16), text_color=ROAST
+                ).pack(side="left", padx=(0, 8))
 
-            info_box = ctk.CTkFrame(row, fg_color="transparent")
-            info_box.pack(side="left", fill="x", expand=True)
+                info_box = ctk.CTkFrame(row, fg_color="transparent")
+                info_box.pack(side="left", fill="x", expand=True)
 
-            ctk.CTkLabel(
-                info_box, text=fn, font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
-                text_color=ROAST, anchor="w"
-            ).pack(anchor="w")
+                ctk.CTkLabel(
+                    info_box, text=fn, font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+                    text_color=ROAST, anchor="w"
+                ).pack(anchor="w")
 
-            ctk.CTkLabel(
-                info_box, text=f"Kích thước: {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10),
-                text_color=BROWN, anchor="w"
-            ).pack(anchor="w")
+                ctk.CTkLabel(
+                    info_box, text=f"Kích thước: {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10),
+                    text_color=BROWN, anchor="w"
+                ).pack(anchor="w")
         else:
             ctk.CTkLabel(
                 self.auditor_po_status_box,
@@ -4808,16 +4832,16 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             ).pack(fill="both", expand=True)
 
     def auditor_browse_po_file(self):
-        path = filedialog.askopenfilename(
-            title="Chọn file Purchase Order",
+        paths = filedialog.askopenfilenames(
+            title="Chọn file Purchase Order (có thể chọn nhiều file)",
             filetypes=[("Excel Files", "*.xlsx *.xls")]
         )
-        if path:
-            self.auditor_po_file = os.path.abspath(path)
+        if paths:
+            self.auditor_po_files = [os.path.abspath(p) for p in paths]
             self.auditor_render_po_status()
 
     def auditor_clear_po_file(self):
-        self.auditor_po_file = ""
+        self.auditor_po_files = []
         self.auditor_render_po_status()
 
     def auditor_browse_cust_file(self):
@@ -4848,7 +4872,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def auditor_on_drop_po(self, event):
         paths = [p for p in parse_drop_paths(event.data) if os.path.isfile(p)]
         if paths:
-            self.auditor_po_file = paths[0]
+            self.auditor_po_files = paths
             self.auditor_render_po_status()
 
     def auditor_on_drop_cust(self, event):
@@ -4860,7 +4884,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def auditor_start_process(self):
         if self.auditor_running:
             return
-        if not self.auditor_po_file or not os.path.exists(self.auditor_po_file):
+        if not hasattr(self, 'auditor_po_files') or not self.auditor_po_files or not all(os.path.exists(p) for p in self.auditor_po_files):
             messagebox.showwarning("Thiếu file", "Vui lòng chọn File Purchase Order (PO) cần kiểm toán.")
             return
         if not self.auditor_cust_file or not os.path.exists(self.auditor_cust_file):
@@ -4881,7 +4905,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def auditor_worker(self):
         try:
             self.auditor_prog.set(0.3)
-            po_doc = POParsedDoc(self.auditor_po_file)
+            po_doc = POParsedDoc(self.auditor_po_files)
             self.auditor_prog.set(0.6)
             cust_catalog = CustomerCatalog(self.auditor_cust_file)
             self.auditor_prog.set(0.85)
@@ -4889,11 +4913,14 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             results = self.auditor_engine.audit(po_doc, cust_catalog)
 
             # Export Excel directly annotated on PO copy
-            po_dir = os.path.dirname(self.auditor_po_file)
-            po_base, po_ext = os.path.splitext(os.path.basename(self.auditor_po_file))
-            out_fn = os.path.join(po_dir, f"{po_base}_audited{po_ext}")
-            export_audit_excel(results, out_fn, source_po_path=self.auditor_po_file)
-            self.auditor_last_report = out_fn
+            po_dir = os.path.dirname(self.auditor_po_files[0])
+            out_paths = export_audit_excel(results, "", source_po_path=self.auditor_po_files)
+            if out_paths:
+                self.auditor_last_report = out_paths[0]
+                out_fn = self.auditor_last_report
+            else:
+                self.auditor_last_report = ""
+                out_fn = "" 
 
             self.after(0, self.auditor_finish_ui, len(results), results, out_fn, "")
         except Exception as e:
