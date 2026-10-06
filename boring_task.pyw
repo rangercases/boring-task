@@ -35,6 +35,11 @@ try:
 except ImportError:
     order_auditor = None
 
+try:
+    import assortment_analyzer
+except ImportError:
+    assortment_analyzer = None
+
 # Set Windows App User Model ID so Taskbar groups and shows custom icon
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("rangercases.boringtask.v1")
@@ -51,13 +56,13 @@ STATE_FILE_NAME = ".app_state.json"
 
 # Per-machine module visibility (controlled centrally by code & local config.json)
 CONFIG_FILE_NAME = "config.json"
-APP_MODES = ("all", "cost", "images", "fabric", "auditor")
+APP_MODES = ("all", "cost", "images", "fabric", "auditor", "assortment")
 
 # BẢNG PHÂN QUYỀN TẬP TRUNG (Sửa tại đây để phân quyền từ xa qua Git update)
 USER_PERMISSIONS = {
-    "nhung": ["cost"],                                   # Ms Nhung: chỉ xem Purchase Cost
-    "thuy":  ["fabric", "auditor"],                      # Ms Thuy: Fabric Checker & Order Auditor
-    "admin": ["cost", "fabric", "images", "auditor"],   # Admin: toàn quyền xem tất cả các module
+    "nhung": ["cost", "assortment"],                                  # Ms Nhung: Purchase Cost & Assortment Analyzer
+    "thuy":  ["fabric", "auditor"],                                    # Ms Thuy: Fabric Checker & Order Auditor (KHÔNG thấy assortment)
+    "admin": ["cost", "fabric", "images", "auditor", "assortment"],   # Admin: toàn quyền xem tất cả các module
 }
 
 # Image Inserter module
@@ -186,12 +191,12 @@ def load_app_mode():
         # Fallback to direct mode string if present
         mode = str(cfg.get("mode", "all")).strip().lower()
         if mode == "all":
-            return ["cost", "fabric", "images", "auditor"]
-        elif mode in ("cost", "fabric", "images", "auditor"):
+            return ["cost", "fabric", "images", "auditor", "assortment"]
+        elif mode in ("cost", "fabric", "images", "auditor", "assortment"):
             return [mode]
-        return ["cost", "fabric", "images", "auditor"]
+        return ["cost", "fabric", "images", "auditor", "assortment"]
     except Exception:
-        return ["cost", "fabric", "images", "auditor"]
+        return ["cost", "fabric", "images", "auditor", "assortment"]
 
 def img_url_to_unc(url):
     """Converts a file:// link stored in Excel into a Windows UNC path."""
@@ -279,6 +284,11 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.auditor_cust_file = ""
         self.auditor_running = False
         self.auditor_last_report = ""
+
+        # Assortment Analyzer state
+        self.assortment_file = ""
+        self.assortment_running = False
+        self.assortment_last_output = ""
         saved_state = self.load_saved_state()
 
         if saved_state is not None:
@@ -374,32 +384,45 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     # Silent Lightning-Fast Background Auto-Updater
     # ----------------------------------------------------
     def silent_auto_update(self):
-        """Runs silently in background. Checks GitHub Releases / raw code in 1-2s.
-        If a newer release exists, silently downloads and overwrites local code in <1s.
+        """Runs silently in background. Checks latest commit SHA from GitHub.
+        If a new commit is pushed, silently downloads and updates local files in 1-2s.
         """
         try:
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            curr_file = os.path.abspath(__file__)
+            app_dir = os.path.dirname(curr_file)
+            sha_file = os.path.join(app_dir, ".git_sha")
+            
+            curr_sha = ""
+            if os.path.exists(sha_file):
+                try:
+                    with open(sha_file, "r", encoding="utf-8") as f:
+                        curr_sha = f.read().strip()
+                except Exception:
+                    pass
+
+            # Check latest commit from GitHub main branch
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/main"
             req = urllib.request.Request(url, headers={"User-Agent": "BoringTask-App"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
-                    latest_tag = data.get("tag_name", "")
-                    if latest_tag and is_newer_version(latest_tag, APP_VERSION):
+                    latest_sha = data.get("sha", "")
+                    
+                    if latest_sha and latest_sha != curr_sha:
+                        # Fetch latest boring_task.pyw
                         raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/boring_task.pyw"
                         req_raw = urllib.request.Request(raw_url, headers={"User-Agent": "BoringTask-App"})
                         with urllib.request.urlopen(req_raw, timeout=5) as raw_resp:
                             if raw_resp.status == 200:
                                 new_code = raw_resp.read()
                                 if len(new_code) > 1000 and (b"BoringTask" in new_code or b"ClaimHelper" in new_code):
-                                    curr_file = os.path.abspath(__file__)
-                                    app_dir = os.path.dirname(curr_file)
                                     tmp_file = curr_file + ".new"
                                     with open(tmp_file, "wb") as f:
                                         f.write(new_code)
                                     os.replace(tmp_file, curr_file)
 
-                                    # Also ensure extra modules (fabric_checker.py, order_auditor.py) are kept up to date
-                                    for extra_mod in ["fabric_checker.py", "order_auditor.py"]:
+                                    # Also ensure extra modules are kept up to date
+                                    for extra_mod in ["fabric_checker.py", "order_auditor.py", "assortment_analyzer.py"]:
                                         try:
                                             mod_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{extra_mod}"
                                             mod_req = urllib.request.Request(mod_url, headers={"User-Agent": "BoringTask-App"})
@@ -415,7 +438,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                                         except Exception:
                                             pass
 
-                                    self.after(0, self.set_update_badge, f"✓ Đã tự động cập nhật {latest_tag}")
+                                    with open(sha_file, "w", encoding="utf-8") as f:
+                                        f.write(latest_sha)
+
+                                    self.after(0, self.set_update_badge, f"✓ Đã tự động cập nhật ({latest_sha[:7]})")
         except Exception:
             pass
 
@@ -485,6 +511,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.image_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.fabric_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.auditor_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.assortment_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
 
         self.build_home()
         self.build_feature_nav(self.claim_view, "Purchase Cost Auto-Filled")
@@ -758,6 +785,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             self.build_fabric_checker()
         if "auditor" in self.app_mode:
             self.build_order_auditor()
+        if "assortment" in self.app_mode:
+            self.build_assortment_analyzer()
 
         self.show_home()
 
@@ -807,6 +836,13 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 "title": "Order Auditor",
                 "subtitle": "Multi-Layer PO Check",
                 "command": lambda: self.show_feature(self.auditor_view, "Order Auditor"),
+            })
+        if "assortment" in self.app_mode:
+            features.append({
+                "icon": "📊",
+                "title": "Assortment Analyzer",
+                "subtitle": "Weekly PO & Dest Stats",
+                "command": lambda: self.show_feature(self.assortment_view, "Assortment Analyzer"),
             })
 
         cols = 3
@@ -3470,6 +3506,297 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     font=ctk.CTkFont(family=FONT_SANS, size=10, slant="italic"),
                     text_color=FAINT
                 ).pack(padx=16, pady=(4, 8), anchor="w")
+
+    # ====================================================
+    # MODULE: Assortment Analyzer (Weekly PO & Dest Stats)
+    # ====================================================
+    def build_assortment_analyzer(self):
+        self.build_feature_nav(self.assortment_view, "Assortment Analyzer")
+
+        scroll = ctk.CTkScrollableFrame(self.assortment_view, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
+
+        # CARD 1: File Nguồn Assortment
+        self.card_assort_file = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_assort_file.pack(fill="x", pady=(0, 20))
+
+        top_file = ctk.CTkFrame(self.card_assort_file, fg_color="transparent")
+        top_file.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top_file,
+            text="FILE EXCEL ASSORTMENT HỆ THỐNG",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_box = ctk.CTkFrame(top_file, fg_color="transparent")
+        btn_box.pack(side="right")
+
+        self.btn_pick_assort = ctk.CTkButton(
+            btn_box,
+            text="+ Chọn File Assortment...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=175,
+            height=28,
+            command=self.assortment_browse_file
+        )
+        self.btn_pick_assort.pack(side="left", padx=4)
+
+        self.btn_clear_assort = ctk.CTkButton(
+            btn_box,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=70,
+            height=28,
+            command=self.assortment_clear_file
+        )
+        self.btn_clear_assort.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_assort_file, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.assort_status_box = ctk.CTkFrame(
+            self.card_assort_file, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.assort_status_box.pack(fill="x", padx=24, pady=(0, 20))
+        self.assortment_render_file_status()
+
+        # ACTION BUTTON
+        btn_run_box = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_run_box.pack(fill="x", pady=(4, 14))
+
+        self.btn_run_assort = ctk.CTkButton(
+            btn_run_box,
+            text="Bắt Đầu Phân Tích & Tạo Sheet Thống Kê (Per_week)",
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            fg_color=ROAST,
+            hover_color=MOSS,
+            text_color=IVORY,
+            corner_radius=24,
+            height=48,
+            command=self.assortment_start_processing
+        )
+        self.btn_run_assort.pack(fill="x")
+
+        # PROGRESS BAR
+        self.prog_bar_assort = ctk.CTkProgressBar(scroll, progress_color=MOSS, fg_color=LINE, height=3, corner_radius=2)
+        self.prog_bar_assort.set(0)
+        self.prog_bar_assort.pack(fill="x", pady=(0, 20))
+
+        # CARD 2: KẾT QUẢ
+        self.card_assort_results = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_assort_results.pack(fill="both", expand=True, pady=(0, 20))
+
+        top_res = ctk.CTkFrame(self.card_assort_results, fg_color="transparent")
+        top_res.pack(fill="x", padx=24, pady=(18, 10))
+
+        ctk.CTkLabel(
+            top_res,
+            text="KẾT QUẢ PHÂN TÍCH",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        ctk.CTkFrame(self.card_assort_results, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.assort_feed = ctk.CTkFrame(
+            self.card_assort_results, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.assort_feed.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.assortment_render_initial_feed()
+
+        # Drag and Drop support
+        if getattr(self, "has_dnd", False):
+            for t in [self.card_assort_file, self.assort_status_box]:
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', lambda e: self.assortment_on_drop(e))
+                except Exception:
+                    pass
+
+    def assortment_render_initial_feed(self):
+        for child in self.assort_feed.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(
+            self.assort_feed,
+            text="Kéo thả hoặc chọn file Excel Assortment rồi bấm 'Bắt Đầu Phân Tích'.\nỨng dụng sẽ tự động tính SKU từng kho (CW01, CW02), mã trùng lặp và % tỷ lệ theo từng tuần.",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN,
+            justify="center",
+            pady=32
+        ).pack(fill="both", expand=True)
+
+    def assortment_render_file_status(self):
+        for child in self.assort_status_box.winfo_children():
+            child.destroy()
+        if self.assortment_file and os.path.exists(self.assortment_file):
+            sz = format_file_size(os.path.getsize(self.assortment_file))
+            fn = os.path.basename(self.assortment_file)
+            row = ctk.CTkFrame(self.assort_status_box, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=12)
+
+            ctk.CTkLabel(row, text="📊", font=ctk.CTkFont(size=16), text_color=ROAST).pack(side="left", padx=(0, 8))
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="x", expand=True)
+
+            ctk.CTkLabel(info_box, text=fn, font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"), text_color=ROAST, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(info_box, text=f"Dung lượng: {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10), text_color=BROWN, anchor="w").pack(anchor="w")
+        else:
+            ctk.CTkLabel(
+                self.assort_status_box,
+                text="Chưa chọn file Assortment.\nKéo & thả file Excel (.xlsx) vào đây hoặc bấm nút Chọn File ở trên.",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=FAINT,
+                justify="center",
+                pady=16
+            ).pack(fill="both", expand=True)
+
+    def assortment_browse_file(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file Excel Assortment",
+            filetypes=[("Excel Files", "*.xlsx;*.xlsm"), ("All Files", "*.*")]
+        )
+        if path:
+            try:
+                validate_excel_file(path)
+                self.assortment_file = os.path.abspath(path)
+                self.assortment_render_file_status()
+            except Exception as e:
+                messagebox.showerror("File không hợp lệ", str(e))
+
+    def assortment_clear_file(self):
+        self.assortment_file = ""
+        self.assortment_render_file_status()
+
+    def assortment_on_drop(self, event):
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if p.lower().endswith(('.xlsx', '.xlsm')) and not os.path.basename(p).startswith('~$'):
+                try:
+                    validate_excel_file(p)
+                    self.assortment_file = os.path.abspath(p)
+                    self.assortment_render_file_status()
+                    break
+                except Exception as e:
+                    messagebox.showerror("File không hợp lệ", str(e))
+
+    def assortment_start_processing(self):
+        if self.assortment_running:
+            return
+        if not self.assortment_file or not os.path.exists(self.assortment_file):
+            messagebox.showwarning("Thiếu dữ liệu", "Vui lòng chọn file Excel Assortment trước khi phân tích.")
+            return
+
+        self.assortment_running = True
+        self.btn_run_assort.configure(state="disabled", text="Đang phân tích dữ liệu...")
+        self.prog_bar_assort.set(0.3)
+
+        threading.Thread(target=self._assortment_worker, daemon=True).start()
+
+    def _assortment_worker(self):
+        try:
+            if not assortment_analyzer:
+                raise ImportError("Không tìm thấy module assortment_analyzer.py")
+
+            out_path, num_weeks = assortment_analyzer.analyze_assortment_file(self.assortment_file)
+            self.assortment_last_output = out_path
+            self.after(0, self._assortment_success, out_path, num_weeks)
+        except Exception as e:
+            self.after(0, self._assortment_error, str(e))
+
+    def _assortment_success(self, out_path, num_weeks):
+        self.assortment_running = False
+        self.btn_run_assort.configure(state="normal", text="Bắt Đầu Phân Tích & Tạo Sheet Thống Kê (Per_week)")
+        self.prog_bar_assort.set(1.0)
+
+        for child in self.assort_feed.winfo_children():
+            child.destroy()
+
+        res_box = ctk.CTkFrame(self.assort_feed, fg_color="transparent")
+        res_box.pack(fill="x", padx=16, pady=16)
+
+        ctk.CTkLabel(
+            res_box,
+            text=f"✓ Đã phân tích thành công {num_weeks} tuần PO!",
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            text_color=MOSS
+        ).pack(anchor="w", pady=(0, 6))
+
+        fn = os.path.basename(out_path)
+        ctk.CTkLabel(
+            res_box,
+            text=f"File kết quả: {fn}\nĐã thêm sheet 'Per_week' với đầy đủ công thức và định dạng chuẩn.",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=ROAST,
+            justify="left"
+        ).pack(anchor="w", pady=(0, 14))
+
+        act_row = ctk.CTkFrame(res_box, fg_color="transparent")
+        act_row.pack(anchor="w")
+
+        ctk.CTkButton(
+            act_row,
+            text="Mở File Excel",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            fg_color=ROAST,
+            hover_color=MOSS,
+            text_color=IVORY,
+            corner_radius=14,
+            height=30,
+            command=lambda: os.startfile(out_path)
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            act_row,
+            text="Mở Thư Mục",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            height=30,
+            command=lambda: reveal_in_explorer(out_path)
+        ).pack(side="left")
+
+    def _assortment_error(self, err_msg):
+        self.assortment_running = False
+        self.btn_run_assort.configure(state="normal", text="Bắt Đầu Phân Tích & Tạo Sheet Thống Kê (Per_week)")
+        self.prog_bar_assort.set(0)
+
+        for child in self.assort_feed.winfo_children():
+            child.destroy()
+
+        err_box = ctk.CTkFrame(self.assort_feed, fg_color="transparent")
+        err_box.pack(fill="x", padx=16, pady=16)
+
+        ctk.CTkLabel(
+            err_box,
+            text="❌ Có lỗi xảy ra trong quá trình phân tích:",
+            font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+            text_color=DANGER
+        ).pack(anchor="w", pady=(0, 4))
+
+        ctk.CTkLabel(
+            err_box,
+            text=err_msg,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=ROAST,
+            wraplength=650,
+            justify="left"
+        ).pack(anchor="w")
 
 if __name__ == "__main__":
     app = BoringTaskApp()
