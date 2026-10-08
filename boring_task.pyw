@@ -1604,6 +1604,436 @@ def analyze_assortment_file(file_path, output_path=None):
     return output_path, len(po_order)
 
 # ==============================================================================
+# EMBEDDED MODULE 4: WEEKLY PO CHECKER (weekly_po_checker)
+# ==============================================================================
+import os
+import sys
+import re
+import copy
+import win32file
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+W_FILL_OK = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+W_FONT_OK = Font(name="Segoe UI", size=10, bold=True, color="006100")
+
+W_FILL_WARN = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+W_FONT_WARN = Font(name="Segoe UI", size=10, bold=True, color="9C6500")
+
+W_FILL_ERR = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+W_FONT_ERR = Font(name="Segoe UI", size=10, bold=True, color="9C0006")
+
+W_FILL_HEAD = PatternFill(start_color="F1EADB", end_color="F1EADB", fill_type="solid")
+W_FONT_HEAD = Font(name="Segoe UI", size=10, bold=True, color="2B211C")
+
+W_BORDER_SIDE = Side(border_style="thin", color="E8E0D0")
+W_BORDER = Border(left=W_BORDER_SIDE, right=W_BORDER_SIDE, top=W_BORDER_SIDE, bottom=W_BORDER_SIDE)
+
+def weekly_safe_copy_shared(src, dst):
+    """Safely copies a file even if currently opened/locked by Excel with shared read/write."""
+    handle = win32file.CreateFile(
+        src,
+        win32file.GENERIC_READ,
+        win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE | win32file.FILE_SHARE_DELETE,
+        None,
+        win32file.OPEN_EXISTING,
+        win32file.FILE_ATTRIBUTE_NORMAL,
+        None
+    )
+    with open(dst, 'wb') as out_f:
+        while True:
+            hr, data = win32file.ReadFile(handle, 1024 * 1024)
+            if not data:
+                break
+            out_f.write(data)
+    win32file.CloseHandle(handle)
+
+def weekly_normalize_key(val):
+    """Normalize item art code/SKU: string, strip, lower, remove leading zeros if numeric."""
+    if val is None:
+        return ""
+    s = str(val).strip().split(".")[0]
+    return s.lower()
+
+def weekly_normalize_text_loose(text):
+    """Normalize text loosely for typo-resilient comparison (collapse spaces, commas, hyphens)."""
+    if not text:
+        return ""
+    s = str(text).lower()
+    s = re.sub(r'[\s,._\-\(\)]+', ' ', s).strip()
+    return s
+
+def weekly_clean_str(val):
+    return str(val).strip() if val is not None else ""
+
+def weekly_parse_int_qty(val):
+    if val is None or val == "":
+        return 0
+    try:
+        if isinstance(val, (int, float)):
+            return int(round(val))
+        s = str(val).replace(",", "").strip()
+        return int(round(float(s)))
+    except Exception:
+        return 0
+
+def weekly_detect_pi_number(filepath):
+    """Extracts PI number (e.g. S498702) from filename or sheet cells."""
+    fname = os.path.basename(filepath)
+    m = re.search(r'(S\d{5,7})', fname, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    try:
+        tmp = filepath + ".tmp_peek.xlsx"
+        weekly_safe_copy_shared(filepath, tmp)
+        wb = openpyxl.load_workbook(tmp, read_only=True, data_only=True)
+        for sname in wb.sheetnames:
+            ws = wb[sname]
+            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                if r_idx > 30:
+                    break
+                for cell in row:
+                    if cell and isinstance(cell, str):
+                        m2 = re.search(r'(S\d{5,7})', cell, re.IGNORECASE)
+                        if m2:
+                            wb.close()
+                            if os.path.exists(tmp): os.remove(tmp)
+                            return m2.group(1).upper()
+        wb.close()
+        if os.path.exists(tmp): os.remove(tmp)
+    except Exception:
+        pass
+    return ""
+
+def weekly_get_merged_val(ws, r, c):
+    val = ws.cell(r, c).value
+    if val is not None:
+        return val
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row <= r <= rng.max_row and rng.min_col <= c <= rng.max_col:
+            return ws.cell(rng.min_row, rng.min_col).value
+    return None
+
+def weekly_locate_table_in_sheet(ws):
+    """Smartly detects the header row and column positions of an order table in any sheet."""
+    for r in range(1, min(ws.max_row + 1, 60)):
+        row_vals = [str(weekly_get_merged_val(ws, r, c) or '').strip() for c in range(1, min(ws.max_column + 1, 80))]
+        found = {}
+        for c_idx, val in enumerate(row_vals, start=1):
+            vl = val.lower().replace(' ', '').replace('.', '').replace('_', '')
+            if 'customerartno' in vl or vl == 'no' or 'itemno' in vl:
+                if 'art' not in found: found['art'] = c_idx
+            if 'description' in vl or 'customeritemname' in vl:
+                if 'desc' not in found: found['desc'] = c_idx
+            if 'quantity' in vl or 'qty' in vl:
+                if 'qty' not in found: found['qty'] = c_idx
+            if 'scitemno' in vl:
+                if 'sc_item' not in found: found['sc_item'] = c_idx
+            if 'scitemname' in vl:
+                if 'sc_name' not in found: found['sc_name'] = c_idx
+        if 'art' in found and ('desc' in found or 'qty' in found):
+            return r, found
+    return -1, {}
+
+def weekly_find_best_order_sheet(wb):
+    for sname in wb.sheetnames:
+        h_row, col_map = weekly_locate_table_in_sheet(wb[sname])
+        if h_row != -1:
+            return wb[sname], h_row, col_map
+    return wb.active, -1, {}
+
+def weekly_load_master_overview_index(overview_path):
+    """Loads Master Overview and builds comprehensive lookup index.
+    Returns: (master_by_pi, master_all)
+    """
+    tmp_path = overview_path + ".tmp_load.xlsx"
+    weekly_safe_copy_shared(overview_path, tmp_path)
+    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    ws = wb.active
+
+    headers = None
+    h_row = 1
+    for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        row_str = [str(c or '').lower() for c in row]
+        if any('customer art no' in c or 'customerartno' in c or 'item no' in c for c in row_str):
+            headers = [str(c or '').strip() for c in row]
+            h_row = r_idx
+            break
+        if r_idx > 10:
+            break
+
+    if not headers:
+        headers = [str(c or '').strip() for c in next(ws.iter_rows(values_only=True))]
+        h_row = 1
+
+    col_map = {}
+    for idx, h in enumerate(headers):
+        hl = h.lower().replace(" ", "").replace(".", "").replace("_", "")
+        if "pino" in hl or "pi" == hl:
+            col_map["pi"] = idx
+        elif "pono" in hl or "po" == hl:
+            col_map["po"] = idx
+        elif "customerartno" in hl or "customerart" in hl:
+            col_map["art"] = idx
+        elif "scitemno" in hl or ("itemno" in hl and "customer" not in hl):
+            col_map["sc_item"] = idx
+        elif "scitemname" in hl:
+            col_map["sc_name"] = idx
+        elif "customeritemname" in hl:
+            col_map["cust_name"] = idx
+        elif "orderedquantity" in hl or "orderquantity" in hl or "orderedqty" in hl or "qty" == hl:
+            col_map["qty"] = idx
+
+    master_by_pi = {}
+    master_all = {}
+
+    for row in ws.iter_rows(min_row=h_row + 1, values_only=True):
+        if not any(row):
+            continue
+        pi_val = weekly_clean_str(row[col_map.get("pi", 4)] if "pi" in col_map else "")
+        art_val = weekly_clean_str(row[col_map.get("art", 12)] if "art" in col_map else "")
+        if not art_val:
+            continue
+
+        m_pi = re.search(r'(S\d{5,7})', pi_val, re.IGNORECASE)
+        pi_key = m_pi.group(1).upper() if m_pi else pi_val.upper()
+
+        art_key = weekly_normalize_key(art_val)
+        item_data = {
+            "pi": pi_key,
+            "po": weekly_clean_str(row[col_map.get("po", 5)] if "po" in col_map else ""),
+            "art_raw": art_val,
+            "art_key": art_key,
+            "sc_item": weekly_clean_str(row[col_map.get("sc_item", 13)] if "sc_item" in col_map else ""),
+            "sc_name": weekly_clean_str(row[col_map.get("sc_name", 17)] if "sc_name" in col_map else ""),
+            "cust_name": weekly_clean_str(row[col_map.get("cust_name", 19)] if "cust_name" in col_map else ""),
+            "qty": weekly_parse_int_qty(row[col_map.get("qty", 21)] if "qty" in col_map else 0),
+        }
+
+        if pi_key:
+            if pi_key not in master_by_pi:
+                master_by_pi[pi_key] = {}
+            if art_key in master_by_pi[pi_key]:
+                master_by_pi[pi_key][art_key]["qty"] += item_data["qty"]
+            else:
+                master_by_pi[pi_key][art_key] = copy.deepcopy(item_data)
+
+        if art_key not in master_all:
+            master_all[art_key] = copy.deepcopy(item_data)
+        else:
+            master_all[art_key]["qty"] += item_data["qty"]
+
+    wb.close()
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    return master_by_pi, master_all
+
+def weekly_find_safe_append_col(ws):
+    """Safely finds an empty column index to append columns without colliding with merged or formatted cells."""
+    max_c = 0
+    for r in range(1, min(ws.max_row + 1, 150)):
+        for c in range(1, ws.max_column + 1):
+            if ws.cell(r, c).value is not None and c > max_c:
+                max_c = c
+    for rng in ws.merged_cells.ranges:
+        if rng.max_col > max_c:
+            max_c = rng.max_col
+    for col_letter, dim in ws.column_dimensions.items():
+        if dim.width is not None and dim.width > 0:
+            try:
+                c_idx = openpyxl.utils.column_index_from_string(col_letter)
+                if c_idx > max_c:
+                    max_c = c_idx
+            except Exception:
+                pass
+    return max_c + 1
+
+def weekly_audit_file_generic(file_path, master_dict, output_suffix="_checked.xlsx", factory_items_sum=None, role_name="NHUNG"):
+    """Audits an order file (Nhung or Factory) against Master PO dictionary.
+    Preserves 100% original layout, styling, and formulas, appending [CHECK STATUS] and [AUDIT NOTE].
+    """
+    tmp_in = file_path + ".tmp_audit.xlsx"
+    weekly_safe_copy_shared(file_path, tmp_in)
+    wb = openpyxl.load_workbook(tmp_in)
+
+    ws, h_row, col_map = weekly_find_best_order_sheet(wb)
+    if h_row == -1:
+        wb.close()
+        if os.path.exists(tmp_in): os.remove(tmp_in)
+        raise ValueError(f"Không nhận diện được bảng đơn hàng trong file '{os.path.basename(file_path)}'.")
+
+    # Safe append column location
+    check_col = weekly_find_safe_append_col(ws)
+    note_col = check_col + 1
+
+    # Header styling
+    ws.column_dimensions[get_column_letter(check_col)].width = 22
+    ws.column_dimensions[get_column_letter(note_col)].width = 52
+    ws.column_dimensions[get_column_letter(check_col)].hidden = False
+    ws.column_dimensions[get_column_letter(note_col)].hidden = False
+
+    cell_h_chk = ws.cell(h_row, check_col, "[CHECK STATUS]")
+    cell_h_chk.fill = W_FILL_HEAD
+    cell_h_chk.font = W_FONT_HEAD
+    cell_h_chk.border = W_BORDER
+    cell_h_chk.alignment = Alignment(horizontal="center", vertical="center")
+
+    cell_h_not = ws.cell(h_row, note_col, "[AUDIT NOTE]")
+    cell_h_not.fill = W_FILL_HEAD
+    cell_h_not.font = W_FONT_HEAD
+    cell_h_not.border = W_BORDER
+    cell_h_not.alignment = Alignment(horizontal="left", vertical="center")
+
+    # First pass: sum quantities and catalog items by art_key
+    file_sum_qty = {}
+    row_item_map = {}
+
+    for r in range(h_row + 1, ws.max_row + 1):
+        art_val = ws.cell(r, col_map.get('art', 1)).value
+        if not art_val:
+            continue
+        art_str = str(art_val).strip()
+
+        # Filtering: skip totals, address headers, non-SKU texts
+        art_lower = art_str.lower()
+        if any(w in art_lower for w in ('total', 'grand total', 'ship-to', 'address', 'warehouse', 'gate ', 'ghent', 'belgium', 'location')):
+            continue
+        if not any(ch.isdigit() for ch in art_str):
+            continue
+
+        art_k = weekly_normalize_key(art_str)
+        desc_val = weekly_clean_str(weekly_get_merged_val(ws, r, col_map.get('desc', 2)))
+        
+        # Get quantity directly or via merged
+        raw_qty = ws.cell(r, col_map.get('qty', 3)).value
+        if raw_qty is None and 'qty' in col_map:
+            # check neighbor col (e.g. Assortment has header at 41 but data at 42)
+            c_target = col_map['qty']
+            for c_try in (c_target, c_target + 1, c_target - 1):
+                if 1 <= c_try <= ws.max_column:
+                    v_try = ws.cell(r, c_try).value
+                    if v_try is not None:
+                        raw_qty = v_try
+                        break
+        qty_val = weekly_parse_int_qty(raw_qty)
+
+        sc_item_val = weekly_clean_str(weekly_get_merged_val(ws, r, col_map.get('sc_item', 0))) if 'sc_item' in col_map else ""
+        sc_name_val = weekly_clean_str(weekly_get_merged_val(ws, r, col_map.get('sc_name', 0))) if 'sc_name' in col_map else ""
+
+        row_item_map[r] = (art_k, art_str, desc_val, qty_val, sc_item_val, sc_name_val)
+        file_sum_qty[art_k] = file_sum_qty.get(art_k, 0) + qty_val
+
+    # Statistics
+    stats = {
+        "total_lines": len(row_item_map),
+        "total_qty": sum(file_sum_qty.values()),
+        "ok": 0,
+        "warn": 0,
+        "err": 0,
+        "missing_in_file": [],
+        "diff_lines": []
+    }
+
+    # Second pass: check each row and decorate
+    for r, item_info in row_item_map.items():
+        art_k, art_str, desc_val, qty_val, sc_item_val, sc_name_val = item_info
+
+        status = "OK"
+        notes = []
+        fill_to_apply = W_FILL_OK
+        font_to_apply = W_FONT_OK
+
+        if art_k not in master_dict:
+            status = "KHÔNG CÓ TRONG MASTER"
+            fill_to_apply = W_FILL_ERR
+            font_to_apply = W_FONT_ERR
+            notes.append(f"Mã '{art_str}' không tồn tại trong Master PO!")
+        else:
+            m_item = master_dict[art_k]
+            tot_file_q = file_sum_qty.get(art_k, 0)
+            tot_mast_q = m_item['qty']
+            if tot_file_q != tot_mast_q:
+                status = "LỆCH SỐ LƯỢNG"
+                fill_to_apply = W_FILL_ERR
+                font_to_apply = W_FONT_ERR
+                notes.append(f"Tổng số lượng ({tot_file_q}) lệch Master ({tot_mast_q})")
+
+            # 3-way check with Factory if available
+            if factory_items_sum is not None:
+                tot_fac_q = factory_items_sum.get(art_k, 0)
+                if tot_fac_q != tot_file_q:
+                    if status == "OK":
+                        status = "LỆCH VỚI NHÀ MÁY"
+                        fill_to_apply = W_FILL_WARN
+                        font_to_apply = W_FONT_WARN
+                    notes.append(f"Nhà máy nhận {tot_fac_q} (lệch đơn hàng {tot_file_q})")
+
+            # Description check (fuzzy)
+            if desc_val and m_item['cust_name']:
+                if weekly_normalize_text_loose(desc_val) != weekly_normalize_text_loose(m_item['cust_name']):
+                    if status == "OK":
+                        status = "LỆCH TÊN"
+                        fill_to_apply = W_FILL_WARN
+                        font_to_apply = W_FONT_WARN
+                    notes.append(f"Tên Master: '{m_item['cust_name']}'")
+
+            # SC Item No check
+            if sc_item_val and m_item['sc_item']:
+                if weekly_normalize_key(sc_item_val) != weekly_normalize_key(m_item['sc_item']):
+                    if status == "OK":
+                        status = "SAI MÃ SC ITEM"
+                        fill_to_apply = W_FILL_ERR
+                        font_to_apply = W_FONT_ERR
+                    notes.append(f"SC Item Master: '{m_item['sc_item']}'")
+
+        if not notes:
+            notes.append("Khớp 100% với Master Overview")
+
+        # Write cell values safely
+        c_chk = ws.cell(r, check_col, status)
+        c_chk.fill = fill_to_apply
+        c_chk.font = font_to_apply
+        c_chk.border = W_BORDER
+        c_chk.alignment = Alignment(horizontal="center", vertical="center")
+
+        note_text = " | ".join(notes)
+        c_not = ws.cell(r, note_col, note_text)
+        c_not.border = W_BORDER
+        c_not.font = font_to_apply if status != "OK" else Font(name="Segoe UI", size=10, color="006100")
+        c_not.alignment = Alignment(horizontal="left", vertical="center")
+
+        if status == "OK":
+            stats["ok"] += 1
+        elif "LỆCH" in status or "SAI" in status:
+            stats["err"] += 1
+            stats["diff_lines"].append((art_str, status, note_text))
+        else:
+            stats["warn"] += 1
+            stats["diff_lines"].append((art_str, status, note_text))
+
+    # Items in Master but missing in this file
+    for art_k, m_item in master_dict.items():
+        if art_k not in file_sum_qty:
+            stats["missing_in_file"].append(m_item)
+
+    # Save output file
+    base, ext = os.path.splitext(file_path)
+    out_path = f"{base}{output_suffix}"
+    try:
+        wb.save(out_path)
+    except PermissionError:
+        import time
+        ts = time.strftime("%H%M%S")
+        out_path = f"{base}_{ts}{output_suffix}"
+        wb.save(out_path)
+    wb.close()
+    if os.path.exists(tmp_in):
+        os.remove(tmp_in)
+
+    return out_path, stats, file_sum_qty
+
+# ==============================================================================
 # MAIN BORING TASK APPLICATION CORE
 # ==============================================================================
 APP_VERSION = "v1.2"
@@ -1613,13 +2043,13 @@ STATE_FILE_NAME = ".app_state.json"
 
 # Per-machine module visibility (controlled centrally by code & local config.json)
 CONFIG_FILE_NAME = "config.json"
-APP_MODES = ("all", "cost", "images", "fabric", "auditor", "assortment")
+APP_MODES = ("all", "cost", "images", "fabric", "auditor", "assortment", "weekly_po")
 
 # BẢNG PHÂN QUYỀN TẬP TRUNG (Sửa tại đây để phân quyền từ xa qua Git update)
 USER_PERMISSIONS = {
-    "nhung": ["cost", "assortment"],                                  # Ms Nhung: Purchase Cost & Assortment Analyzer
-    "thuy":  ["fabric", "auditor"],                                    # Ms Thuy: Fabric Checker & Order Auditor (KHÔNG thấy assortment)
-    "admin": ["cost", "fabric", "images", "auditor", "assortment"],   # Admin: toàn quyền xem tất cả các module
+    "nhung": ["cost", "assortment", "weekly_po"],                                # Ms Nhung: Purchase Cost, Assortment & Weekly PO
+    "thuy":  ["fabric", "auditor"],                                                # Ms Thuy: Fabric Checker & Order Auditor
+    "admin": ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"], # Admin: toan quyen xem tat ca cac module
 }
 
 # Image Inserter module
@@ -1748,14 +2178,14 @@ def load_app_mode():
         # Fallback to direct mode string if present
         mode = str(cfg.get("mode", "all")).strip().lower()
         if mode == "all":
-            return ["cost", "fabric", "images", "auditor", "assortment"]
+            return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"]
         elif mode == "cost":
-            return ["cost", "assortment"]
-        elif mode in ("cost", "fabric", "images", "auditor", "assortment"):
+            return ["cost", "assortment", "weekly_po"]
+        elif mode in ("cost", "fabric", "images", "auditor", "assortment", "weekly_po"):
             return [mode]
-        return ["cost", "fabric", "images", "auditor", "assortment"]
+        return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"]
     except Exception:
-        return ["cost", "fabric", "images", "auditor", "assortment"]
+        return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"]
 
 def img_url_to_unc(url):
     """Converts a file:// link stored in Excel into a Windows UNC path."""
@@ -1848,6 +2278,14 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.assortment_file = ""
         self.assortment_running = False
         self.assortment_last_output = ""
+
+        # Weekly PO Checker state
+        self.weekly_po_master_file = ""
+        self.weekly_po_nhung_file = ""
+        self.weekly_po_factory_file = ""
+        self.weekly_po_running = False
+        self.weekly_po_last_outputs = []
+        self.weekly_po_master_cache = None
         saved_state = self.load_saved_state()
 
         if saved_state is not None:
@@ -1855,6 +2293,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             saved_ov = saved_state.get("overview_path", "")
             if saved_ov and os.path.exists(saved_ov):
                 self.overview_path = saved_ov
+                self.weekly_po_master_file = saved_ov
+            saved_po_m = saved_state.get("weekly_po_master", "")
+            if saved_po_m and os.path.exists(saved_po_m):
+                self.weekly_po_master_file = saved_po_m
             
             # Restore saved claim files (keep only existing files)
             saved_claims = saved_state.get("claim_files", [])
@@ -1873,6 +2315,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 if f.lower().startswith("overview") and f.endswith(".xlsx") and not f.startswith("~$"):
                     self.overview_path = os.path.join(curr_dir, f)
                     break
+        if not self.weekly_po_master_file:
+            self.weekly_po_master_file = self.overview_path
 
         self.setup_ui()
         self.setup_drag_and_drop()
@@ -1932,7 +2376,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         try:
             data = {
                 "overview_path": self.overview_path,
-                "claim_files": self.claim_files
+                "claim_files": self.claim_files,
+                "weekly_po_master": self.weekly_po_master_file
             }
             with open(s_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2056,6 +2501,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.fabric_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.auditor_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.assortment_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.weekly_po_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
 
         self.build_home()
         self.build_feature_nav(self.claim_view, "Purchase Cost Auto-Filled")
@@ -2331,6 +2777,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             self.build_order_auditor()
         if "assortment" in self.app_mode:
             self.build_assortment_analyzer()
+        if "weekly_po" in self.app_mode:
+            self.build_weekly_po_checker()
 
         self.show_home()
 
@@ -2387,6 +2835,13 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 "title": "Assortment Analyzer",
                 "subtitle": "Weekly PO & Dest Stats",
                 "command": lambda: self.show_feature(self.assortment_view, "Assortment Analyzer"),
+            })
+        if "weekly_po" in self.app_mode:
+            features.append({
+                "icon": "🔍",
+                "title": "Weekly PO Check",
+                "subtitle": "Master vs Order Audit",
+                "command": lambda: self.show_feature(self.weekly_po_view, "Weekly PO Checking"),
             })
 
         cols = 3
@@ -2518,6 +2973,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.image_view.pack_forget()
         self.fabric_view.pack_forget()
         self.auditor_view.pack_forget()
+        self.assortment_view.pack_forget()
+        self.weekly_po_view.pack_forget()
         self.home_view.pack(fill="both", expand=True)
         self.current_view = self.home_view
         self.title("Boring Task")
@@ -2849,6 +3306,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         # Route window-level drops to whichever module is on screen
         if self.current_view is self.image_view:
             return self.on_drop_image(event)
+        if self.current_view is self.weekly_po_view:
+            return self.weekly_po_on_drop_generic(event)
         if self.current_view is not self.claim_view:
             return
         self.ov_display_container.configure(border_color=FAINT, fg_color=SAND)
@@ -5331,6 +5790,643 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         ctk.CTkLabel(
             err_box,
             text="❌ Có lỗi xảy ra trong quá trình phân tích:",
+            font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+            text_color=DANGER
+        ).pack(anchor="w", pady=(0, 4))
+
+        ctk.CTkLabel(
+            err_box,
+            text=err_msg,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=ROAST,
+            wraplength=650,
+            justify="left"
+        ).pack(anchor="w")
+
+# ====================================================
+    # MODULE: Weekly PO Checking (Master vs Nhung vs Factory)
+    # ====================================================
+    def build_weekly_po_checker(self):
+        self.build_feature_nav(self.weekly_po_view, "Weekly PO Checking")
+
+        scroll = ctk.CTkScrollableFrame(self.weekly_po_view, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
+
+        # CARD 1: File Master Overview (Cached & Persistent)
+        self.card_w_master = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_w_master.pack(fill="x", pady=(0, 16))
+
+        top_m = ctk.CTkFrame(self.card_w_master, fg_color="transparent")
+        top_m.pack(fill="x", padx=24, pady=(16, 8))
+
+        ctk.CTkLabel(
+            top_m,
+            text="1. FILE MASTER OVERVIEW (DỮ LIỆU GỐC CHUẨN)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_box_m = ctk.CTkFrame(top_m, fg_color="transparent")
+        btn_box_m.pack(side="right")
+
+        self.btn_w_pick_master = ctk.CTkButton(
+            btn_box_m,
+            text="+ Cập Nhật Master...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=150,
+            height=28,
+            command=self.weekly_po_browse_master
+        )
+        self.btn_w_pick_master.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_w_master, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 12))
+
+        self.weekly_master_status_box = ctk.CTkFrame(
+            self.card_w_master, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.weekly_master_status_box.pack(fill="x", padx=24, pady=(0, 16))
+        self.weekly_po_render_master_status()
+
+        # CARD 2: Đơn Hàng Của Nhung Gửi Đi (Bắt Buộc)
+        self.card_w_nhung = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_w_nhung.pack(fill="x", pady=(0, 16))
+
+        top_nh = ctk.CTkFrame(self.card_w_nhung, fg_color="transparent")
+        top_nh.pack(fill="x", padx=24, pady=(16, 8))
+
+        ctk.CTkLabel(
+            top_nh,
+            text="2. ĐƠN HÀNG GỬI ĐI (FILE CỦA NHUNG — BẮT BUỘC)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_box_nh = ctk.CTkFrame(top_nh, fg_color="transparent")
+        btn_box_nh.pack(side="right")
+
+        self.btn_w_pick_nhung = ctk.CTkButton(
+            btn_box_nh,
+            text="+ Chọn File Đơn Hàng...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=165,
+            height=28,
+            command=self.weekly_po_browse_nhung
+        )
+        self.btn_w_pick_nhung.pack(side="left", padx=4)
+
+        self.btn_w_clear_nhung = ctk.CTkButton(
+            btn_box_nh,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=65,
+            height=28,
+            command=self.weekly_po_clear_nhung
+        )
+        self.btn_w_clear_nhung.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_w_nhung, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 12))
+
+        self.weekly_nhung_status_box = ctk.CTkFrame(
+            self.card_w_nhung, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.weekly_nhung_status_box.pack(fill="x", padx=24, pady=(0, 16))
+        self.weekly_po_render_nhung_status()
+
+        # CARD 3: Đơn Hàng Nhà Máy Gửi Lại (Tùy Chọn / Linh Hoạt)
+        self.card_w_factory = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_w_factory.pack(fill="x", pady=(0, 16))
+
+        top_fac = ctk.CTkFrame(self.card_w_factory, fg_color="transparent")
+        top_fac.pack(fill="x", padx=24, pady=(16, 8))
+
+        ctk.CTkLabel(
+            top_fac,
+            text="3. ĐƠN HÀNG NHÀ MÁY PHẢN HỒI (TÙY CHỌN / CÓ THỂ CHECK SAU)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        btn_box_fac = ctk.CTkFrame(top_fac, fg_color="transparent")
+        btn_box_fac.pack(side="right")
+
+        self.btn_w_pick_factory = ctk.CTkButton(
+            btn_box_fac,
+            text="+ Chọn File Nhà Máy...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=165,
+            height=28,
+            command=self.weekly_po_browse_factory
+        )
+        self.btn_w_pick_factory.pack(side="left", padx=4)
+
+        self.btn_w_clear_factory = ctk.CTkButton(
+            btn_box_fac,
+            text="Xóa File",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=65,
+            height=28,
+            command=self.weekly_po_clear_factory
+        )
+        self.btn_w_clear_factory.pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_w_factory, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 12))
+
+        self.weekly_factory_status_box = ctk.CTkFrame(
+            self.card_w_factory, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.weekly_factory_status_box.pack(fill="x", padx=24, pady=(0, 16))
+        self.weekly_po_render_factory_status()
+
+        # ACTION BUTTON
+        btn_run_box = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_run_box.pack(fill="x", pady=(4, 12))
+
+        self.btn_run_weekly_po = ctk.CTkButton(
+            btn_run_box,
+            text="Bắt Đầu Đối Soát & Thêm Cột Check Vào File",
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            fg_color=ROAST,
+            hover_color=MOSS,
+            text_color=IVORY,
+            corner_radius=24,
+            height=48,
+            command=self.weekly_po_start_processing
+        )
+        self.btn_run_weekly_po.pack(fill="x")
+
+        # PROGRESS BAR
+        self.prog_bar_weekly_po = ctk.CTkProgressBar(scroll, progress_color=MOSS, fg_color=LINE, height=3, corner_radius=2)
+        self.prog_bar_weekly_po.set(0)
+        self.prog_bar_weekly_po.pack(fill="x", pady=(0, 16))
+
+        # CARD 4: KẾT QUẢ ĐỐI SOÁT
+        self.card_w_results = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_w_results.pack(fill="both", expand=True, pady=(0, 20))
+
+        top_res = ctk.CTkFrame(self.card_w_results, fg_color="transparent")
+        top_res.pack(fill="x", padx=24, pady=(16, 8))
+
+        ctk.CTkLabel(
+            top_res,
+            text="KẾT QUẢ ĐỐI SOÁT & BÁO CÁO",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        ctk.CTkFrame(self.card_w_results, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 12))
+
+        self.weekly_po_feed = ctk.CTkFrame(
+            self.card_w_results, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT
+        )
+        self.weekly_po_feed.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.weekly_po_render_initial_feed()
+
+        # Drag and Drop support
+        if getattr(self, "has_dnd", False):
+            for t in [self.card_w_master, self.weekly_master_status_box]:
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', lambda e: self.weekly_po_on_drop_master(e))
+                except Exception:
+                    pass
+            for t in [self.card_w_nhung, self.weekly_nhung_status_box]:
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', lambda e: self.weekly_po_on_drop_nhung(e))
+                except Exception:
+                    pass
+            for t in [self.card_w_factory, self.weekly_factory_status_box]:
+                try:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', lambda e: self.weekly_po_on_drop_factory(e))
+                except Exception:
+                    pass
+
+    def weekly_po_render_initial_feed(self):
+        for child in self.weekly_po_feed.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(
+            self.weekly_po_feed,
+            text="Chọn file đơn hàng cần thẩm định rồi bấm 'Bắt Đầu Đối Soát'.\n• Có thể check riêng file của Nhung trước khi gửi đi.\n• Khi có thêm file Nhà máy, ứng dụng sẽ đối chiếu 3 chiều và phát hiện mã thiếu, lệch số lượng, lệch tên.",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN,
+            justify="center",
+            pady=32
+        ).pack(fill="both", expand=True)
+
+    def weekly_po_render_master_status(self):
+        for child in self.weekly_master_status_box.winfo_children():
+            child.destroy()
+        if self.weekly_po_master_file and os.path.exists(self.weekly_po_master_file):
+            sz = format_file_size(os.path.getsize(self.weekly_po_master_file))
+            fn = os.path.basename(self.weekly_po_master_file)
+            row = ctk.CTkFrame(self.weekly_master_status_box, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=10)
+
+            ctk.CTkLabel(row, text="💾", font=ctk.CTkFont(size=16), text_color=MOSS).pack(side="left", padx=(0, 8))
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="x", expand=True)
+
+            ctk.CTkLabel(info_box, text=f"{fn}  [Đã nạp sẵn]", font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"), text_color=ROAST, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(info_box, text=f"{self.weekly_po_master_file}  •  {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10), text_color=BROWN, anchor="w").pack(anchor="w")
+        else:
+            ctk.CTkLabel(
+                self.weekly_master_status_box,
+                text="Chưa có file Master Overview. Kéo & thả file hoặc bấm 'Cập Nhật Master' ở trên.",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=FAINT,
+                justify="center",
+                pady=14
+            ).pack(fill="both", expand=True)
+
+    def weekly_po_render_nhung_status(self):
+        for child in self.weekly_nhung_status_box.winfo_children():
+            child.destroy()
+        if self.weekly_po_nhung_file and os.path.exists(self.weekly_po_nhung_file):
+            sz = format_file_size(os.path.getsize(self.weekly_po_nhung_file))
+            fn = os.path.basename(self.weekly_po_nhung_file)
+            row = ctk.CTkFrame(self.weekly_nhung_status_box, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=10)
+
+            ctk.CTkLabel(row, text="📄", font=ctk.CTkFont(size=16), text_color=ROAST).pack(side="left", padx=(0, 8))
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="x", expand=True)
+
+            ctk.CTkLabel(info_box, text=fn, font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"), text_color=ROAST, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(info_box, text=f"Dung lượng: {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10), text_color=BROWN, anchor="w").pack(anchor="w")
+        else:
+            ctk.CTkLabel(
+                self.weekly_nhung_status_box,
+                text="Chưa chọn file đơn hàng của Nhung.\nKéo & thả file Excel (.xlsx) vào đây hoặc bấm nút Chọn File ở trên.",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=FAINT,
+                justify="center",
+                pady=14
+            ).pack(fill="both", expand=True)
+
+    def weekly_po_render_factory_status(self):
+        for child in self.weekly_factory_status_box.winfo_children():
+            child.destroy()
+        if self.weekly_po_factory_file and os.path.exists(self.weekly_po_factory_file):
+            sz = format_file_size(os.path.getsize(self.weekly_po_factory_file))
+            fn = os.path.basename(self.weekly_po_factory_file)
+            row = ctk.CTkFrame(self.weekly_factory_status_box, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=10)
+
+            ctk.CTkLabel(row, text="🏭", font=ctk.CTkFont(size=16), text_color=ROAST).pack(side="left", padx=(0, 8))
+            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box.pack(side="left", fill="x", expand=True)
+
+            ctk.CTkLabel(info_box, text=fn, font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"), text_color=ROAST, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(info_box, text=f"Dung lượng: {sz}", font=ctk.CTkFont(family=FONT_SANS, size=10), text_color=BROWN, anchor="w").pack(anchor="w")
+        else:
+            ctk.CTkLabel(
+                self.weekly_factory_status_box,
+                text="(Tùy chọn) Kéo & thả file phản hồi của Nhà máy nếu có.\nNếu chưa có, ứng dụng sẽ chỉ kiểm tra đối chiếu file của Nhung với Master.",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=FAINT,
+                justify="center",
+                pady=14
+            ).pack(fill="both", expand=True)
+
+    def weekly_po_browse_master(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file Master Overview",
+            filetypes=[("Excel Files", "*.xlsx;*.xlsm"), ("All Files", "*.*")]
+        )
+        if path:
+            try:
+                validate_excel_file(path)
+                self.weekly_po_master_file = os.path.abspath(path)
+                self.weekly_po_master_cache = None # invalidate cache
+                self.save_state()
+                self.weekly_po_render_master_status()
+            except Exception as e:
+                messagebox.showerror("File không hợp lệ", str(e))
+
+    def weekly_po_browse_nhung(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file đơn hàng của Nhung",
+            filetypes=[("Excel Files", "*.xlsx;*.xlsm"), ("All Files", "*.*")]
+        )
+        if path:
+            try:
+                validate_excel_file(path)
+                self.weekly_po_nhung_file = os.path.abspath(path)
+                self.weekly_po_render_nhung_status()
+            except Exception as e:
+                messagebox.showerror("File không hợp lệ", str(e))
+
+    def weekly_po_clear_nhung(self):
+        self.weekly_po_nhung_file = ""
+        self.weekly_po_render_nhung_status()
+
+    def weekly_po_browse_factory(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file đơn hàng Nhà máy",
+            filetypes=[("Excel Files", "*.xlsx;*.xlsm"), ("All Files", "*.*")]
+        )
+        if path:
+            try:
+                validate_excel_file(path)
+                self.weekly_po_factory_file = os.path.abspath(path)
+                self.weekly_po_render_factory_status()
+            except Exception as e:
+                messagebox.showerror("File không hợp lệ", str(e))
+
+    def weekly_po_clear_factory(self):
+        self.weekly_po_factory_file = ""
+        self.weekly_po_render_factory_status()
+
+    def weekly_po_on_drop_master(self, event):
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if p.lower().endswith(('.xlsx', '.xlsm')) and not os.path.basename(p).startswith('~$'):
+                try:
+                    validate_excel_file(p)
+                    self.weekly_po_master_file = os.path.abspath(p)
+                    self.weekly_po_master_cache = None
+                    self.save_state()
+                    self.weekly_po_render_master_status()
+                    break
+                except Exception as e:
+                    messagebox.showerror("File không hợp lệ", str(e))
+
+    def weekly_po_on_drop_nhung(self, event):
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if p.lower().endswith(('.xlsx', '.xlsm')) and not os.path.basename(p).startswith('~$'):
+                try:
+                    validate_excel_file(p)
+                    self.weekly_po_nhung_file = os.path.abspath(p)
+                    self.weekly_po_render_nhung_status()
+                    break
+                except Exception as e:
+                    messagebox.showerror("File không hợp lệ", str(e))
+
+    def weekly_po_on_drop_factory(self, event):
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if p.lower().endswith(('.xlsx', '.xlsm')) and not os.path.basename(p).startswith('~$'):
+                try:
+                    validate_excel_file(p)
+                    self.weekly_po_factory_file = os.path.abspath(p)
+                    self.weekly_po_render_factory_status()
+                    break
+                except Exception as e:
+                    messagebox.showerror("File không hợp lệ", str(e))
+
+    def weekly_po_on_drop_generic(self, event):
+        paths = parse_drop_paths(event.data)
+        for p in paths:
+            if os.path.isfile(p) and p.endswith('.xlsx') and not os.path.basename(p).startswith('~$'):
+                fn = os.path.basename(p).lower()
+                if "overview" in fn:
+                    self.weekly_po_master_file = os.path.abspath(p)
+                    self.weekly_po_master_cache = None
+                    self.save_state()
+                    self.weekly_po_render_master_status()
+                elif "orderitem" in fn or "sample" in fn:
+                    self.weekly_po_factory_file = os.path.abspath(p)
+                    self.weekly_po_render_factory_status()
+                else:
+                    self.weekly_po_nhung_file = os.path.abspath(p)
+                    self.weekly_po_render_nhung_status()
+
+    def weekly_po_start_processing(self):
+        if self.weekly_po_running:
+            return
+        if not self.weekly_po_master_file or not os.path.exists(self.weekly_po_master_file):
+            messagebox.showwarning("Thiếu Master", "Vui lòng chọn hoặc kéo thả file Master Overview trước khi đối soát.")
+            return
+        if not self.weekly_po_nhung_file or not os.path.exists(self.weekly_po_nhung_file):
+            messagebox.showwarning("Thiếu đơn hàng", "Vui lòng chọn file đơn hàng gửi đi (file của Nhung) trước khi đối soát.")
+            return
+
+        self.weekly_po_running = True
+        self.btn_run_weekly_po.configure(state="disabled", text="Đang tiến hành đối soát...")
+        self.prog_bar_weekly_po.set(0.15)
+
+        for child in self.weekly_po_feed.winfo_children():
+            child.destroy()
+
+        loading_box = ctk.CTkFrame(self.weekly_po_feed, fg_color="transparent")
+        loading_box.pack(fill="both", expand=True, pady=32)
+        ctk.CTkLabel(
+            loading_box,
+            text="⏳ Đang phân tích Master Overview và đối soát các thông tin...",
+            font=ctk.CTkFont(family=FONT_SANS, size=12),
+            text_color=BROWN
+        ).pack()
+
+        threading.Thread(target=self._weekly_po_worker, daemon=True).start()
+
+    def _weekly_po_worker(self):
+        try:
+            self.prog_bar_weekly_po.set(0.3)
+            # Load master cache if not loaded
+            if not self.weekly_po_master_cache:
+                m_by_pi, m_all = weekly_load_master_overview_index(self.weekly_po_master_file)
+                self.weekly_po_master_cache = (m_by_pi, m_all)
+            else:
+                m_by_pi, m_all = self.weekly_po_master_cache
+
+            self.prog_bar_weekly_po.set(0.5)
+
+            # Auto detect PI from files
+            pi_detected = weekly_detect_pi_number(self.weekly_po_nhung_file)
+            if not pi_detected and self.weekly_po_factory_file:
+                pi_detected = weekly_detect_pi_number(self.weekly_po_factory_file)
+
+            master_dict = m_all
+            if pi_detected and pi_detected in m_by_pi:
+                master_dict = m_by_pi[pi_detected]
+
+            out_fac = None
+            stats_fac = None
+            fac_sum = None
+
+            # 1. Audit Factory if provided
+            if self.weekly_po_factory_file and os.path.exists(self.weekly_po_factory_file):
+                self.prog_bar_weekly_po.set(0.65)
+                out_fac, stats_fac, fac_sum = weekly_audit_file_generic(
+                    self.weekly_po_factory_file,
+                    master_dict,
+                    output_suffix="_checked.xlsx",
+                    role_name="NHAMAY"
+                )
+
+            # 2. Audit Nhung
+            self.prog_bar_weekly_po.set(0.85)
+            out_nhung, stats_nhung, nhung_sum = weekly_audit_file_generic(
+                self.weekly_po_nhung_file,
+                master_dict,
+                output_suffix="_checked.xlsx",
+                factory_items_sum=fac_sum,
+                role_name="NHUNG"
+            )
+
+            self.prog_bar_weekly_po.set(1.0)
+            self.after(0, lambda: self._weekly_po_success(pi_detected, out_nhung, stats_nhung, out_fac, stats_fac))
+
+        except Exception as e:
+            self.after(0, lambda: self._weekly_po_error(str(e)))
+
+    def _weekly_po_success(self, pi_num, out_nhung, stats_nhung, out_fac, stats_fac):
+        self.weekly_po_running = False
+        self.btn_run_weekly_po.configure(state="normal", text="Bắt Đầu Đối Soát & Thêm Cột Check Vào File")
+
+        for child in self.weekly_po_feed.winfo_children():
+            child.destroy()
+
+        res_box = ctk.CTkFrame(self.weekly_po_feed, fg_color="transparent")
+        res_box.pack(fill="x", padx=16, pady=12)
+
+        # Header summary
+        header_text = f"✅ HOÀN THÀNH ĐỐI SOÁT" + (f" (Mã PI: {pi_num})" if pi_num else "")
+        ctk.CTkLabel(
+            res_box,
+            text=header_text,
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            text_color=MOSS
+        ).pack(anchor="w", pady=(0, 6))
+
+        # Result Card Nhung
+        nh_card = ctk.CTkFrame(res_box, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+        nh_card.pack(fill="x", pady=6)
+
+        nh_top = ctk.CTkFrame(nh_card, fg_color="transparent")
+        nh_top.pack(fill="x", padx=14, pady=8)
+
+        fn_nh = os.path.basename(out_nhung)
+        ctk.CTkLabel(
+            nh_top,
+            text=f"📁 File Đơn Hàng (Nhung): {fn_nh}",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=ROAST
+        ).pack(side="left")
+
+        btn_box_nh = ctk.CTkFrame(nh_top, fg_color="transparent")
+        btn_box_nh.pack(side="right")
+
+        ctk.CTkButton(
+            btn_box_nh, text="Mở File", font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color=ROAST, hover_color=MOSS, text_color=IVORY,
+            corner_radius=12, height=26, width=70, command=lambda: os.startfile(out_nhung)
+        ).pack(side="left", padx=2)
+
+        ctk.CTkButton(
+            btn_box_nh, text="Thư Mục", font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent", hover_color=SAND, text_color=ROAST,
+            border_width=1, border_color=LINE, corner_radius=12, height=26, width=70,
+            command=lambda: reveal_in_explorer(out_nhung)
+        ).pack(side="left", padx=2)
+
+        status_nh_str = f"Tổng {stats_nhung['total_lines']} dòng • Khớp: {stats_nhung['ok']} • Lệch/Chú ý: {stats_nhung['err'] + stats_nhung['warn']}"
+        ctk.CTkLabel(
+            nh_card, text=status_nh_str, font=ctk.CTkFont(family=FONT_SANS, size=10),
+            text_color=BROWN if (stats_nhung['err'] + stats_nhung['warn'] == 0) else DANGER
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        # Result Card Factory (if ran)
+        if out_fac and stats_fac:
+            fac_card = ctk.CTkFrame(res_box, fg_color=CARD, corner_radius=10, border_width=1, border_color=LINE)
+            fac_card.pack(fill="x", pady=6)
+
+            fac_top = ctk.CTkFrame(fac_card, fg_color="transparent")
+            fac_top.pack(fill="x", padx=14, pady=8)
+
+            fn_fac = os.path.basename(out_fac)
+            ctk.CTkLabel(
+                fac_top,
+                text=f"🏭 File Nhà Máy: {fn_fac}",
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                text_color=ROAST
+            ).pack(side="left")
+
+            btn_box_fac = ctk.CTkFrame(fac_top, fg_color="transparent")
+            btn_box_fac.pack(side="right")
+
+            ctk.CTkButton(
+                btn_box_fac, text="Mở File", font=ctk.CTkFont(family=FONT_SANS, size=11),
+                fg_color=ROAST, hover_color=MOSS, text_color=IVORY,
+                corner_radius=12, height=26, width=70, command=lambda: os.startfile(out_fac)
+            ).pack(side="left", padx=2)
+
+            ctk.CTkButton(
+                btn_box_fac, text="Thư Mục", font=ctk.CTkFont(family=FONT_SANS, size=11),
+                fg_color="transparent", hover_color=SAND, text_color=ROAST,
+                border_width=1, border_color=LINE, corner_radius=12, height=26, width=70,
+                command=lambda: reveal_in_explorer(out_fac)
+            ).pack(side="left", padx=2)
+
+            miss_cnt = len(stats_fac['missing_in_file'])
+            status_fac_str = f"Tổng {stats_fac['total_lines']} dòng • Khớp: {stats_fac['ok']} • Lệch dòng: {stats_fac['err']} • THIẾU BỎ SÓT: {miss_cnt} MÃ"
+            ctk.CTkLabel(
+                fac_card, text=status_fac_str, font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=BROWN if (stats_fac['err'] == 0 and miss_cnt == 0) else DANGER
+            ).pack(anchor="w", padx=14, pady=(0, 8))
+
+            if miss_cnt > 0:
+                alert_box = ctk.CTkFrame(res_box, fg_color="#fdeeed", corner_radius=8, border_width=1, border_color="#f5c2c7")
+                alert_box.pack(fill="x", pady=6)
+                ctk.CTkLabel(
+                    alert_box,
+                    text=f"⚠️ CẢNH BÁO: Nhà máy bị bỏ sót {miss_cnt} mã so với Master PO!",
+                    font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                    text_color=DANGER
+                ).pack(anchor="w", padx=12, pady=(6, 2))
+                for m in stats_fac['missing_in_file']:
+                    ctk.CTkLabel(
+                        alert_box,
+                        text=f"  • Mã {m['art_raw']} — {m['cust_name']} (Số lượng: {m['qty']})",
+                        font=ctk.CTkFont(family=FONT_SANS, size=10),
+                        text_color=ROAST
+                    ).pack(anchor="w", padx=12, pady=1)
+                ctk.CTkFrame(alert_box, height=4, fg_color="transparent").pack()
+
+    def _weekly_po_error(self, err_msg):
+        self.weekly_po_running = False
+        self.btn_run_weekly_po.configure(state="normal", text="Bắt Đầu Đối Soát & Thêm Cột Check Vào File")
+        self.prog_bar_weekly_po.set(0)
+
+        for child in self.weekly_po_feed.winfo_children():
+            child.destroy()
+
+        err_box = ctk.CTkFrame(self.weekly_po_feed, fg_color="transparent")
+        err_box.pack(fill="x", padx=16, pady=16)
+
+        ctk.CTkLabel(
+            err_box,
+            text="❌ Có lỗi xảy ra trong quá trình đối soát:",
             font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
             text_color=DANGER
         ).pack(anchor="w", pady=(0, 4))
