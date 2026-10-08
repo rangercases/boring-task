@@ -5821,7 +5821,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         ctk.CTkLabel(
             top_m,
-            text="1. FILE MASTER OVERVIEW (DỮ LIỆU GỐC CHUẨN)",
+            text="1. FILE MASTER OVERVIEW",
             font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
             text_color=BROWN
         ).pack(side="left")
@@ -5862,7 +5862,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         ctk.CTkLabel(
             top_nh,
-            text="2. ĐƠN HÀNG GỬI ĐI (FILE CỦA NHUNG — BẮT BUỘC)",
+            text="2. ĐƠN HÀNG GỬI ĐI",
             font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
             text_color=BROWN
         ).pack(side="left")
@@ -5918,7 +5918,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         ctk.CTkLabel(
             top_fac,
-            text="3. ĐƠN HÀNG NHÀ MÁY PHẢN HỒI (TÙY CHỌN / CÓ THỂ CHECK SAU)",
+            text="3. ĐƠN HÀNG NHÀ MÁY",
             font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
             text_color=BROWN
         ).pack(side="left")
@@ -6035,7 +6035,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             child.destroy()
         ctk.CTkLabel(
             self.weekly_po_feed,
-            text="Chọn file đơn hàng cần thẩm định rồi bấm 'Bắt Đầu Đối Soát'.\n• Có thể check riêng file của Nhung trước khi gửi đi.\n• Khi có thêm file Nhà máy, ứng dụng sẽ đối chiếu 3 chiều và phát hiện mã thiếu, lệch số lượng, lệch tên.",
+            text="",
             font=ctk.CTkFont(family=FONT_SANS, size=11),
             text_color=BROWN,
             justify="center",
@@ -6085,7 +6085,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         else:
             ctk.CTkLabel(
                 self.weekly_nhung_status_box,
-                text="Chưa chọn file đơn hàng của Nhung.\nKéo & thả file Excel (.xlsx) vào đây hoặc bấm nút Chọn File ở trên.",
+                text="kéo thả nhanh.",
                 font=ctk.CTkFont(family=FONT_SANS, size=11),
                 text_color=FAINT,
                 justify="center",
@@ -6110,7 +6110,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         else:
             ctk.CTkLabel(
                 self.weekly_factory_status_box,
-                text="(Tùy chọn) Kéo & thả file phản hồi của Nhà máy nếu có.\nNếu chưa có, ứng dụng sẽ chỉ kiểm tra đối chiếu file của Nhung với Master.",
+                text="kéo thả nhanh.",
                 font=ctk.CTkFont(family=FONT_SANS, size=11),
                 text_color=FAINT,
                 justify="center",
@@ -6302,7 +6302,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def _weekly_po_success(self, pi_num, out_nhung, stats_nhung, out_fac, stats_fac):
         self.weekly_po_running = False
-        self.btn_run_weekly_po.configure(state="normal", text="Bắt Đầu Đối Soát & Thêm Cột Check Vào File")
+        self.btn_run_weekly_po.configure(state="normal", text="Bắt Đầu Đối Soát")
 
         for child in self.weekly_po_feed.winfo_children():
             child.destroy()
