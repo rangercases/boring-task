@@ -1849,8 +1849,50 @@ def weekly_find_safe_append_col(ws):
                 pass
     return max_c + 1
 
-def weekly_audit_file_generic(file_path, master_dict, output_suffix="_checked.xlsx", factory_items_sum=None, role_name="NHUNG"):
+def weekly_extract_file_items_summary(file_path):
+    """Pre-reads an order file (Nhung or Factory) to extract total quantity per art_key."""
+    tmp_in = file_path + ".tmp_summary.xlsx"
+    weekly_safe_copy_shared(file_path, tmp_in)
+    wb = openpyxl.load_workbook(tmp_in, data_only=True)
+    ws, h_row, col_map = weekly_find_best_order_sheet(wb)
+    if h_row == -1:
+        wb.close()
+        if os.path.exists(tmp_in): os.remove(tmp_in)
+        return {}
+
+    file_sum_qty = {}
+    for r in range(h_row + 1, ws.max_row + 1):
+        art_val = ws.cell(r, col_map.get('art', 1)).value
+        if not art_val:
+            continue
+        art_str = str(art_val).strip()
+        art_lower = art_str.lower()
+        if any(w in art_lower for w in ('total', 'grand total', 'ship-to', 'address', 'warehouse', 'gate ', 'ghent', 'belgium', 'location')):
+            continue
+        if not any(ch.isdigit() for ch in art_str):
+            continue
+
+        art_k = weekly_normalize_key(art_str)
+        raw_qty = ws.cell(r, col_map.get('qty', 3)).value
+        if raw_qty is None and 'qty' in col_map:
+            c_target = col_map['qty']
+            for c_try in (c_target, c_target + 1, c_target - 1):
+                if 1 <= c_try <= ws.max_column:
+                    v_try = ws.cell(r, c_try).value
+                    if v_try is not None:
+                        raw_qty = v_try
+                        break
+        qty_val = weekly_parse_int_qty(raw_qty)
+        file_sum_qty[art_k] = file_sum_qty.get(art_k, 0) + qty_val
+
+    wb.close()
+    if os.path.exists(tmp_in):
+        os.remove(tmp_in)
+    return file_sum_qty
+
+def weekly_audit_file_generic(file_path, master_dict, output_suffix="_checked.xlsx", other_file_items_sum=None, role_name="NHUNG", other_role_name="NHAMAY"):
     """Audits an order file (Nhung or Factory) against Master PO dictionary.
+    Quantities are strictly compared between Nhung and Factory (when both files exist), NOT against Master PO.
     Preserves 100% original layout, styling, and formulas, appending [CHECK STATUS] and [AUDIT NOTE].
     """
     tmp_in = file_path + ".tmp_audit.xlsx"
@@ -1952,22 +1994,18 @@ def weekly_audit_file_generic(file_path, master_dict, output_suffix="_checked.xl
         else:
             m_item = master_dict[art_k]
             tot_file_q = file_sum_qty.get(art_k, 0)
-            tot_mast_q = m_item['qty']
-            if tot_file_q != tot_mast_q:
-                status = "LỆCH SỐ LƯỢNG"
-                fill_to_apply = W_FILL_ERR
-                font_to_apply = W_FONT_ERR
-                notes.append(f"Tổng số lượng ({tot_file_q}) lệch Master ({tot_mast_q})")
 
-            # 3-way check with Factory if available
-            if factory_items_sum is not None:
-                tot_fac_q = factory_items_sum.get(art_k, 0)
-                if tot_fac_q != tot_file_q:
-                    if status == "OK":
-                        status = "LỆCH VỚI NHÀ MÁY"
-                        fill_to_apply = W_FILL_WARN
-                        font_to_apply = W_FONT_WARN
-                    notes.append(f"Nhà máy nhận {tot_fac_q} (lệch đơn hàng {tot_file_q})")
+            # Check quantity between Nhung and Factory ONLY if the other file is provided
+            if other_file_items_sum is not None:
+                tot_other_q = other_file_items_sum.get(art_k, 0)
+                if tot_file_q != tot_other_q:
+                    status = "LỆCH SỐ LƯỢNG"
+                    fill_to_apply = W_FILL_ERR
+                    font_to_apply = W_FONT_ERR
+                    if role_name == "NHUNG":
+                        notes.append(f"Lệch SL: Đơn hàng {tot_file_q} ≠ Nhà máy {tot_other_q}")
+                    else:
+                        notes.append(f"Lệch SL: Nhà máy {tot_file_q} ≠ Đơn hàng {tot_other_q}")
 
             # Description check (fuzzy)
             if desc_val and m_item['cust_name']:
@@ -1988,7 +2026,10 @@ def weekly_audit_file_generic(file_path, master_dict, output_suffix="_checked.xl
                     notes.append(f"SC Item Master: '{m_item['sc_item']}'")
 
         if not notes:
-            notes.append("Khớp 100% với Master Overview")
+            if other_file_items_sum is not None:
+                notes.append("Khớp thông tin Master & Khớp SL 2 bên")
+            else:
+                notes.append("Khớp thông tin Master (Chưa có file đối ứng check SL)")
 
         # Write cell values safely
         c_chk = ws.cell(r, check_col, status)
@@ -2012,10 +2053,12 @@ def weekly_audit_file_generic(file_path, master_dict, output_suffix="_checked.xl
             stats["warn"] += 1
             stats["diff_lines"].append((art_str, status, note_text))
 
-    # Items in Master but missing in this file
-    for art_k, m_item in master_dict.items():
-        if art_k not in file_sum_qty:
-            stats["missing_in_file"].append(m_item)
+    # Cross check missing items between this file and the other file (if provided)
+    if other_file_items_sum is not None:
+        for other_k in other_file_items_sum.keys():
+            if other_k not in file_sum_qty:
+                m_info = master_dict.get(other_k, {"art_raw": other_k, "cust_name": "(Chưa rõ tên)", "qty": other_file_items_sum[other_k]})
+                stats["missing_in_file"].append(m_info)
 
     # Save output file
     base, ext = os.path.splitext(file_path)
@@ -6274,14 +6317,21 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             stats_fac = None
             fac_sum = None
 
+            # Pre-extract sums if both exist so they can check each other
+            has_factory = bool(self.weekly_po_factory_file and os.path.exists(self.weekly_po_factory_file))
+            fac_pre_sum = weekly_extract_file_items_summary(self.weekly_po_factory_file) if has_factory else None
+            nhung_pre_sum = weekly_extract_file_items_summary(self.weekly_po_nhung_file)
+
             # 1. Audit Factory if provided
-            if self.weekly_po_factory_file and os.path.exists(self.weekly_po_factory_file):
+            if has_factory:
                 self.prog_bar_weekly_po.set(0.65)
                 out_fac, stats_fac, fac_sum = weekly_audit_file_generic(
                     self.weekly_po_factory_file,
                     master_dict,
                     output_suffix="_checked.xlsx",
-                    role_name="NHAMAY"
+                    other_file_items_sum=nhung_pre_sum,
+                    role_name="NHAMAY",
+                    other_role_name="NHUNG"
                 )
 
             # 2. Audit Nhung
@@ -6290,8 +6340,9 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 self.weekly_po_nhung_file,
                 master_dict,
                 output_suffix="_checked.xlsx",
-                factory_items_sum=fac_sum,
-                role_name="NHUNG"
+                other_file_items_sum=fac_pre_sum,
+                role_name="NHUNG",
+                other_role_name="NHAMAY"
             )
 
             self.prog_bar_weekly_po.set(1.0)
@@ -6400,14 +6451,14 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 alert_box.pack(fill="x", pady=6)
                 ctk.CTkLabel(
                     alert_box,
-                    text=f"⚠️ CẢNH BÁO: Nhà máy bị bỏ sót {miss_cnt} mã so với Master PO!",
+                    text=f"⚠️ CẢNH BÁO: Nhà máy thiếu {miss_cnt} mã so với đơn hàng gửi đi!",
                     font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
                     text_color=DANGER
                 ).pack(anchor="w", padx=12, pady=(6, 2))
                 for m in stats_fac['missing_in_file']:
                     ctk.CTkLabel(
                         alert_box,
-                        text=f"  • Mã {m['art_raw']} — {m['cust_name']} (Số lượng: {m['qty']})",
+                        text=f"  • Mã {m.get('art_raw', '')} — {m.get('cust_name', '')} (Số lượng: {m.get('qty', 0)})",
                         font=ctk.CTkFont(family=FONT_SANS, size=10),
                         text_color=ROAST
                     ).pack(anchor="w", padx=12, pady=1)
