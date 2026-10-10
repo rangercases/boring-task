@@ -2256,6 +2256,8 @@ class CartonAuditEngine:
             "product_desc": "",
             "color_variant": "",
             "matched_po": None,
+            "barcode_found": None,
+            "barcode_valid": False,
             "fsc_logos": [],
             "fsc_found": None,
             "fsc_valid": False,
@@ -2277,6 +2279,25 @@ class CartonAuditEngine:
                 break
 
         findings["matched_po"] = matched_po_info
+
+        # 1b. Quét và đối soát mã Barcode trên tem nhãn
+        found_barcodes = sorted(list(set(re.findall(r"\b(933\d{10})\b", page_text))))
+        if not found_barcodes:
+            found_barcodes = sorted(list(set(re.findall(r"\b(\d{10,14})\b", page_text))))
+        findings["barcode_found"] = ", ".join(found_barcodes) if found_barcodes else "UNKNOWN"
+
+        if matched_po_info:
+            expected_oc = matched_po_info.get("oc", "").strip()
+            if found_barcodes and any(b == expected_oc for b in found_barcodes):
+                findings["barcode_valid"] = True
+            elif not found_barcodes:
+                findings["barcode_valid"] = False
+                findings["issues"].append("Không tìm thấy dòng mã số Barcode trên các tem nhãn bản vẽ")
+            else:
+                findings["barcode_valid"] = False
+                findings["issues"].append(f"Mã Barcode trên tem ('{findings['barcode_found']}') KHÔNG KHỚP với đơn hàng PO ('{expected_oc}')")
+        else:
+            findings["barcode_valid"] = False
 
         # 2. Trích xuất mô tả sản phẩm & màu sắc / biến thể
         m_desc = re.search(r'((?:[A-Za-z0-9 ]+\n+)?(?:[A-Za-z0-9 ]+\([A-Za-z0-9 ]+\)))\s*\n+Article no\.:', page_text)
@@ -2335,6 +2356,8 @@ class CartonAuditEngine:
                 findings["status"] = "FAIL"
                 findings["issues"].append(f"Mã Article {', '.join(found_articles)} KHÔNG CÓ trong các file PO đã nạp")
         elif not findings["fsc_valid"]:
+            findings["status"] = "FAIL"
+        elif not findings["barcode_valid"]:
             findings["status"] = "FAIL"
         elif not findings["brand_ok"] or not findings["icons_ok"]:
             findings["status"] = "WARN"
@@ -2483,28 +2506,25 @@ class CartonAuditEngine:
                 drawn_side_marks.append(l_rect)
                 draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
 
-        # 5. Barcode & Nhan tem (Gom chinh xac ca ma vach va khung vien LABEL 100x75mm)
+        # 5. Barcode & Nhan tem (Khoanh can sat dong ma so barcode va audit ro Matched PO / NOT MATCHED)
         bc_num_lines = [l for l in all_lines if l[1].strip().isdigit() and len(l[1].strip()) >= 10 and l[0].y0 < 5600]
         drawn_bc = []
         for bcl, bctxt in bc_num_lines:
-            bc_r = fitz.Rect(bcl)
-            nearby_d = [d for d in drawings if abs(d['rect'].y0 - bc_r.y0) < 300 and abs(d['rect'].x0 - bc_r.x0) < 300]
-            for nd in nearby_d:
-                bc_r.include_rect(fitz.Rect(nd['rect']))
-            
-            red_d = [d for d in drawings if abs(d['rect'].y0 - bc_r.y0) < 300 and (bc_r.x0 - 50 < d['rect'].x0 < bc_r.x1 + 600)]
-            for rd in red_d:
-                bc_r.include_rect(fitz.Rect(rd['rect']))
+            clean_bc = bctxt.strip()
+            # Khoanh cận sát dòng mã số (lề đệm 10px ngang, 5px dọc)
+            bc_r = fitz.Rect(bcl.x0 - 10, bcl.y0 - 5, bcl.x1 + 10, bcl.y1 + 5)
 
-            bc_r.x0 -= 15
-            bc_r.x1 += 15
-            bc_r.y0 -= 15
-            bc_r.y1 += 15
-
-            if any(abs(bc_r.x0 - dbc.x0) < 300 for dbc in drawn_bc):
+            if any(abs(bc_r.x0 - dbc.x0) < 50 and abs(bc_r.y0 - dbc.y0) < 50 for dbc in drawn_bc):
                 continue
             drawn_bc.append(bc_r)
-            draw_line_item(bc_r, 'Checked OK', status='PASS', fontsize=30)
+
+            # Audit trạng thái khớp mã với PO
+            if matched_po_info and clean_bc == matched_po_info.get('oc', '').strip():
+                draw_line_item(bc_r, 'Matched PO', status='PASS', fontsize=30)
+            elif matched_po_info:
+                draw_line_item(bc_r, 'NOT MATCHED PO', status='FAIL', fontsize=30)
+            else:
+                draw_line_item(bc_r, 'Not in PO', status='FAIL', fontsize=30)
 
         # 6. Logo FSC (Gom khung logo FSC tren mat thung)
         fsc_logos = findings.get('fsc_logos', [])
@@ -2573,7 +2593,14 @@ class CartonAuditEngine:
         desc_line = findings.get('product_desc', '')
         po_desc = f"(Khop PO: {matched_po_info['cust_name']})" if (matched_po_info and matched_po_info.get('cust_name')) else '(Thong tin mau sac tham khao)'
         page.insert_text(fitz.Point(bx0 + 200, by0 + 790), to_ascii(f'4. Mo ta san pham / Mau sac in mat thung: {desc_line} {po_desc}'), fontsize=48, color=BLUE_BORDER, fontname='helv')
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 900), to_ascii('5. Thong so dong goi & Tem nhan: Gross weight / Colli / Container & Barcode DAY DU'), fontsize=48, color=GREEN_BORDER, fontname='helv')
+        bc_found_str = findings.get('barcode_found', '') or 'UNKNOWN'
+        if findings.get('barcode_valid'):
+            bc_stat_str = f"Barcode {bc_found_str}: KHOP DON HANG ({po_label})"
+            bc_stat_col = GREEN_BORDER
+        else:
+            bc_stat_str = f"Barcode {bc_found_str}: SAI LECH / KHONG KHOP PO"
+            bc_stat_col = RED_BORDER
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 900), to_ascii(f'5. Thong so Barcode & Tem nhan: {bc_stat_str}'), fontsize=48, color=bc_stat_col, fontname='helv')
 
         page.set_cropbox(fitz.Rect(0, 0, page.rect.width, y_white_bottom))
 
@@ -7386,23 +7413,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             for p in self.carton_po_files:
                 f_row = ctk.CTkFrame(box, fg_color=CARD, corner_radius=8, border_width=1, border_color=LINE)
                 f_row.pack(fill="x", pady=2)
-                
-                # Huy hiệu xanh thân thiện
-                ctk.CTkLabel(
-                    f_row,
-                    text="✓ Sẵn sàng",
-                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
-                    text_color=MOSS
-                ).pack(side="left", padx=(10, 8), pady=4)
 
-                ctk.CTkLabel(
-                    f_row,
-                    text=f"📄 {os.path.basename(p)}",
-                    font=ctk.CTkFont(family=FONT_SANS, size=11),
-                    text_color=ROAST
-                ).pack(side="left", pady=4)
-
-                # Nút xóa tinh tế trung tính không gây hiểu nhầm lỗi
+                # Nút xóa tinh tế trung tính - pack mép phải TRƯỚC để luôn cố định vị trí
                 del_btn = ctk.CTkButton(
                     f_row,
                     text="Xóa",
@@ -7418,6 +7430,23 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     command=lambda target=p: self._remove_single_po(target)
                 )
                 del_btn.pack(side="right", padx=10, pady=4)
+
+                # Huy hiệu xanh thân thiện
+                ctk.CTkLabel(
+                    f_row,
+                    text="✓ Sẵn sàng",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                    text_color=MOSS
+                ).pack(side="left", padx=(10, 8), pady=4)
+
+                # Nhãn tên file nằm ở giữa, tự căn trái và thu gọn không lấn nút Xóa
+                ctk.CTkLabel(
+                    f_row,
+                    text=f"📄 {os.path.basename(p)}",
+                    font=ctk.CTkFont(family=FONT_SANS, size=11),
+                    text_color=ROAST,
+                    anchor="w"
+                ).pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
 
     def _remove_single_po(self, target):
         if target in self.carton_po_files:
@@ -7475,22 +7504,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 f_row = ctk.CTkFrame(box, fg_color=CARD, corner_radius=8, border_width=1, border_color=LINE)
                 f_row.pack(fill="x", pady=2)
 
-                # Huy hiệu xanh thân thiện
-                ctk.CTkLabel(
-                    f_row,
-                    text="✓ Sẵn sàng",
-                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
-                    text_color=MOSS
-                ).pack(side="left", padx=(10, 8), pady=4)
-
-                ctk.CTkLabel(
-                    f_row,
-                    text=f"📐 {os.path.basename(p)}",
-                    font=ctk.CTkFont(family=FONT_SANS, size=11),
-                    text_color=ROAST
-                ).pack(side="left", pady=4)
-
-                # Nút xóa tinh tế trung tính không gây hiểu nhầm lỗi
+                # Nút xóa tinh tế trung tính - pack mép phải TRƯỚC để luôn cố định vị trí
                 del_btn = ctk.CTkButton(
                     f_row,
                     text="Xóa",
@@ -7506,6 +7520,23 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     command=lambda target=p: self._remove_single_pdf(target)
                 )
                 del_btn.pack(side="right", padx=10, pady=4)
+
+                # Huy hiệu xanh thân thiện
+                ctk.CTkLabel(
+                    f_row,
+                    text="✓ Sẵn sàng",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                    text_color=MOSS
+                ).pack(side="left", padx=(10, 8), pady=4)
+
+                # Nhãn tên file nằm ở giữa, tự căn trái và thu gọn không lấn nút Xóa
+                ctk.CTkLabel(
+                    f_row,
+                    text=f"📐 {os.path.basename(p)}",
+                    font=ctk.CTkFont(family=FONT_SANS, size=11),
+                    text_color=ROAST,
+                    anchor="w"
+                ).pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
 
     def _remove_single_pdf(self, target):
         if target in self.carton_pdf_files:
@@ -7594,6 +7625,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             i_row = ctk.CTkFrame(item_card, fg_color="transparent")
             i_row.pack(fill="x", padx=14, pady=(10, 6))
 
+            # 2 nút riêng biệt theo yêu cầu của người dùng - pack mép phải TRƯỚC để luôn cố định
+            btn_box = ctk.CTkFrame(i_row, fg_color="transparent")
+            btn_box.pack(side="right")
+
             badge_text = "✓ PASS" if is_pass else "✗ FAIL"
             badge_color = MOSS if is_pass else DANGER
 
@@ -7608,12 +7643,9 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 i_row,
                 text=r["file"],
                 font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
-                text_color=ROAST
-            ).pack(side="left")
-
-            # 2 nút riêng biệt theo yêu cầu của người dùng
-            btn_box = ctk.CTkFrame(i_row, fg_color="transparent")
-            btn_box.pack(side="right")
+                text_color=ROAST,
+                anchor="w"
+            ).pack(side="left", fill="x", expand=True, padx=(0, 8))
 
             # Nút 1: Mở trực tiếp file PDF
             ctk.CTkButton(
