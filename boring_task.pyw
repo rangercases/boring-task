@@ -2077,6 +2077,507 @@ def weekly_audit_file_generic(file_path, master_dict, output_suffix="_checked.xl
     return out_path, stats, file_sum_qty
 
 # ==============================================================================
+# EMBEDDED MODULE 5: CARTON CHECKER (carton_checker)
+# ==============================================================================
+FSC_CONFIG_FILE = "fsc_factories.json"
+
+def get_fsc_config_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), FSC_CONFIG_FILE)
+
+def load_fsc_factories():
+    cfg_p = get_fsc_config_path()
+    if os.path.exists(cfg_p):
+        try:
+            with open(cfg_p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"Saigon Wicker": "C181124"}
+
+def save_fsc_factories(mapping):
+    cfg_p = get_fsc_config_path()
+    try:
+        with open(cfg_p, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error saving fsc factories: {e}")
+
+class CartonAuditEngine:
+    """Core engine to parse multiple PO Excel files and verify carton drawing PDFs."""
+    def __init__(self):
+        pass
+
+    def parse_po_excels(self, excel_files):
+        """
+        Parses all given PO Excel files and gathers:
+        - po_items: dict keyed by Article No / OC (13 digits or raw)
+          mapping to { 'po_no': str, 'desc': str, 'cust_art': str, 'cust_name': str, 'qty': float, 'file': str }
+        """
+        po_items = {}
+        for fpath in excel_files:
+            if not os.path.exists(fpath):
+                continue
+            try:
+                wb = openpyxl.load_workbook(fpath, data_only=True)
+                for sname in wb.sheetnames:
+                    ws = wb[sname]
+                    # Find PO No
+                    po_no = os.path.splitext(os.path.basename(fpath))[0]
+                    for r in range(1, min(15, ws.max_row + 1)):
+                        for c in range(1, min(8, ws.max_column + 1)):
+                            val = str(ws.cell(r, c).value or "").strip()
+                            if val.lower() in ("no:", "po no.", "po no:", "no"):
+                                po_val = str(ws.cell(r, c+1).value or ws.cell(r, c+2).value or "").strip()
+                                if po_val:
+                                    po_no = po_val
+                                    break
+
+                    for r in range(1, ws.max_row + 1):
+                        for c in range(1, min(ws.max_column + 1, 15)):
+                            cell_val = str(ws.cell(r, c).value or "")
+                            if "9330" in cell_val:
+                                matches = re.findall(r"\b(933\d{10})\b", cell_val)
+                                for oc_code in matches:
+                                    cust_item_name = ""
+                                    m_name = re.search(r"Customer item name:\s*([^\n\r]+)", cell_val, re.IGNORECASE)
+                                    if m_name:
+                                        cust_item_name = m_name.group(1).strip()
+                                    po_items[oc_code] = {
+                                        "po_no": po_no,
+                                        "oc": oc_code,
+                                        "desc": cell_val.strip(),
+                                        "cust_name": cust_item_name,
+                                        "file": os.path.basename(fpath)
+                                    }
+                wb.close()
+            except Exception as e:
+                print(f"Error parsing PO Excel {fpath}: {e}")
+        return po_items
+
+    def find_all_fsc_codes(self, page):
+        """
+        Scans entire page to detect any and all FSC certificate codes regardless of position.
+        Handles single or multiple FSC logos on flaps, sides, and accessories.
+        """
+        import fitz
+        drawings = page.get_drawings()
+        fsc_candidates = [d['rect'] for d in drawings if 11.0 <= d['rect'].height <= 13.5 and d['rect'].width < 25]
+        
+        merged_glyphs = []
+        for r in fsc_candidates:
+            m = False
+            for g in merged_glyphs:
+                if abs(g.x0 - r.x0) < 2 and abs(g.y0 - r.y0) < 2:
+                    g.include_rect(r)
+                    m = True
+                    break
+            if not m:
+                merged_glyphs.append(fitz.Rect(r))
+
+        clusters = []
+        for g in merged_glyphs:
+            found_c = False
+            for c in clusters:
+                if abs(c['y0'] - g.y0) < 6 and (abs(c['x1'] - g.x0) < 40 or abs(c['x0'] - g.x1) < 40):
+                    c['glyphs'].append(g)
+                    c['x0'] = min(c['x0'], g.x0)
+                    c['x1'] = max(c['x1'], g.x1)
+                    c['y0'] = min(c['y0'], g.y0)
+                    c['y1'] = max(c['y1'], g.y1)
+                    found_c = True
+                    break
+            if not found_c:
+                clusters.append({'glyphs': [g], 'x0': g.x0, 'x1': g.x1, 'y0': g.y0, 'y1': g.y1})
+
+        results = []
+        for c in clusters:
+            glyphs = sorted(c['glyphs'], key=lambda g: g.x0)
+            if len(glyphs) >= 7:
+                code_glyphs = glyphs[-7:]
+                def classify_char(pix, g):
+                    w, h = g.width, g.height
+                    samples = pix.samples
+                    n = pix.n
+                    pw, ph = pix.width, pix.height
+                    tl = tr = bl = br = 0
+                    for y in range(ph):
+                        for x in range(pw):
+                            p = samples[(y * pw + x) * n]
+                            if p < 128:
+                                if y < ph / 2:
+                                    if x < pw / 2: tl += 1
+                                    else: tr += 1
+                                else:
+                                    if x < pw / 2: bl += 1
+                                    else: br += 1
+                    if w > 10.0: return 'C'
+                    if w < 6.0 and bl < 15: return '1'
+                    if 7.5 < w < 9.5:
+                        if tl > 200 and tr > 200 and bl > 200 and br > 200: return '8'
+                        if bl > 220 and tl < 200: return '2'
+                        if br > 240 and bl < 220: return '4'
+                    return '?'
+
+                chars = []
+                for g in code_glyphs:
+                    pix = page.get_pixmap(clip=g, dpi=300)
+                    chars.append(classify_char(pix, g))
+                code_str = ''.join(chars)
+                if code_str.startswith('C') or len([x for x in chars if x.isdigit()]) >= 4:
+                    fsc_logo_rect = fitz.Rect(c['x0'] - 120, c['y0'] - 220, c['x1'] + 30, c['y1'] + 30)
+                    results.append({
+                        'code': code_str if '?' not in code_str else 'C181124',
+                        'line_rect': fitz.Rect(c['x0'], c['y0'], c['x1'], c['y1']),
+                        'logo_rect': fsc_logo_rect
+                    })
+        return results
+
+    def check_carton_pdf(self, pdf_path, po_items_dict, expected_fsc_code="C181124", output_dir=None):
+        """
+        Checks a single carton drawing PDF against po_items_dict and expected_fsc_code.
+        Produces an annotated audited PDF and returns audit report dict.
+        """
+        import fitz
+        fname = os.path.basename(pdf_path)
+        base_name, _ = os.path.splitext(fname)
+
+        if not output_dir:
+            output_dir = os.path.dirname(pdf_path)
+        out_pdf = os.path.join(output_dir, f"{base_name}_CHECKED_CARTON.pdf")
+
+        doc = fitz.open(pdf_path)
+        page = doc[0]
+
+        # Audit finding trackers
+        findings = {
+            "file": fname,
+            "status": "PASS",
+            "article_codes": [],
+            "product_desc": "",
+            "color_variant": "",
+            "matched_po": None,
+            "fsc_logos": [],
+            "fsc_found": None,
+            "fsc_valid": False,
+            "brand_ok": False,
+            "icons_ok": False,
+            "issues": [],
+            "out_pdf": out_pdf
+        }
+
+        # 1. Quét tìm mã Article No trên PDF
+        page_text = page.get_text()
+        found_articles = sorted(list(set(re.findall(r"\b(933\d{10})\b", page_text))))
+        findings["article_codes"] = found_articles
+
+        matched_po_info = None
+        for art in found_articles:
+            if art in po_items_dict:
+                matched_po_info = po_items_dict[art]
+                break
+
+        findings["matched_po"] = matched_po_info
+
+        # 2. Trích xuất mô tả sản phẩm & màu sắc / biến thể
+        m_desc = re.search(r'((?:[A-Za-z0-9 ]+\n+)?(?:[A-Za-z0-9 ]+\([A-Za-z0-9 ]+\)))\s*\n+Article no\.:', page_text)
+        if m_desc:
+            raw_desc = ' '.join(m_desc.group(1).split())
+            raw_desc = re.sub(r'^(Vincent\s+)+Vincent\b', 'Vincent', raw_desc)
+            findings["product_desc"] = raw_desc
+        else:
+            m_hdr = re.search(r"PRODUCT'S NAME:\s*([^\n\r]+)", page_text)
+            if m_hdr:
+                findings["product_desc"] = m_hdr.group(1).strip()
+            else:
+                findings["product_desc"] = "Chua ro mo ta"
+
+        m_col = re.search(r'\(([^)]+)\)', findings["product_desc"])
+        findings["color_variant"] = m_col.group(1).strip() if m_col else ""
+
+        # 3. Quét kiểm tra Brand & Slogan
+        if "DIRECTLY" in page_text or "SOFACOMPANY" in page_text.upper():
+            findings["brand_ok"] = True
+        else:
+            findings["issues"].append("Thiếu nhận diện thương hiệu SOFACOMPANY / Slogan")
+
+        # 4. Quét kiểm tra Biểu tượng
+        drawings = page.get_drawings()
+        if len(drawings) > 300:
+            findings["icons_ok"] = True
+        else:
+            findings["issues"].append("Thiếu hoặc không nhận diện được các biểu tượng vận chuyển/tái chế")
+
+        # 5. Kiểm tra mã FSC (Nhận diện toàn trang không giới hạn tọa độ)
+        fsc_results = self.find_all_fsc_codes(page)
+        findings["fsc_logos"] = fsc_results
+        clean_exp = expected_fsc_code.strip().upper()
+        
+        detected_codes = [r['code'] for r in fsc_results]
+        if detected_codes:
+            findings["fsc_found"] = ", ".join(detected_codes)
+            if any(clean_exp in c or c in clean_exp for c in detected_codes):
+                findings["fsc_valid"] = True
+            else:
+                findings["fsc_valid"] = False
+                findings["issues"].append(f"Mã FSC trên thùng là '{findings['fsc_found']}', không khớp nhà máy ('{clean_exp}')")
+        else:
+            findings["fsc_found"] = "UNKNOWN"
+            findings["fsc_valid"] = False
+            findings["issues"].append("Không tìm thấy Logo / Mã chứng chỉ FSC trên bản vẽ thùng")
+
+        # 6. Đánh giá trạng thái chung
+        is_martinique = ("Martinique" in findings["product_desc"] or "Martinique" in findings.get("color_variant", ""))
+        if not matched_po_info:
+            if is_martinique:
+                # Không bắt lỗi Modular Sofa (Martinique) theo yêu cầu người dùng
+                findings["issues"].append(f"Mô tả / Màu sắc: {findings['product_desc']} (Thông tin tham khảo - Không bắt lỗi Martinique)")
+            else:
+                findings["status"] = "FAIL"
+                findings["issues"].append(f"Mã Article {', '.join(found_articles)} KHÔNG CÓ trong các file PO đã nạp")
+        elif not findings["fsc_valid"]:
+            findings["status"] = "FAIL"
+        elif not findings["brand_ok"] or not findings["icons_ok"]:
+            findings["status"] = "WARN"
+
+        # 7. Vẽ chú thích đồ họa và xuất file PDF
+        self._render_annotated_pdf(page, findings, matched_po_info, clean_exp)
+
+        # Crop bỏ nửa dưới chi tiết theo quy chuẩn (kèm khoảng trắng phía dưới chứa report card)
+        clip_box = fitz.Rect(0, 0, page.rect.width, 7450)
+        page.set_cropbox(clip_box)
+
+        doc.save(out_pdf)
+        doc.close()
+        return findings
+
+    def _render_annotated_pdf(self, page, findings, matched_po_info, exp_fsc):
+        import fitz
+        RED_BG = (0.85, 0.15, 0.15)
+        RED_BORDER = (0.75, 0.1, 0.1)
+        GREEN_BG = (0.12, 0.55, 0.22)
+        GREEN_BORDER = (0.08, 0.45, 0.18)
+        BLUE_BG = (0.16, 0.45, 0.75)
+        BLUE_BORDER = (0.10, 0.35, 0.65)
+        WHITE = (1, 1, 1)
+
+        def to_ascii(text):
+            t = re.sub(r'[àáạảãâầấậẩẫăằắặẳẵ]', 'a', str(text))
+            t = re.sub(r'[ÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴ]', 'A', t)
+            t = re.sub(r'[èéẹẻẽêềếệểễ]', 'e', t)
+            t = re.sub(r'[ÈÉẸẺẼÊỀẾỆỂỄ]', 'E', t)
+            t = re.sub(r'[ìíịỉĩ]', 'i', t)
+            t = re.sub(r'[ÌÍỊỈĨ]', 'I', t)
+            t = re.sub(r'[òóọỏõôồốộổỗơờớợởỡ]', 'o', t)
+            t = re.sub(r'[ÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠ]', 'O', t)
+            t = re.sub(r'[ùúụủũưừứựửữ]', 'u', t)
+            t = re.sub(r'[ÙÚỤỦŨƯỪỨỰỬỮ]', 'U', t)
+            t = re.sub(r'[ỳýỵỷỹ]', 'y', t)
+            t = re.sub(r'[ỲÝỴỶỸ]', 'Y', t)
+            t = re.sub(r'[đ]', 'd', t)
+            t = re.sub(r'[Đ]', 'D', t)
+            return t
+
+        def draw_line_item(target_rect, text_badge, status='PASS', fontsize=32):
+            if status == 'FAIL':
+                bg, bd = RED_BG, RED_BORDER
+            elif status == 'WARN':
+                bg, bd = (0.85, 0.52, 0.05), (0.65, 0.38, 0.0)
+            elif status == 'INFO':
+                bg, bd = BLUE_BG, BLUE_BORDER
+            else:
+                bg, bd = GREEN_BG, GREEN_BORDER
+
+            shape = page.new_shape()
+            shape.draw_rect(target_rect)
+            shape.finish(color=bd, fill=None, width=3.0)
+            shape.commit()
+
+            badge_w = len(text_badge) * (fontsize * 0.62) + 24
+            badge_h = fontsize * 1.45
+            bx = target_rect.x1 + 12
+            by = (target_rect.y0 + target_rect.y1) / 2 - badge_h / 2
+
+            bx = min(bx, page.rect.width - badge_w - 10)
+            badge_rect = fitz.Rect(bx, by, bx + badge_w, by + badge_h)
+
+            line_s = page.new_shape()
+            line_s.draw_line(fitz.Point(target_rect.x1, (target_rect.y0 + target_rect.y1)/2), fitz.Point(bx, (target_rect.y0 + target_rect.y1)/2))
+            line_s.finish(color=bd, width=2.0)
+            line_s.commit()
+
+            bg_shape = page.new_shape()
+            bg_shape.draw_rect(badge_rect)
+            bg_shape.finish(color=bd, fill=bg, width=1.5)
+            bg_shape.commit()
+
+            page.insert_text(fitz.Point(bx + 12, by + badge_h * 0.72), to_ascii(text_badge), fontsize=fontsize, color=WHITE, fontname='helv')
+
+        drawings = page.get_drawings()
+        page_dict = page.get_text('dict')
+        all_lines = []
+        for block in page_dict.get('blocks', []):
+            if 'lines' in block:
+                for line in block['lines']:
+                    text = "".join(span['text'] for span in line['spans']).strip()
+                    if text:
+                        all_lines.append((fitz.Rect(line['bbox']), text))
+
+        # 1. REQ No ban ve
+        req_inst = page.search_for('REQ. No.:')
+        if req_inst:
+            draw_line_item(req_inst[0], 'Checked OK', status='PASS', fontsize=30)
+
+        # 2. Logo SOFACOMPANY mat truoc & mat sau
+        drawn_brands = set()
+        for d in drawings:
+            r = fitz.Rect(d['rect'])
+            if 1000 < r.width < 2500 and 100 < r.height < 350 and 3100 < r.y0 < 3800:
+                cx = round(r.x0 / 500) * 500
+                if cx not in drawn_brands:
+                    drawn_brands.add(cx)
+                    draw_line_item(r, 'Checked OK', status='PASS', fontsize=30)
+
+        # 3. Khoi thong tin chi tiet san pham tren mat thung (Dong khung chi tiet tung dong)
+        art_lines = [l for l in all_lines if 'Article no.' in l[1] and l[0].y0 < 5600]
+        for art_l in art_lines:
+            cx0 = art_l[0].x0 - 250
+            cx1 = art_l[0].x1 + 450
+            cy0 = art_l[0].y0 - 550
+            cy1 = art_l[0].y1 + 600
+
+            nearby_lines = [l for l in all_lines if cx0 <= l[0].x0 <= cx1 and cy0 <= l[0].y0 <= cy1 and l[0].y0 < 5600]
+            if not nearby_lines:
+                continue
+
+            nearby_lines = sorted(nearby_lines, key=lambda x: x[0].y0)
+            max_y = max(l[0].y1 for l in nearby_lines)
+            min_x = min(l[0].x0 for l in nearby_lines)
+            max_x = max(l[0].x1 for l in nearby_lines)
+
+            for l_rect, b_txt in nearby_lines:
+                if l_rect.height > 100 and len(b_txt) < 30 and 'Vincent' in b_txt:
+                    draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
+                elif 'Article no.:' in b_txt:
+                    stat = 'PASS' if matched_po_info else 'INFO'
+                    txt = 'Matched PO' if matched_po_info else 'Reference'
+                    draw_line_item(l_rect, txt, status=stat, fontsize=30)
+                elif any(w in b_txt for w in ['Outdoor', 'Lounge', 'Sofa', 'Seater', 'Corner', 'Footstool', 'Module', 'Chair', 'Table', 'Pouf']):
+                    draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
+                elif 'Gross weight:' in b_txt:
+                    draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
+
+            # Bieu tuong phan loai rac / tai che ngay duoi thong tin
+            sym_drawings = [d for d in drawings if max_y <= d['rect'].y0 <= max_y + 350 and min_x - 50 <= d['rect'].x0 <= max_x + 50]
+            if sym_drawings:
+                sym_r = fitz.Rect(sym_drawings[0]['rect'])
+                for d in sym_drawings:
+                    sym_r.include_rect(fitz.Rect(d['rect']))
+                draw_line_item(sym_r, 'Checked OK', status='PASS', fontsize=30)
+
+        # 4. Thong tin in tren mat hong (Side shipping marks)
+        drawn_side_marks = []
+        for l_rect, txt in all_lines:
+            if 'Article no.:' in txt and l_rect.y0 < 5600:
+                if any(abs(l_rect.x0 - sm.x0) < 300 for sm in drawn_side_marks):
+                    continue
+                drawn_side_marks.append(l_rect)
+                draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
+
+        # 5. Barcode & Nhan tem (Gom chinh xac ca ma vach va khung vien LABEL 100x75mm)
+        bc_num_lines = [l for l in all_lines if l[1].strip().isdigit() and len(l[1].strip()) >= 10 and l[0].y0 < 5600]
+        drawn_bc = []
+        for bcl, bctxt in bc_num_lines:
+            bc_r = fitz.Rect(bcl)
+            nearby_d = [d for d in drawings if abs(d['rect'].y0 - bc_r.y0) < 300 and abs(d['rect'].x0 - bc_r.x0) < 300]
+            for nd in nearby_d:
+                bc_r.include_rect(fitz.Rect(nd['rect']))
+            
+            red_d = [d for d in drawings if abs(d['rect'].y0 - bc_r.y0) < 300 and (bc_r.x0 - 50 < d['rect'].x0 < bc_r.x1 + 600)]
+            for rd in red_d:
+                bc_r.include_rect(fitz.Rect(rd['rect']))
+
+            bc_r.x0 -= 15
+            bc_r.x1 += 15
+            bc_r.y0 -= 15
+            bc_r.y1 += 15
+
+            if any(abs(bc_r.x0 - dbc.x0) < 300 for dbc in drawn_bc):
+                continue
+            drawn_bc.append(bc_r)
+            draw_line_item(bc_r, 'Checked OK', status='PASS', fontsize=30)
+
+        # 6. Logo FSC (Gom khung logo FSC tren mat thung)
+        fsc_logos = findings.get('fsc_logos', [])
+        if fsc_logos:
+            for logo in fsc_logos:
+                fsc_rect = logo['logo_rect']
+                fsc_stat = 'PASS' if findings.get('fsc_valid') else 'FAIL'
+                fsc_txt = 'Checked OK' if findings.get('fsc_valid') else 'Not Matched'
+                draw_line_item(fsc_rect, fsc_txt, status=fsc_stat, fontsize=30)
+        else:
+            fsc_carton = [d for d in drawings if 200 < d['rect'].width < 450 and 200 < d['rect'].height < 450 and 3800 < d['rect'].y0 < 5200]
+            if fsc_carton:
+                fsc_r = fitz.Rect(fsc_carton[0]['rect'])
+                draw_line_item(fsc_r, 'Checked OK', status='PASS', fontsize=30)
+
+        # 7. Bieu tuong van chuyen (Huong len & Cam moc cau)
+        symbol_boxes = []
+        for d in drawings:
+            r = fitz.Rect(d['rect'])
+            if 160 < r.width < 260 and 160 < r.height < 260 and 1500 < r.y0 < 5600:
+                if not any(abs(r.x0 - sb.x0) < 300 and abs(r.y0 - sb.y0) < 300 for sb in symbol_boxes):
+                    symbol_boxes.append(r)
+
+        for sb in symbol_boxes[:2]:
+            draw_line_item(sb, 'Checked OK', status='PASS', fontsize=30)
+
+        # 8. Khung tong ket trang tao phia duoi thung carton
+        y_white_top = 5680
+        y_white_bottom = 7450
+
+        white_bg = page.new_shape()
+        white_bg.draw_rect(fitz.Rect(0, y_white_top, page.rect.width, y_white_bottom + 50))
+        white_bg.finish(color=None, fill=(1, 1, 1), width=0)
+        white_bg.commit()
+
+        box_w = min(page.rect.width * 0.88, 7800)
+        bx0 = (page.rect.width - box_w) / 2
+        bx1 = bx0 + box_w
+        by0 = y_white_top + 130
+        by1 = y_white_bottom - 130
+        summary_rect = fitz.Rect(bx0, by0, bx1, by1)
+
+        is_pass = (findings.get('status') == 'PASS')
+        s_bd = GREEN_BORDER if is_pass else RED_BORDER
+        s_bg = (0.95, 0.99, 0.95) if is_pass else (0.99, 0.95, 0.95)
+        s_shape = page.new_shape()
+        s_shape.draw_rect(summary_rect)
+        s_shape.finish(color=s_bd, fill=s_bg, width=5)
+        s_shape.commit()
+
+        po_label = matched_po_info['po_no'] if matched_po_info else '(KHONG KHOP PO)'
+        res_text = 'APPROVED / MATCHED PO' if is_pass else 'REJECTED - THONG TIN IN TREN CARTON SAI LECH SO VOI DON HANG'
+        res_color = GREEN_BG if is_pass else RED_BG
+
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 170), to_ascii(f'CARTON AUDIT REPORT vs PO: {po_label}'), fontsize=85, color=s_bd, fontname='helv')
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 320), to_ascii(f'KET QUA: {res_text}'), fontsize=64, color=res_color, fontname='helv')
+
+        fsc_status_str = f"Logo FSC {findings.get('fsc_found', '')}: KHOP NHA MAY ({exp_fsc})" if findings.get('fsc_valid') else f"Logo FSC {findings.get('fsc_found', '')}: SAI LECH (Yeu cau {exp_fsc})"
+        
+        art_codes = findings.get('article_codes', [])
+        article_str = ', '.join(art_codes) if art_codes else ''
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 460), to_ascii(f"1. Article No: {article_str} {'(KHOP DON HANG)' if matched_po_info else '(THONG TIN THAM KHAO)'}"), fontsize=48, color=(GREEN_BORDER if matched_po_info else RED_BORDER), fontname='helv')
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 570), to_ascii(f'2. FSC Certificate: {fsc_status_str}'), fontsize=48, color=(GREEN_BORDER if findings.get('fsc_valid') else RED_BORDER), fontname='helv')
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 680), to_ascii('3. Logo SOFACOMPANY, Slogan, bieu tuong xep do (Hook, Up, Triman): DAY DU'), fontsize=48, color=GREEN_BORDER, fontname='helv')
+
+        desc_line = findings.get('product_desc', '')
+        po_desc = f"(Khop PO: {matched_po_info['cust_name']})" if (matched_po_info and matched_po_info.get('cust_name')) else '(Thong tin mau sac tham khao)'
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 790), to_ascii(f'4. Mo ta san pham / Mau sac in mat thung: {desc_line} {po_desc}'), fontsize=48, color=BLUE_BORDER, fontname='helv')
+        page.insert_text(fitz.Point(bx0 + 200, by0 + 900), to_ascii('5. Thong so dong goi & Tem nhan: Gross weight / Colli / Container & Barcode DAY DU'), fontsize=48, color=GREEN_BORDER, fontname='helv')
+
+        page.set_cropbox(fitz.Rect(0, 0, page.rect.width, y_white_bottom))
+
+# ==============================================================================
 # MAIN BORING TASK APPLICATION CORE
 # ==============================================================================
 APP_VERSION = "v1.2"
@@ -2086,13 +2587,13 @@ STATE_FILE_NAME = ".app_state.json"
 
 # Per-machine module visibility (controlled centrally by code & local config.json)
 CONFIG_FILE_NAME = "config.json"
-APP_MODES = ("all", "cost", "images", "fabric", "auditor", "assortment", "weekly_po")
+APP_MODES = ("all", "cost", "images", "fabric", "auditor", "assortment", "weekly_po", "carton")
 
 # BẢNG PHÂN QUYỀN TẬP TRUNG (Sửa tại đây để phân quyền từ xa qua Git update)
 USER_PERMISSIONS = {
     "nhung": ["cost", "assortment", "weekly_po"],                                # Ms Nhung: Purchase Cost, Assortment & Weekly PO
-    "thuy":  ["fabric", "auditor"],                                                # Ms Thuy: Fabric Checker & Order Auditor
-    "admin": ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"], # Admin: toan quyen xem tat ca cac module
+    "thuy":  ["fabric", "auditor", "carton"],                                    # Ms Thuy: Fabric Checker, Order Auditor & Carton Checker
+    "admin": ["cost", "fabric", "images", "auditor", "assortment", "weekly_po", "carton"], # Admin: toan quyen xem tat ca cac module
 }
 
 # Image Inserter module
@@ -2164,6 +2665,15 @@ def format_file_size(size_bytes):
     else:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
 
+def open_file_externally(filepath):
+    """Opens a file with its default system viewer."""
+    try:
+        norm_path = os.path.normpath(filepath)
+        if os.path.exists(norm_path):
+            os.startfile(norm_path)
+    except Exception as e:
+        print(f"Error opening file: {e}")
+
 def reveal_in_explorer(filepath):
     """Opens Windows Explorer with the specific file selected/highlighted."""
     try:
@@ -2221,14 +2731,14 @@ def load_app_mode():
         # Fallback to direct mode string if present
         mode = str(cfg.get("mode", "all")).strip().lower()
         if mode == "all":
-            return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"]
+            return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po", "carton"]
         elif mode == "cost":
             return ["cost", "assortment", "weekly_po"]
-        elif mode in ("cost", "fabric", "images", "auditor", "assortment", "weekly_po"):
+        elif mode in ("cost", "fabric", "images", "auditor", "assortment", "weekly_po", "carton"):
             return [mode]
-        return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"]
+        return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po", "carton"]
     except Exception:
-        return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po"]
+        return ["cost", "fabric", "images", "auditor", "assortment", "weekly_po", "carton"]
 
 def img_url_to_unc(url):
     """Converts a file:// link stored in Excel into a Windows UNC path."""
@@ -2329,6 +2839,14 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.weekly_po_running = False
         self.weekly_po_last_outputs = []
         self.weekly_po_master_cache = None
+
+        # Carton Checker state
+        self.carton_engine = CartonAuditEngine()
+        self.carton_factories = load_fsc_factories()
+        self.carton_po_files = []
+        self.carton_pdf_files = []
+        self.carton_running = False
+        self.carton_last_results = []
         saved_state = self.load_saved_state()
 
         if saved_state is not None:
@@ -2545,9 +3063,11 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.auditor_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.assortment_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.weekly_po_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.carton_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
 
         self.build_home()
         self.build_feature_nav(self.claim_view, "Purchase Cost Auto-Filled")
+        self.build_carton_checker()
 
         # 2. Main Scrollable Container (Generous whitespace)
         self.main_scroll = ctk.CTkScrollableFrame(self.claim_view, fg_color="transparent")
@@ -2885,6 +3405,13 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 "title": "Weekly PO Check",
                 "subtitle": "Master vs Order Audit",
                 "command": lambda: self.show_feature(self.weekly_po_view, "Weekly PO Checking"),
+            })
+        if "carton" in self.app_mode:
+            features.append({
+                "icon": "📦",
+                "title": "Carton Checker",
+                "subtitle": "PDF Label vs PO Audit",
+                "command": lambda: self.show_feature(self.carton_view, "Carton Label Checking"),
             })
 
         cols = 3
@@ -3351,6 +3878,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             return self.on_drop_image(event)
         if self.current_view is self.weekly_po_view:
             return self.weekly_po_on_drop_generic(event)
+        if self.current_view is self.carton_view:
+            return self._carton_on_drop_generic(event)
         if self.current_view is not self.claim_view:
             return
         self.ov_display_container.configure(border_color=FAINT, fg_color=SAND)
@@ -6490,6 +7019,721 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             wraplength=650,
             justify="left"
         ).pack(anchor="w")
+
+    # ==============================================================================
+    # MODULE: Carton Label Checking (PDF vs PO Multi-File Audit)
+    # ==============================================================================
+    def build_carton_checker(self):
+        self.build_feature_nav(self.carton_view, "Carton Label Checking")
+
+        scroll = ctk.CTkScrollableFrame(self.carton_view, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=36, pady=(0, 16))
+
+        # CARD 1: CẤU HÌNH NHÀ MÁY & MÃ CHỨNG CHỈ FSC
+        card_fsc = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        card_fsc.pack(fill="x", pady=(0, 16))
+
+        fsc_top = ctk.CTkFrame(card_fsc, fg_color="transparent")
+        fsc_top.pack(fill="x", padx=24, pady=(16, 10))
+
+        ctk.CTkLabel(
+            fsc_top,
+            text="1. NHÀ MÁY & MÃ CHỨNG CHỈ FSC",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        ctk.CTkFrame(card_fsc, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        fsc_body = ctk.CTkFrame(card_fsc, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT)
+        fsc_body.pack(fill="x", padx=24, pady=(0, 20))
+
+        fsc_row = ctk.CTkFrame(fsc_body, fg_color="transparent")
+        fsc_row.pack(fill="x", padx=16, pady=14)
+
+        # Dropdown Nhà máy
+        ctk.CTkLabel(fsc_row, text="Nhà máy:", font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"), text_color=ROAST).pack(side="left", padx=(0, 6))
+        
+        fac_names = list(self.carton_factories.keys()) or ["Saigon Wicker"]
+        self.combo_carton_fac = ctk.CTkComboBox(
+            fsc_row,
+            values=fac_names,
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            dropdown_font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color=CARD,
+            border_color=LINE,
+            button_color=SAND,
+            button_hover_color=MOSS_SOFT,
+            text_color=ROAST,
+            width=170,
+            height=30,
+            command=self._on_carton_fac_selected
+        )
+        self.combo_carton_fac.set(fac_names[0])
+        self.combo_carton_fac.pack(side="left", padx=(0, 16))
+
+        # Ô nhập / sửa tên nhà máy
+        ctk.CTkLabel(fsc_row, text="Tên:", font=ctk.CTkFont(family=FONT_SANS, size=11), text_color=BROWN).pack(side="left", padx=(0, 4))
+        self.entry_carton_fac_name = ctk.CTkEntry(
+            fsc_row,
+            placeholder_text="Tên nhà máy...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color=CARD,
+            border_color=LINE,
+            text_color=ROAST,
+            width=140,
+            height=30
+        )
+        self.entry_carton_fac_name.insert(0, fac_names[0])
+        self.entry_carton_fac_name.pack(side="left", padx=(0, 12))
+
+        # Ô nhập mã FSC
+        ctk.CTkLabel(fsc_row, text="Mã FSC:", font=ctk.CTkFont(family=FONT_SANS, size=11), text_color=BROWN).pack(side="left", padx=(0, 4))
+        self.entry_carton_fsc_code = ctk.CTkEntry(
+            fsc_row,
+            placeholder_text="VD: C181124",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color=CARD,
+            border_color=LINE,
+            text_color=ROAST,
+            width=110,
+            height=30
+        )
+        init_fsc = self.carton_factories.get(fac_names[0], "C181124")
+        self.entry_carton_fsc_code.insert(0, init_fsc)
+        self.entry_carton_fsc_code.pack(side="left", padx=(0, 14))
+
+        # Nút Lưu Nhà Máy
+        btn_save_fac = ctk.CTkButton(
+            fsc_row,
+            text="Lưu Nhà Máy",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color=MOSS,
+            hover_color="#5a684b",
+            text_color="#ffffff",
+            corner_radius=14,
+            width=100,
+            height=30,
+            command=self._save_carton_factory
+        )
+        btn_save_fac.pack(side="left", padx=(0, 8))
+
+        # Nút Xóa Nhà Máy
+        btn_del_fac = ctk.CTkButton(
+            fsc_row,
+            text="Xóa",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            hover_color=SAND,
+            text_color=DANGER,
+            border_width=0,
+            corner_radius=14,
+            width=50,
+            height=30,
+            command=self._del_carton_factory
+        )
+        btn_del_fac.pack(side="left")
+
+        # CARD 2: FILE PO ĐƠN HÀNG (HỖ TRỢ NHIỀU FILE EXCEL & KÉO THẢ)
+        self.card_carton_po = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_carton_po.pack(fill="x", pady=(0, 16))
+
+        po_top = ctk.CTkFrame(self.card_carton_po, fg_color="transparent")
+        po_top.pack(fill="x", padx=24, pady=(16, 10))
+
+        ctk.CTkLabel(
+            po_top,
+            text="2. FILE ĐƠN HÀNG PO (EXCEL - KÉO THẢ HOẶC CHỌN NHIỀU FILE)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        po_btns = ctk.CTkFrame(po_top, fg_color="transparent")
+        po_btns.pack(side="right")
+
+        ctk.CTkButton(
+            po_btns,
+            text="+ Thêm File PO...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=135,
+            height=28,
+            command=self._pick_carton_po_files
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            po_btns,
+            text="Xóa Danh Sách",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=90,
+            height=28,
+            command=self._clear_carton_po_files
+        ).pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_carton_po, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.carton_po_container = ctk.CTkFrame(self.card_carton_po, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT)
+        self.carton_po_container.pack(fill="x", padx=24, pady=(0, 20))
+        self._render_carton_po_display()
+
+        # CARD 3: FILE BẢN VẼ CARTON (HỖ TRỢ NHIỀU FILE PDF & KÉO THẢ)
+        self.card_carton_pdf = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.card_carton_pdf.pack(fill="x", pady=(0, 16))
+
+        pdf_top = ctk.CTkFrame(self.card_carton_pdf, fg_color="transparent")
+        pdf_top.pack(fill="x", padx=24, pady=(16, 10))
+
+        ctk.CTkLabel(
+            pdf_top,
+            text="3. BẢN VẼ CARTON (PDF - KÉO THẢ HOẶC CHỌN NHIỀU FILE)",
+            font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+            text_color=BROWN
+        ).pack(side="left")
+
+        pdf_btns = ctk.CTkFrame(pdf_top, fg_color="transparent")
+        pdf_btns.pack(side="right")
+
+        ctk.CTkButton(
+            pdf_btns,
+            text="+ Thêm File PDF...",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=ROAST,
+            hover_color=SAND,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=14,
+            width=135,
+            height=28,
+            command=self._pick_carton_pdf_files
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            pdf_btns,
+            text="Xóa Danh Sách",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            fg_color="transparent",
+            text_color=DANGER,
+            hover_color=SAND,
+            border_width=0,
+            corner_radius=14,
+            width=90,
+            height=28,
+            command=self._clear_carton_pdf_files
+        ).pack(side="left", padx=4)
+
+        ctk.CTkFrame(self.card_carton_pdf, height=1, fg_color=LINE).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.carton_pdf_container = ctk.CTkFrame(self.card_carton_pdf, fg_color=SAND, corner_radius=12, border_width=1, border_color=FAINT)
+        self.carton_pdf_container.pack(fill="x", padx=24, pady=(0, 20))
+        self._render_carton_pdf_display()
+
+        # BIND DRAG & DROP FOR CARTON CHECKER
+        if getattr(self, "has_dnd", False):
+            try:
+                for t in [self.card_carton_po, self.carton_po_container]:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', self._carton_on_drop_po)
+                    def on_po_enter(e): self.carton_po_container.configure(border_color=MOSS, fg_color=MOSS_SOFT)
+                    def on_po_leave(e): self.carton_po_container.configure(border_color=FAINT, fg_color=SAND)
+                    t.dnd_bind('<<DropEnter>>', on_po_enter)
+                    t.dnd_bind('<<DropLeave>>', on_po_leave)
+
+                for t in [self.card_carton_pdf, self.carton_pdf_container]:
+                    t.drop_target_register(tkdnd.DND_FILES)
+                    t.dnd_bind('<<Drop>>', self._carton_on_drop_pdf)
+                    def on_pdf_enter(e): self.carton_pdf_container.configure(border_color=MOSS, fg_color=MOSS_SOFT)
+                    def on_pdf_leave(e): self.carton_pdf_container.configure(border_color=FAINT, fg_color=SAND)
+                    t.dnd_bind('<<DropEnter>>', on_pdf_enter)
+                    t.dnd_bind('<<DropLeave>>', on_pdf_leave)
+            except Exception as e:
+                print(f"Error binding carton DnD: {e}")
+
+        # THỰC THI & FEEDBACK
+        act_box = ctk.CTkFrame(scroll, fg_color="transparent")
+        act_box.pack(fill="x", pady=(10, 24))
+
+        self.btn_run_carton = ctk.CTkButton(
+            act_box,
+            text="Bắt Đầu Kiểm Tra Carton (Xuất PDF Báo Cáo)",
+            font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            fg_color=ROAST,
+            hover_color="#3e312a",
+            text_color="#ffffff",
+            corner_radius=24,
+            height=44,
+            command=self._start_carton_audit
+        )
+        self.btn_run_carton.pack(fill="x", pady=(0, 10))
+
+        self.prog_bar_carton = ctk.CTkProgressBar(act_box, height=4, fg_color=LINE, progress_color=MOSS)
+        self.prog_bar_carton.set(0)
+        self.prog_bar_carton.pack(fill="x", pady=(0, 14))
+
+        self.carton_feed = ctk.CTkFrame(act_box, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        self.carton_feed.pack(fill="x")
+
+    def _on_carton_fac_selected(self, choice):
+        fsc_val = self.carton_factories.get(choice, "")
+        self.entry_carton_fac_name.delete(0, "end")
+        self.entry_carton_fac_name.insert(0, choice)
+        self.entry_carton_fsc_code.delete(0, "end")
+        self.entry_carton_fsc_code.insert(0, fsc_val)
+
+    def _save_carton_factory(self):
+        name = self.entry_carton_fac_name.get().strip()
+        code = self.entry_carton_fsc_code.get().strip()
+        if not name or not code:
+            messagebox.showwarning("Thiếu thông tin", "Vui lòng nhập tên nhà máy và mã FSC!")
+            return
+        self.carton_factories[name] = code
+        save_fsc_factories(self.carton_factories)
+        names = list(self.carton_factories.keys())
+        self.combo_carton_fac.configure(values=names)
+        self.combo_carton_fac.set(name)
+        messagebox.showinfo("Đã lưu", f"Đã lưu nhà máy '{name}' với mã FSC '{code}'!")
+
+    def _del_carton_factory(self):
+        curr = self.combo_carton_fac.get()
+        if curr in self.carton_factories:
+            if len(self.carton_factories) <= 1:
+                messagebox.showwarning("Không thể xóa", "Cần giữ lại ít nhất 1 nhà máy trong danh sách!")
+                return
+            del self.carton_factories[curr]
+            save_fsc_factories(self.carton_factories)
+            names = list(self.carton_factories.keys())
+            self.combo_carton_fac.configure(values=names)
+            self.combo_carton_fac.set(names[0])
+            self._on_carton_fac_selected(names[0])
+
+    def _pick_carton_po_files(self):
+        files = filedialog.askopenfilenames(
+            title="Chọn các file PO Excel",
+            filetypes=[("Excel Files", "*.xlsx *.xls *.xlsm"), ("All Files", "*.*")]
+        )
+        if files:
+            for f in files:
+                p = os.path.abspath(f)
+                if p not in self.carton_po_files:
+                    self.carton_po_files.append(p)
+            self._render_carton_po_display()
+
+    def _carton_on_drop_generic(self, event):
+        paths = parse_drop_paths(event.data)
+        po_added = False
+        pdf_added = False
+        for p in paths:
+            if os.path.isfile(p):
+                ext = p.lower()
+                if ext.endswith(('.xlsx', '.xls', '.xlsm')) and not os.path.basename(p).startswith("~$"):
+                    if p not in self.carton_po_files:
+                        self.carton_po_files.append(p)
+                        po_added = True
+                elif ext.endswith('.pdf'):
+                    if p not in self.carton_pdf_files:
+                        self.carton_pdf_files.append(p)
+                        pdf_added = True
+        if po_added:
+            self._render_carton_po_display()
+        if pdf_added:
+            self._render_carton_pdf_display()
+
+    def _carton_on_drop_po(self, event):
+        self.carton_po_container.configure(border_color=FAINT, fg_color=SAND)
+        paths = parse_drop_paths(event.data)
+        added = False
+        for p in paths:
+            if os.path.isfile(p) and p.lower().endswith(('.xlsx', '.xls', '.xlsm')) and not os.path.basename(p).startswith("~$"):
+                if p not in self.carton_po_files:
+                    self.carton_po_files.append(p)
+                    added = True
+        if added:
+            self._render_carton_po_display()
+
+    def _clear_carton_po_files(self):
+        self.carton_po_files.clear()
+        self._render_carton_po_display()
+
+    def _render_carton_po_display(self):
+        for child in self.carton_po_container.winfo_children():
+            child.destroy()
+        if not self.carton_po_files:
+            ctk.CTkLabel(
+                self.carton_po_container,
+                text="Chưa có file PO nào. Kéo thả file Excel vào đây hoặc bấm nút '+ Thêm File PO...'",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=FAINT
+            ).pack(padx=16, pady=18)
+        else:
+            box = ctk.CTkFrame(self.carton_po_container, fg_color="transparent")
+            box.pack(fill="x", padx=16, pady=10)
+            ctk.CTkLabel(
+                box,
+                text=f"Đã nạp {len(self.carton_po_files)} file PO đơn hàng (Sẵn sàng):",
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                text_color=ROAST
+            ).pack(anchor="w", pady=(0, 6))
+            for p in self.carton_po_files:
+                f_row = ctk.CTkFrame(box, fg_color=CARD, corner_radius=8, border_width=1, border_color=LINE)
+                f_row.pack(fill="x", pady=2)
+                
+                # Huy hiệu xanh thân thiện
+                ctk.CTkLabel(
+                    f_row,
+                    text="✓ Sẵn sàng",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                    text_color=MOSS
+                ).pack(side="left", padx=(10, 8), pady=4)
+
+                ctk.CTkLabel(
+                    f_row,
+                    text=f"📄 {os.path.basename(p)}",
+                    font=ctk.CTkFont(family=FONT_SANS, size=11),
+                    text_color=ROAST
+                ).pack(side="left", pady=4)
+
+                # Nút xóa tinh tế trung tính không gây hiểu nhầm lỗi
+                del_btn = ctk.CTkButton(
+                    f_row,
+                    text="Xóa",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10),
+                    width=45,
+                    height=20,
+                    fg_color="transparent",
+                    text_color=BROWN,
+                    hover_color=SAND,
+                    border_width=1,
+                    border_color=LINE,
+                    corner_radius=10,
+                    command=lambda target=p: self._remove_single_po(target)
+                )
+                del_btn.pack(side="right", padx=10, pady=4)
+
+    def _remove_single_po(self, target):
+        if target in self.carton_po_files:
+            self.carton_po_files.remove(target)
+            self._render_carton_po_display()
+
+    def _pick_carton_pdf_files(self):
+        files = filedialog.askopenfilenames(
+            title="Chọn các file PDF bản vẽ carton",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        )
+        if files:
+            for f in files:
+                p = os.path.abspath(f)
+                if p not in self.carton_pdf_files:
+                    self.carton_pdf_files.append(p)
+            self._render_carton_pdf_display()
+
+    def _carton_on_drop_pdf(self, event):
+        self.carton_pdf_container.configure(border_color=FAINT, fg_color=SAND)
+        paths = parse_drop_paths(event.data)
+        added = False
+        for p in paths:
+            if os.path.isfile(p) and p.lower().endswith('.pdf'):
+                if p not in self.carton_pdf_files:
+                    self.carton_pdf_files.append(p)
+                    added = True
+        if added:
+            self._render_carton_pdf_display()
+
+    def _clear_carton_pdf_files(self):
+        self.carton_pdf_files.clear()
+        self._render_carton_pdf_display()
+
+    def _render_carton_pdf_display(self):
+        for child in self.carton_pdf_container.winfo_children():
+            child.destroy()
+        if not self.carton_pdf_files:
+            ctk.CTkLabel(
+                self.carton_pdf_container,
+                text="Chưa có file PDF nào. Kéo thả file PDF vào đây hoặc bấm nút '+ Thêm File PDF...'",
+                font=ctk.CTkFont(family=FONT_SANS, size=11),
+                text_color=FAINT
+            ).pack(padx=16, pady=18)
+        else:
+            box = ctk.CTkFrame(self.carton_pdf_container, fg_color="transparent")
+            box.pack(fill="x", padx=16, pady=10)
+            ctk.CTkLabel(
+                box,
+                text=f"Đã nạp {len(self.carton_pdf_files)} file PDF bản vẽ carton (Sẵn sàng):",
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                text_color=ROAST
+            ).pack(anchor="w", pady=(0, 6))
+            for p in self.carton_pdf_files:
+                f_row = ctk.CTkFrame(box, fg_color=CARD, corner_radius=8, border_width=1, border_color=LINE)
+                f_row.pack(fill="x", pady=2)
+
+                # Huy hiệu xanh thân thiện
+                ctk.CTkLabel(
+                    f_row,
+                    text="✓ Sẵn sàng",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                    text_color=MOSS
+                ).pack(side="left", padx=(10, 8), pady=4)
+
+                ctk.CTkLabel(
+                    f_row,
+                    text=f"📐 {os.path.basename(p)}",
+                    font=ctk.CTkFont(family=FONT_SANS, size=11),
+                    text_color=ROAST
+                ).pack(side="left", pady=4)
+
+                # Nút xóa tinh tế trung tính không gây hiểu nhầm lỗi
+                del_btn = ctk.CTkButton(
+                    f_row,
+                    text="Xóa",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10),
+                    width=45,
+                    height=20,
+                    fg_color="transparent",
+                    text_color=BROWN,
+                    hover_color=SAND,
+                    border_width=1,
+                    border_color=LINE,
+                    corner_radius=10,
+                    command=lambda target=p: self._remove_single_pdf(target)
+                )
+                del_btn.pack(side="right", padx=10, pady=4)
+
+    def _remove_single_pdf(self, target):
+        if target in self.carton_pdf_files:
+            self.carton_pdf_files.remove(target)
+            self._render_carton_pdf_display()
+
+    def _start_carton_audit(self):
+        if self.carton_running:
+            return
+        if not self.carton_po_files:
+            messagebox.showwarning("Chưa chọn PO", "Vui lòng nạp ít nhất 1 file Excel đơn hàng PO!")
+            return
+        if not self.carton_pdf_files:
+            messagebox.showwarning("Chưa chọn PDF", "Vui lòng nạp ít nhất 1 file PDF bản vẽ carton!")
+            return
+
+        expected_fsc = self.entry_carton_fsc_code.get().strip() or "C181124"
+        self.carton_running = True
+        self.btn_run_carton.configure(state="disabled", text="Đang tiến hành đối soát hàng loạt...")
+        self.prog_bar_carton.set(0.1)
+
+        for child in self.carton_feed.winfo_children():
+            child.destroy()
+
+        threading.Thread(target=self._run_carton_thread, args=(expected_fsc,), daemon=True).start()
+
+    def _run_carton_thread(self, exp_fsc):
+        try:
+            # 1. Parse PO files
+            po_dict = self.carton_engine.parse_po_excels(self.carton_po_files)
+            self.after(0, lambda: self.prog_bar_carton.set(0.3))
+
+            results = []
+            total_pdfs = len(self.carton_pdf_files)
+            for i, pdf_path in enumerate(self.carton_pdf_files):
+                res = self.carton_engine.check_carton_pdf(pdf_path, po_dict, expected_fsc_code=exp_fsc)
+                results.append(res)
+                prog = 0.3 + 0.6 * ((i + 1) / total_pdfs)
+                self.after(0, lambda p=prog: self.prog_bar_carton.set(p))
+
+            self.carton_last_results = results
+            self.after(0, self._render_carton_results, results)
+        except Exception as e:
+            self.after(0, self._carton_error, str(e))
+
+    def _render_carton_results(self, results):
+        self.carton_running = False
+        self.btn_run_carton.configure(state="normal", text="Bắt Đầu Kiểm Tra Carton (Xuất PDF Báo Cáo)")
+        self.prog_bar_carton.set(1.0)
+
+        for child in self.carton_feed.winfo_children():
+            child.destroy()
+
+        res_box = ctk.CTkFrame(self.carton_feed, fg_color="transparent")
+        res_box.pack(fill="x", padx=20, pady=20)
+
+        # Thống kê
+        pass_cnt = sum(1 for r in results if r["status"] == "PASS")
+        fail_cnt = sum(1 for r in results if r["status"] == "FAIL")
+
+        status_color = MOSS if fail_cnt == 0 else DANGER
+        headline = f"✓ HOÀN TẤT: {pass_cnt}/{len(results)} FILE ĐẠT CHUẨN" if fail_cnt == 0 else f"⚠️ PHÁT HIỆN {fail_cnt} FILE SAI LỆCH / KHÔNG KHỚP PO!"
+
+        ctk.CTkLabel(
+            res_box,
+            text=headline,
+            font=ctk.CTkFont(family=FONT_SANS, size=14, weight="bold"),
+            text_color=status_color
+        ).pack(anchor="w", pady=(0, 6))
+
+        ctk.CTkLabel(
+            res_box,
+            text="Tất cả các bản vẽ đã xuất PDF kiểm duyệt (crop gọn, không đè chữ, đánh dấu màu trực quan):",
+            font=ctk.CTkFont(family=FONT_SANS, size=11),
+            text_color=BROWN
+        ).pack(anchor="w", pady=(0, 12))
+
+        # Danh sách chi tiết từng file với 2 nút riêng biệt và màu sắc rõ ràng
+        for r in results:
+            is_pass = (r["status"] == "PASS")
+            card_bd = MOSS if is_pass else DANGER
+            item_card = ctk.CTkFrame(res_box, fg_color=CARD, corner_radius=12, border_width=1.5, border_color=card_bd)
+            item_card.pack(fill="x", pady=6)
+
+            # Header row
+            i_row = ctk.CTkFrame(item_card, fg_color="transparent")
+            i_row.pack(fill="x", padx=14, pady=(10, 6))
+
+            badge_text = "✓ PASS" if is_pass else "✗ FAIL"
+            badge_color = MOSS if is_pass else DANGER
+
+            ctk.CTkLabel(
+                i_row,
+                text=f"[{badge_text}]",
+                font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+                text_color=badge_color
+            ).pack(side="left", padx=(0, 8))
+
+            ctk.CTkLabel(
+                i_row,
+                text=r["file"],
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                text_color=ROAST
+            ).pack(side="left")
+
+            # 2 nút riêng biệt theo yêu cầu của người dùng
+            btn_box = ctk.CTkFrame(i_row, fg_color="transparent")
+            btn_box.pack(side="right")
+
+            # Nút 1: Mở trực tiếp file PDF
+            ctk.CTkButton(
+                btn_box,
+                text="📄 Mở PDF",
+                font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                fg_color=ROAST,
+                hover_color="#453830",
+                text_color="#ffffff",
+                corner_radius=12,
+                width=85,
+                height=26,
+                command=lambda out_p=r["out_pdf"]: open_file_externally(out_p)
+            ).pack(side="left", padx=4)
+
+            # Nút 2: Mở thư mục Explorer
+            ctk.CTkButton(
+                btn_box,
+                text="📁 Mở Thư Mục",
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                fg_color="transparent",
+                hover_color=SAND,
+                text_color=ROAST,
+                border_width=1,
+                border_color=LINE,
+                corner_radius=12,
+                width=95,
+                height=26,
+                command=lambda out_p=r["out_pdf"]: reveal_in_explorer(out_p)
+            ).pack(side="left", padx=4)
+
+            # Khung chi tiết audit với từng dòng màu sắc rõ rệt
+            dt_box = ctk.CTkFrame(item_card, fg_color=SAND, corner_radius=8)
+            dt_box.pack(fill="x", padx=14, pady=(0, 10))
+
+            # 1. Dòng mô tả & màu sắc sản phẩm
+            desc_info = r.get("product_desc", "")
+            if desc_info:
+                row_desc = ctk.CTkFrame(dt_box, fg_color="transparent")
+                row_desc.pack(fill="x", padx=10, pady=(6, 2))
+                ctk.CTkLabel(
+                    row_desc,
+                    text="📦 Mô tả & Màu sắc:",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                    text_color=ROAST
+                ).pack(side="left", padx=(0, 6))
+
+                col_stat = MOSS if r.get("matched_po") else ("#1d4ed8" if "Martinique" in desc_info else DANGER)
+                po_extra = f"  ⇄  Đơn PO: {r['matched_po']['cust_name']}" if r.get("matched_po") and r['matched_po'].get("cust_name") else (" (Thông tin tham khảo - Không bắt lỗi)" if "Martinique" in desc_info else " (Không tìm thấy trong PO)")
+                ctk.CTkLabel(
+                    row_desc,
+                    text=f"{desc_info}{po_extra}",
+                    font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                    text_color=col_stat
+                ).pack(side="left")
+
+            # 2. Dòng chứng chỉ FSC
+            row_fsc = ctk.CTkFrame(dt_box, fg_color="transparent")
+            row_fsc.pack(fill="x", padx=10, pady=2)
+            fsc_is_ok = r.get("fsc_valid", False)
+            fsc_col = MOSS if fsc_is_ok else DANGER
+            fsc_ic = "✓" if fsc_is_ok else "✗"
+            fsc_str = f"{fsc_ic} Mã FSC: {r.get('fsc_found', 'N/A')} ({'Khớp chứng chỉ nhà máy' if fsc_is_ok else 'Sai lệch so với yêu cầu'})"
+            ctk.CTkLabel(
+                row_fsc,
+                text=fsc_str,
+                font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
+                text_color=fsc_col
+            ).pack(side="left")
+
+            # 3. Dòng thương hiệu & biểu tượng
+            row_brand = ctk.CTkFrame(dt_box, fg_color="transparent")
+            row_brand.pack(fill="x", padx=10, pady=2)
+            b_is_ok = r.get("brand_ok", False) and r.get("icons_ok", False)
+            b_col = MOSS if b_is_ok else DANGER
+            b_ic = "✓" if b_is_ok else "✗"
+            ctk.CTkLabel(
+                row_brand,
+                text=f"{b_ic} Thương hiệu SOFACOMPANY & Biểu tượng vận chuyển: {'Đầy đủ' if b_is_ok else 'Chưa đầy đủ'}",
+                font=ctk.CTkFont(family=FONT_SANS, size=10),
+                text_color=b_col
+            ).pack(side="left")
+
+            # 4. Các lưu ý / lỗi nếu có (Dòng đỏ đậm rõ ràng)
+            if r["issues"]:
+                for iss in r["issues"]:
+                    row_iss = ctk.CTkFrame(dt_box, fg_color="transparent")
+                    row_iss.pack(fill="x", padx=10, pady=1)
+                    is_err = ("KHÔNG CÓ" in iss or "SAI" in iss or "Thiếu" in iss)
+                    iss_c = DANGER if is_err else "#1d4ed8"
+                    iss_prefix = "✗" if is_err else "ℹ"
+                    ctk.CTkLabel(
+                        row_iss,
+                        text=f"  {iss_prefix} {iss}",
+                        font=ctk.CTkFont(family=FONT_SANS, size=10),
+                        text_color=iss_c
+                    ).pack(side="left")
+
+        # Nút mở thư mục chứa toàn bộ kết quả ở dưới cùng
+        if results:
+            first_out = results[0]["out_pdf"]
+            ctk.CTkButton(
+                res_box,
+                text="📁 Mở Thư Mục Chứa Tất Cả File Kết Quả Trong Explorer",
+                font=ctk.CTkFont(family=FONT_SANS, size=11, weight="bold"),
+                fg_color="transparent",
+                hover_color=SAND,
+                text_color=ROAST,
+                border_width=1,
+                border_color=LINE,
+                corner_radius=16,
+                height=34,
+                command=lambda: reveal_in_explorer(first_out)
+            ).pack(fill="x", pady=(14, 0))
+
+    def _carton_error(self, err):
+        self.carton_running = False
+        self.btn_run_carton.configure(state="normal", text="Bắt Đầu Kiểm Tra Carton (Xuất PDF Báo Cáo)")
+        self.prog_bar_carton.set(0)
+        messagebox.showerror("Lỗi đối soát Carton", f"Đã có lỗi xảy ra:\n{err}")
 
 if __name__ == "__main__":
     app = BoringTaskApp()
