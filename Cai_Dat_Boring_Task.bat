@@ -88,14 +88,14 @@ echo.
 echo [2/4] Đang cài đặt thư viện cần thiết...
 %PY_CMD% -m pip install --user -r "%INSTALL_DIR%\requirements.txt" --disable-pip-version-check --quiet
 
-%PY_CMD% -c "import openpyxl, customtkinter, PIL" >nul 2>nul
+%PY_CMD% -c "import openpyxl, customtkinter, PIL, fitz" >nul 2>nul
 if %errorlevel% equ 0 goto :create_shortcut
 
 echo.
 echo [CẢNH BÁO] Chưa thể tải đầy đủ thư viện (có thể do mất mạng).
 echo Đang thử lại với thông báo chi tiết...
 %PY_CMD% -m pip install --user -r "%INSTALL_DIR%\requirements.txt" --disable-pip-version-check
-%PY_CMD% -c "import openpyxl, customtkinter, PIL" >nul 2>nul
+%PY_CMD% -c "import openpyxl, customtkinter, PIL, fitz" >nul 2>nul
 if %errorlevel% equ 0 goto :create_shortcut
 
 echo.
