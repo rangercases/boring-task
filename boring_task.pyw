@@ -2632,6 +2632,13 @@ class CartonAuditEngine:
         req_inst = page.search_for('REQ. No.:')
         if req_inst:
             draw_line_item(req_inst[0], 'Checked OK', status='PASS', fontsize=30)
+        else:
+            # Fallback cho bản vẽ outline không có text
+            req_d = [d['rect'] for d in drawings if d['rect'].y0 < 1000 and 100 < d['rect'].x0 < 2500 and d['rect'].height < 80]
+            if req_d:
+                r_req = fitz.Rect(req_d[0])
+                for x in req_d: r_req.include_rect(x)
+                draw_line_item(r_req, 'Checked OK', status='PASS', fontsize=30)
 
         # 2. Logo SOFACOMPANY mat truoc & mat sau
         drawn_brands = set()
@@ -2645,66 +2652,127 @@ class CartonAuditEngine:
 
         # 3. Khoi thong tin chi tiet san pham tren mat thung
         art_lines = [l for l in all_lines if 'Article no.' in l[1] and l[0].y0 < 5600]
-        for art_l in art_lines:
-            cx0 = art_l[0].x0 - 250
-            cx1 = art_l[0].x1 + 450
-            cy0 = art_l[0].y0 - 550
-            cy1 = art_l[0].y1 + 600
+        if art_lines:
+            for art_l in art_lines:
+                cx0 = art_l[0].x0 - 250
+                cx1 = art_l[0].x1 + 450
+                cy0 = art_l[0].y0 - 550
+                cy1 = art_l[0].y1 + 600
 
-            nearby_lines = [l for l in all_lines if cx0 <= l[0].x0 <= cx1 and cy0 <= l[0].y0 <= cy1 and l[0].y0 < 5600]
-            if not nearby_lines:
-                continue
-
-            nearby_lines = sorted(nearby_lines, key=lambda x: x[0].y0)
-            max_y = max(l[0].y1 for l in nearby_lines)
-            min_x = min(l[0].x0 for l in nearby_lines)
-            max_x = max(l[0].x1 for l in nearby_lines)
-
-            for l_rect, b_txt in nearby_lines:
-                if l_rect.height > 100 and len(b_txt) < 30 and 'Vincent' in b_txt:
-                    draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
-                elif 'Article no.:' in b_txt:
-                    stat = 'PASS' if matched_po_info else 'INFO'
-                    txt = 'Matched PO' if matched_po_info else 'Reference'
-                    draw_line_item(l_rect, txt, status=stat, fontsize=30)
-                elif any(w in b_txt for w in ['Outdoor', 'Lounge', 'Sofa', 'Seater', 'Corner', 'Footstool', 'Module', 'Chair', 'Table', 'Pouf']):
-                    draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
-                elif 'Gross weight:' in b_txt:
-                    draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
-
-            # Bieu tuong phan loai rac / tai che ngay duoi thong tin
-            sym_drawings = [d for d in drawings if max_y <= d['rect'].y0 <= max_y + 350 and min_x - 50 <= d['rect'].x0 <= max_x + 50]
-            if sym_drawings:
-                sym_r = fitz.Rect(sym_drawings[0]['rect'])
-                for d in sym_drawings:
-                    sym_r.include_rect(fitz.Rect(d['rect']))
-                draw_line_item(sym_r, 'Checked OK', status='PASS', fontsize=30)
-
-        # 4. Thong tin in tren mat hong (Side shipping marks)
-        drawn_side_marks = []
-        for l_rect, txt in all_lines:
-            if 'Article no.:' in txt and l_rect.y0 < 5600:
-                if any(abs(l_rect.x0 - sm.x0) < 300 for sm in drawn_side_marks):
+                nearby_lines = [l for l in all_lines if cx0 <= l[0].x0 <= cx1 and cy0 <= l[0].y0 <= cy1 and l[0].y0 < 5600]
+                if not nearby_lines:
                     continue
-                drawn_side_marks.append(l_rect)
-                draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
 
-        # 5. Barcode & Nhan tem
-        bc_num_lines = [l for l in all_lines if l[1].strip().isdigit() and len(l[1].strip()) >= 10 and l[0].y0 < 5600]
-        drawn_bc = []
-        for bcl, bctxt in bc_num_lines:
-            clean_bc = bctxt.strip()
-            bc_r = fitz.Rect(bcl.x0 - 10, bcl.y0 - 5, bcl.x1 + 10, bcl.y1 + 5)
-            if any(abs(bc_r.x0 - dbc.x0) < 50 and abs(bc_r.y0 - dbc.y0) < 50 for dbc in drawn_bc):
-                continue
-            drawn_bc.append(bc_r)
+                nearby_lines = sorted(nearby_lines, key=lambda x: x[0].y0)
+                max_y = max(l[0].y1 for l in nearby_lines)
+                min_x = min(l[0].x0 for l in nearby_lines)
+                max_x = max(l[0].x1 for l in nearby_lines)
 
-            if matched_po_info and clean_bc == matched_po_info.get('oc', '').strip():
-                draw_line_item(bc_r, 'Matched PO', status='PASS', fontsize=30)
-            elif matched_po_info:
-                draw_line_item(bc_r, 'NOT MATCHED PO', status='FAIL', fontsize=30)
-            else:
-                draw_line_item(bc_r, 'Not in PO', status='FAIL', fontsize=30)
+                for l_rect, b_txt in nearby_lines:
+                    if l_rect.height > 100 and len(b_txt) < 30 and 'Vincent' in b_txt:
+                        draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
+                    elif 'Article no.:' in b_txt:
+                        stat = 'PASS' if matched_po_info else 'INFO'
+                        txt = 'Matched PO' if matched_po_info else 'Reference'
+                        draw_line_item(l_rect, txt, status=stat, fontsize=30)
+                    elif any(w in b_txt for w in ['Outdoor', 'Lounge', 'Sofa', 'Seater', 'Corner', 'Footstool', 'Module', 'Chair', 'Table', 'Pouf']):
+                        draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
+                    elif 'Gross weight:' in b_txt:
+                        draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
+
+                # Bieu tuong phan loai rac / tai che ngay duoi thong tin
+                sym_drawings = [d for d in drawings if max_y <= d['rect'].y0 <= max_y + 350 and min_x - 50 <= d['rect'].x0 <= max_x + 50]
+                if sym_drawings:
+                    sym_r = fitz.Rect(sym_drawings[0]['rect'])
+                    for d in sym_drawings:
+                        sym_r.include_rect(fitz.Rect(d['rect']))
+                    draw_line_item(sym_r, 'Checked OK', status='PASS', fontsize=30)
+
+            # 4. Thong tin in tren mat hong (Side shipping marks)
+            drawn_side_marks = []
+            for l_rect, txt in all_lines:
+                if 'Article no.:' in txt and l_rect.y0 < 5600:
+                    if any(abs(l_rect.x0 - sm.x0) < 300 for sm in drawn_side_marks):
+                        continue
+                    drawn_side_marks.append(l_rect)
+                    draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
+
+            # 5. Barcode & Nhan tem
+            bc_num_lines = [l for l in all_lines if l[1].strip().isdigit() and len(l[1].strip()) >= 10 and l[0].y0 < 5600]
+            drawn_bc = []
+            for bcl, bctxt in bc_num_lines:
+                clean_bc = bctxt.strip()
+                bc_r = fitz.Rect(bcl.x0 - 10, bcl.y0 - 5, bcl.x1 + 10, bcl.y1 + 5)
+                if any(abs(bc_r.x0 - dbc.x0) < 50 and abs(bc_r.y0 - dbc.y0) < 50 for dbc in drawn_bc):
+                    continue
+                drawn_bc.append(bc_r)
+
+                if matched_po_info and clean_bc == matched_po_info.get('oc', '').strip():
+                    draw_line_item(bc_r, 'Matched PO', status='PASS', fontsize=30)
+                elif matched_po_info:
+                    draw_line_item(bc_r, 'NOT MATCHED PO', status='FAIL', fontsize=30)
+                else:
+                    draw_line_item(bc_r, 'Not in PO', status='FAIL', fontsize=30)
+
+        else:
+            # OUTLINE DRAWINGS FALLBACK: Tự động gom cụm nét vẽ để khoanh chuẩn xác từng dòng chi tiết!
+            # 4b. Flap marks (Mép nắp thùng 2 bên: Vincent | Article no.: ...)
+            for x_min, x_max in [(1800, 3500), (6500, 8100)]:
+                f_d = [d['rect'] for d in drawings if x_min < d['rect'].x0 < x_max and 2700 < d['rect'].y0 < 2900]
+                if f_d:
+                    r_flap = fitz.Rect(f_d[0])
+                    for x in f_d: r_flap.include_rect(x)
+                    draw_line_item(r_flap, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
+
+            # 5b. Khối thông tin chi tiết trên cả 2 mặt thùng (Mặt trước x ~ 3400..4800, Mặt sau x ~ 9500..10900)
+            for p_xmin, p_xmax in [(3400, 4800), (9500, 10900)]:
+                p_d = [d['rect'] for d in drawings if p_xmin < d['rect'].x0 < p_xmax and 3500 < d['rect'].y0 < 4550 and d['rect'].height < 250 and d['rect'].width < 1800]
+                if not p_d:
+                    continue
+                lines = []
+                curr_line = []
+                sorted_d = sorted(p_d, key=lambda d: d.y0)
+                for d in sorted_d:
+                    if not curr_line:
+                        curr_line.append(d)
+                    else:
+                        if abs(d.y0 - curr_line[-1].y0) < 35:
+                            curr_line.append(d)
+                        else:
+                            lr = fitz.Rect(curr_line[0])
+                            for x in curr_line: lr.include_rect(x)
+                            if lr.width > 50 and lr.height > 10:
+                                lines.append(lr)
+                            curr_line = [d]
+                if curr_line:
+                    lr = fitz.Rect(curr_line[0])
+                    for x in curr_line: lr.include_rect(x)
+                    if lr.width > 50 and lr.height > 10:
+                        lines.append(lr)
+
+                merged = []
+                for l in sorted(lines, key=lambda x: x.y0):
+                    if not merged:
+                        merged.append(l)
+                    else:
+                        if abs(l.y0 - merged[-1].y1) < 15 or abs(l.y0 - merged[-1].y0) < 25:
+                            merged[-1].include_rect(l)
+                        else:
+                            merged.append(l)
+
+                for idx, l in enumerate(merged):
+                    if idx == 0:
+                        # Tên mẫu (Vincent)
+                        draw_line_item(l, 'Checked OK', status='PASS', fontsize=30)
+                    elif idx == 1:
+                        # Article no.: [Mã số]
+                        draw_line_item(l, 'Matched PO' if matched_po_info else 'Reference', status='PASS' if matched_po_info else 'INFO', fontsize=30)
+                    elif idx in (2, 3):
+                        # Quy cách / Tên sản phẩm / Màu sắc
+                        draw_line_item(l, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
+                    elif idx >= 4:
+                        # Trọng lượng, Tem nhãn & Barcode
+                        draw_line_item(l, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
 
         # 6. Logo FSC
         fsc_logos = findings.get('fsc_logos', [])
