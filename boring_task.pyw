@@ -56,6 +56,39 @@ FILL_HEADER = PatternFill(start_color="F1EADB", end_color="F1EADB", fill_type="s
 THIN_BORDER_SIDE = Side(border_style="thin", color="E8E0D0")
 THIN_BORDER = Border(left=THIN_BORDER_SIDE, right=THIN_BORDER_SIDE, top=THIN_BORDER_SIDE, bottom=THIN_BORDER_SIDE)
 
+def load_workbook_safe(file_path, **kwargs):
+    """
+    Mở file Excel an toàn. Nếu file đang được mở trong Microsoft Excel,
+    tự động dùng Windows shared-handle (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+    để đọc trực tiếp từ bộ nhớ mà người dùng KHÔNG CẦN PHẢI ĐÓNG EXCEL.
+    """
+    try:
+        return openpyxl.load_workbook(file_path, **kwargs)
+    except PermissionError:
+        try:
+            import ctypes, msvcrt, io
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_ALL = 7 # READ (1) | WRITE (2) | DELETE (4)
+            OPEN_EXISTING = 3
+            h = ctypes.windll.kernel32.CreateFileW(
+                os.path.abspath(file_path),
+                GENERIC_READ,
+                FILE_SHARE_ALL,
+                None,
+                OPEN_EXISTING,
+                0,
+                None
+            )
+            if h != -1:
+                fd = msvcrt.open_osfhandle(h, 0)
+                with open(fd, 'rb') as f:
+                    content = f.read()
+                return openpyxl.load_workbook(io.BytesIO(content), **kwargs)
+        except Exception:
+            pass
+        fname = os.path.basename(file_path)
+        raise ValueError(f"File '{fname}' đang được mở và khóa bởi ứng dụng khác. Vui lòng đóng file lại rồi thử lại.")
+
 def normalize_text(text):
     """Normalize text: convert to string, lower, replace punctuation with spaces, collapse multi-spaces."""
     if text is None:
@@ -174,7 +207,7 @@ class FabricRuleManager:
         Col A = 'SK name', Col B = 'Supplier name'.
         Compares with existing rules, updates with latest, returns delta report.
         """
-        wb = openpyxl.load_workbook(filepath, data_only=True, read_only=True)
+        wb = load_workbook_safe(filepath, data_only=True, read_only=True)
         # Find sheet named 'Swatch' (case-insensitive) or fallback to first sheet
         target_sheet = None
         for sname in wb.sheetnames:
@@ -263,7 +296,7 @@ def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_
     if not rules:
         raise ValueError("Chưa có quy tắc vải nào được lưu. Vui lòng nạp file Fabric_name.xlsx trước.")
 
-    wb = openpyxl.load_workbook(overview_path)
+    wb = load_workbook_safe(overview_path)
     
     # Sheet selection
     if selected_sheet and selected_sheet in wb.sheetnames:
@@ -618,7 +651,7 @@ class ModelKnowledgeBase:
         """Đọc và nạp thêm các model mới từ file Excel (Model List All.xlsx)."""
         if not os.path.exists(excel_path):
             raise FileNotFoundError(f"Không tìm thấy file {excel_path}")
-        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        wb = load_workbook_safe(excel_path, read_only=True, data_only=True)
         sheet = wb.active
         # Tìm sheet có tên Export hoặc sheet đầu
         if "Export" in wb.sheetnames:
@@ -783,7 +816,7 @@ class POParsedDoc:
             self._parse_single(fp)
 
     def _parse_single(self, file_path: str):
-        wb = openpyxl.load_workbook(file_path, data_only=True)
+        wb = load_workbook_safe(file_path, data_only=True)
         # Tìm sheet PO (ưu tiên sheet có chữ PO hoặc tên vendor/xưởng như NH FSC, hoặc sheet đầu tiên)
         target_sheet = wb.active
         for sname in wb.sheetnames:
@@ -882,7 +915,7 @@ class CustomerCatalog:
         self.parse()
 
     def parse(self):
-        wb = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
+        wb = load_workbook_safe(self.file_path, read_only=True, data_only=True)
 
         # 1. Đọc MASTER DATA nếu có
         if "MASTER DATA" in wb.sheetnames:
@@ -1069,15 +1102,42 @@ class OrderAuditEngine:
 
             # ---------------------------------------------------------
             # LỚP 3 – FABRIC / COLOR VERIFICATION
+            # [LƯU Ý BẢO TRÌ]: Trong CustomerCatalog, thông tin tên sản phẩm kèm màu/vải
+            # của khách được lưu ở trường "name". Phải lấy trường "name" để đối chiếu,
+            # tuyệt đối không để biến rỗng làm trôi qua nhánh PASS mặc định!
             # ---------------------------------------------------------
-            fabric_status, fabric_msg = "PASS", "Fabric / Color verified"
-            if "dune" in combined_text.lower():
-                if "pasha dune" in combined_text.lower() or "padu" in combined_text.lower():
-                    fabric_status, fabric_msg = "PASS", "Pasha Dune verified (Fabric Pasha 058 Dune)"
-                elif "free dune" in combined_text.lower():
-                    fabric_status, fabric_msg = "PASS", "Free Dune verified (Fabric Free 058 Dune)"
-                elif "vega" in combined_text.lower() or "sand dune" in combined_text.lower():
-                    fabric_status, fabric_msg = "PASS", "Vega Sand Dune verified (Fabric Venga Recycle 004 Mole)"
+            cust_fabric_req = ""
+            if matched_entry:
+                cust_fabric_req = (
+                    matched_entry.get("fabric")
+                    or matched_entry.get("color")
+                    or matched_entry.get("name")
+                    or ""
+                )
+
+            if cust_fabric_req:
+                fabric_status, fabric_msg = self.fabric_kb.verify_fabric(cust_fabric_req, combined_text)
+            else:
+                fabric_status, fabric_msg = "REVIEW", "Không có dữ liệu Master của khách để đối chiếu vải"
+
+            # Kiểm tra chuyên sâu cho dòng họ vải Dune (chỉ PASS khi khớp đúng mã nhà cung cấp)
+            low_comb = combined_text.lower()
+            if "dune" in low_comb:
+                if "pasha dune" in low_comb or "padu" in low_comb:
+                    if "pasha" in low_comb and "058" in low_comb:
+                        fabric_status, fabric_msg = "PASS", "Pasha Dune verified (Fabric Pasha 058 Dune)"
+                    else:
+                        fabric_status, fabric_msg = "REVIEW", "Pasha Dune: Cần kiểm tra mã vải nhà cung cấp (Pasha 058 Dune)"
+                elif "free dune" in low_comb:
+                    if "free" in low_comb and "058" in low_comb:
+                        fabric_status, fabric_msg = "PASS", "Free Dune verified (Fabric Free 058 Dune)"
+                    else:
+                        fabric_status, fabric_msg = "REVIEW", "Free Dune: Cần kiểm tra mã vải nhà cung cấp (Free 058 Dune)"
+                elif "vega" in low_comb or "sand dune" in low_comb:
+                    if "venga" in low_comb or "004" in low_comb:
+                        fabric_status, fabric_msg = "PASS", "Vega Sand Dune verified (Fabric Venga Recycle 004 Mole)"
+                    else:
+                        fabric_status, fabric_msg = "REVIEW", "Vega Sand Dune: Cần kiểm tra mã vải (Venga Recycle 004 Mole)"
 
             audit_item.set_layer("Layer 3: Fabric", fabric_status, fabric_msg)
 
@@ -1381,38 +1441,6 @@ def find_assortment_source_sheet(wb):
     candidates.sort(key=lambda x: x['score'], reverse=True)
     best = candidates[0]
     return best['sheet'], best['header_row'], best['po_col'], best['dest_col'], best['sku_col']
-def load_workbook_safe(file_path):
-    """
-    Mở file Excel an toàn. Nếu file đang được mở trong Microsoft Excel,
-    tự động dùng Windows shared-handle (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-    để đọc trực tiếp từ bộ nhớ mà người dùng KHÔNG CẦN PHẢI ĐÓNG EXCEL.
-    """
-    try:
-        return openpyxl.load_workbook(file_path)
-    except PermissionError:
-        try:
-            import ctypes, msvcrt, io
-            GENERIC_READ = 0x80000000
-            FILE_SHARE_ALL = 7 # READ (1) | WRITE (2) | DELETE (4)
-            OPEN_EXISTING = 3
-            h = ctypes.windll.kernel32.CreateFileW(
-                os.path.abspath(file_path),
-                GENERIC_READ,
-                FILE_SHARE_ALL,
-                None,
-                OPEN_EXISTING,
-                0,
-                None
-            )
-            if h != -1:
-                fd = msvcrt.open_osfhandle(h, 0)
-                with open(fd, 'rb') as f:
-                    content = f.read()
-                return openpyxl.load_workbook(io.BytesIO(content))
-        except Exception:
-            pass
-        fname = os.path.basename(file_path)
-        raise ValueError(f"File '{fname}' đang được mở và khóa bởi ứng dụng khác. Vui lòng đóng file lại rồi thử lại.")
 
 def analyze_assortment_file(file_path, output_path=None):
     """
@@ -2116,6 +2144,65 @@ def ensure_fitz():
             raise RuntimeError("Máy tính chưa cài đặt thư viện 'PyMuPDF' để xử lý file PDF.\n"
                                "Vui lòng chạy lệnh: pip install PyMuPDF (hoặc kết nối Internet để tự động tải).")
 
+_GLOBAL_OCR_ENGINE = None
+
+def get_ocr_engine():
+    """
+    Khởi tạo engine OCR nội bộ (rapidocr_onnxruntime) để đọc chữ thực tế trên các bản vẽ
+    bị nhà thiết kế Convert Outline trong Adobe Illustrator (Zero Fake Data).
+    """
+    global _GLOBAL_OCR_ENGINE
+    if _GLOBAL_OCR_ENGINE is not None:
+        return _GLOBAL_OCR_ENGINE
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        _GLOBAL_OCR_ENGINE = RapidOCR()
+        return _GLOBAL_OCR_ENGINE
+    except ImportError:
+        try:
+            import subprocess, sys
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install",
+                "rapidocr_onnxruntime", "--disable-pip-version-check", "--quiet"
+            ])
+            from rapidocr_onnxruntime import RapidOCR
+            _GLOBAL_OCR_ENGINE = RapidOCR()
+            return _GLOBAL_OCR_ENGINE
+        except Exception:
+            return None
+
+ARIAL_FONT_PATH = "C:/Windows/Fonts/arial.ttf" if os.path.exists("C:/Windows/Fonts/arial.ttf") else None
+ARIAL_BOLD_PATH = "C:/Windows/Fonts/arialbd.ttf" if os.path.exists("C:/Windows/Fonts/arialbd.ttf") else None
+
+def insert_unicode_text(page, point, text, fontsize, color, bold=False):
+    """Vẽ chữ tiếng Việt có dấu chuẩn Unicode trên trang PDF, hỗ trợ font Arial hệ thống Windows."""
+    fontfile = ARIAL_BOLD_PATH if bold and ARIAL_BOLD_PATH else ARIAL_FONT_PATH
+    font_tag = 'arial_b' if bold else 'arial_u'
+    if fontfile:
+        try:
+            page.insert_font(fontname=font_tag, fontfile=fontfile)
+            page.insert_text(point, text, fontsize=fontsize, color=color, fontname=font_tag)
+            return
+        except Exception:
+            pass
+
+    t = re.sub(r'[àáạảãâầấậẩẫăằắặẳẵ]', 'a', str(text))
+    t = re.sub(r'[ÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴ]', 'A', t)
+    t = re.sub(r'[èéẹẻẽêềếệểễ]', 'e', t)
+    t = re.sub(r'[ÈÉẸẺẼÊỀẾỆỂỄ]', 'E', t)
+    t = re.sub(r'[ìíịỉĩ]', 'i', t)
+    t = re.sub(r'[ÌÍỊỈĨ]', 'I', t)
+    t = re.sub(r'[òóọỏõôồốộổỗơờớợởỡ]', 'o', t)
+    t = re.sub(r'[ÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠ]', 'O', t)
+    t = re.sub(r'[ùúụủũưừứựửữ]', 'u', t)
+    t = re.sub(r'[ÙÚỤỦŨƯỪỨỰỬỮ]', 'U', t)
+    t = re.sub(r'[ỳýỵỷỹ]', 'y', t)
+    t = re.sub(r'[ỲÝỴỶỸ]', 'Y', t)
+    t = re.sub(r'[đ]', 'd', t)
+    t = re.sub(r'[Đ]', 'D', t)
+    page.insert_text(point, t, fontsize=fontsize, color=color, fontname='helv')
+
+
 class CartonAuditEngine:
     """Core engine to parse multiple PO Excel files and verify carton drawing PDFs."""
     def __init__(self):
@@ -2136,7 +2223,7 @@ class CartonAuditEngine:
             if not os.path.exists(fpath):
                 continue
             try:
-                wb = openpyxl.load_workbook(fpath, data_only=True)
+                wb = load_workbook_safe(fpath, data_only=True)
                 po_default = os.path.splitext(os.path.basename(fpath))[0]
                 m_podef = re.search(r'(S\d{5,7}|PO\d+|ORDER\s*\d+)', po_default, re.IGNORECASE)
                 if m_podef:
@@ -2250,24 +2337,81 @@ class CartonAuditEngine:
                 print(f"Error parsing PO Excel {fpath}: {e}")
         return po_items
 
-    def find_all_fsc_codes(self, page):
+    def _extract_lines_via_ocr(self, page, carton_bottom_y):
         """
-        Scans entire page to detect any and all FSC certificate codes regardless of position.
-        Handles single or multiple FSC logos on flaps, sides, and accessories.
+        Quét OCR trực tiếp trên bản vẽ khi PDF bị Convert Outline.
+        Trả về danh sách [(fitz.Rect, text_str)] với tọa độ thực trên bản vẽ.
+        Tuyệt đối không đoán mò qua tên file.
         """
-        import fitz
+        fitz = ensure_fitz()
+        ocr = get_ocr_engine()
+        if ocr is None:
+            return []
+
+        clip_rect = fitz.Rect(0, 0, page.rect.width, min(page.rect.height, carton_bottom_y))
+        scale = min(3000.0 / max(clip_rect.width, 1.0), 1.5)
+        scale = max(scale, 0.35)
+        mat = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)
+
+        img_bytes = pix.tobytes("png")
+        ocr_res, _ = ocr(img_bytes)
+        if not ocr_res:
+            return []
+
+        extracted_lines = []
+        for item in ocr_res:
+            box, text, score = item[0], str(item[1]).strip(), float(item[2])
+            if not text or score < 0.45:
+                continue
+            xs = [pt[0] for pt in box]
+            ys = [pt[1] for pt in box]
+            r_pdf = fitz.Rect(
+                min(xs) / scale + clip_rect.x0,
+                min(ys) / scale + clip_rect.y0,
+                max(xs) / scale + clip_rect.x0,
+                max(ys) / scale + clip_rect.y0
+            )
+            extracted_lines.append((r_pdf, text))
+
+        return extracted_lines
+
+    def _detect_fsc_clusters_and_ocr(self, page, all_lines):
+        """
+        Tìm tất cả cụm mã FSC trên trang (cả từ text/OCR lẫn cụm nét vẽ nhỏ của logo FSC).
+        Không bao giờ gán cứng 'C181124' nếu không đọc được.
+        """
+        fitz = ensure_fitz()
+        ocr = get_ocr_engine()
+        results = []
+
+        # 1. Tìm trực tiếp trong các dòng text/OCR đã quét
+        for rect, txt in all_lines:
+            m = re.search(r'\b(?:FSC[ -]*)?(C\d{6,7})\b', txt, re.IGNORECASE)
+            if m:
+                code_str = m.group(1).upper()
+                logo_rect = fitz.Rect(rect.x0 - 110, rect.y0 - 200, rect.x1 + 25, rect.y1 + 25)
+                results.append({
+                    "code": code_str,
+                    "line_rect": rect,
+                    "logo_rect": logo_rect
+                })
+
+        if results:
+            return results
+
+        # 2. Nếu chữ FSC quá nhỏ trên bản vẽ lớn, tìm cụm vector của mã FSC và crop 300 DPI để OCR
         drawings = page.get_drawings()
-        fsc_candidates = [d['rect'] for d in drawings if 11.0 <= d['rect'].height <= 13.5 and d['rect'].width < 25]
-        
+        fsc_candidates = [d['rect'] for d in drawings if 9.0 <= d['rect'].height <= 16.0 and d['rect'].width < 28]
         merged_glyphs = []
         for r in fsc_candidates:
-            m = False
+            merged = False
             for g in merged_glyphs:
-                if abs(g.x0 - r.x0) < 2 and abs(g.y0 - r.y0) < 2:
+                if abs(g.x0 - r.x0) < 2.5 and abs(g.y0 - r.y0) < 2.5:
                     g.include_rect(r)
-                    m = True
+                    merged = True
                     break
-            if not m:
+            if not merged:
                 merged_glyphs.append(fitz.Rect(r))
 
         clusters = []
@@ -2285,103 +2429,76 @@ class CartonAuditEngine:
             if not found_c:
                 clusters.append({'glyphs': [g], 'x0': g.x0, 'x1': g.x1, 'y0': g.y0, 'y1': g.y1})
 
-        results = []
         for c in clusters:
-            glyphs = sorted(c['glyphs'], key=lambda g: g.x0)
-            if len(glyphs) >= 7:
-                code_glyphs = glyphs[-7:]
-                def classify_char(pix, g):
-                    w, h = g.width, g.height
-                    samples = pix.samples
-                    n = pix.n
-                    pw, ph = pix.width, pix.height
-                    tl = tr = bl = br = 0
-                    for y in range(ph):
-                        for x in range(pw):
-                            p = samples[(y * pw + x) * n]
-                            if p < 128:
-                                if y < ph / 2:
-                                    if x < pw / 2: tl += 1
-                                    else: tr += 1
-                                else:
-                                    if x < pw / 2: bl += 1
-                                    else: br += 1
-                    if w > 10.0: return 'C'
-                    if w < 6.0 and bl < 15: return '1'
-                    if 7.5 < w < 9.5:
-                        if tl > 200 and tr > 200 and bl > 200 and br > 200: return '8'
-                        if bl > 220 and tl < 200: return '2'
-                        if br > 240 and bl < 220: return '4'
-                    return '?'
+            if len(c['glyphs']) >= 6:
+                line_r = fitz.Rect(c['x0'] - 15, c['y0'] - 10, c['x1'] + 15, c['y1'] + 10)
+                logo_r = fitz.Rect(c['x0'] - 120, c['y0'] - 220, c['x1'] + 30, c['y1'] + 30)
+                code_read = "UNREADABLE"
+                if ocr is not None:
+                    try:
+                        pix = page.get_pixmap(clip=line_r, dpi=300, alpha=False)
+                        ocr_res, _ = ocr(pix.tobytes("png"))
+                        if ocr_res:
+                            raw_t = "".join(item[1] for item in ocr_res).upper()
+                            raw_t = re.sub(r'[^A-Z0-9]', '', raw_t)
+                            # [LƯU Ý BẢO TRÌ]: Chỉ lấy đúng định dạng mã chứng chỉ FSC (C + 5-7 chữ số),
+                            # tuyệt đối không dùng "elif raw_t: code_read = raw_t" làm lọt chữ RECYCLED vào báo cáo!
+                            m_c = re.search(r'(C\d{5,7})', raw_t)
+                            if m_c:
+                                code_read = m_c.group(1)
+                    except Exception:
+                        pass
+                results.append({
+                    "code": code_read,
+                    "line_rect": line_r,
+                    "logo_rect": logo_r
+                })
 
-                chars = []
-                for g in code_glyphs:
-                    pix = page.get_pixmap(clip=g, dpi=300)
-                    chars.append(classify_char(pix, g))
-                code_str = ''.join(chars)
-                if code_str.startswith('C') or len([x for x in chars if x.isdigit()]) >= 4:
-                    fsc_logo_rect = fitz.Rect(c['x0'] - 120, c['y0'] - 220, c['x1'] + 30, c['y1'] + 30)
-                    results.append({
-                        'code': code_str if '?' not in code_str else 'C181124',
-                        'line_rect': fitz.Rect(c['x0'], c['y0'], c['x1'], c['y1']),
-                        'logo_rect': fsc_logo_rect
-                    })
         return results
 
-    def _match_drawing_config_to_po(self, fname, pdf_title, po_items_dict):
+    def _find_true_carton_bounds(self, page, drawings):
         """
-        Smart fallback matcher when PDF has no digital text layer (converted to curves/outlines in Illustrator).
-        Matches based on fabric code, finish/color, module type, and REQ number.
+        [THUẬT TOÁN ĐỊNH VỊ THÙNG ĐỘNG - KHÔNG DÙNG HẰNG SỐ CỨNG 5650]:
+        Tự động tìm đỉnh (top_y) và đáy (bottom_y) thực tế của toàn bộ các mảnh thùng carton
+        dựa trên màu nền giấy carton (nâu/vàng) của hình trải phẳng.
+        - Hỗ trợ hoàn hảo cả thùng xếp 1 hàng ngang lẫn thùng dài xếp 2 tầng dọc (như 0014C).
+        - Tự động loại bỏ phần chú thích kỹ thuật nền trắng (Spec Callouts) ở dưới đáy trang.
         """
-        combined = f"{fname} {pdf_title}".lower()
+        carton_rects = []
+        for d in drawings:
+            r = d['rect']
+            fill = d.get('fill')
+            # Mảnh bìa thùng carton thực tế có tô màu nền giấy nâu/vàng (RGB) và kích thước lớn
+            if fill and isinstance(fill, (tuple, list)) and len(fill) >= 3:
+                if 0.55 < fill[0] < 0.95 and 0.40 < fill[1] < 0.85 and fill[2] < 0.65:
+                    if r.width > 150 and r.height > 150:
+                        carton_rects.append(r)
 
-        # Extract fabric code (e.g. R4281 001, W2416 004, R4248 501)
-        m_fab = re.search(r"([rw]\d{4}\s*\d{3})", combined)
-        fab_code = re.sub(r"\s+", " ", m_fab.group(1)).lower() if m_fab else None
+        # Fallback nếu bản vẽ chỉ có nét đen trắng (không tô màu nền thùng)
+        if not carton_rects:
+            carton_rects = [
+                d['rect'] for d in drawings
+                if d['rect'].width > 800 and d['rect'].height > 250 and d['rect'].y1 < page.rect.height * 0.82
+            ]
 
-        # Extract colors
-        color_keys = []
-        for c in ["anthracite", "coral sand", "olive green", "black", "white", "natural", "brown", "sandshell", "clary sage"]:
-            if c in combined:
-                color_keys.append(c)
+        # Lấy tọa độ đỉnh thật (trừ hao 60pt lề trên) để không bao giờ cắt mất chữ CUSTOMER: SAIGON WICKER
+        all_y0 = [d['rect'].y0 for d in drawings if d['rect'].width > 5]
+        true_top_y = min(0.0, min(all_y0) - 60.0) if all_y0 else 0.0
 
-        # Extract module type
-        mod_type = None
-        if "footrest" in combined or "footstool" in combined: mod_type = "footrest"
-        elif "corner" in combined: mod_type = "corner"
-        elif "arm left" in combined or "lhf" in combined or "left" in combined: mod_type = "left"
-        elif "arm right" in combined or "rhf" in combined or "right" in combined: mod_type = "right"
-        elif "chaiselong" in combined or "chaise" in combined: mod_type = "chaiselong"
-        elif "1 seater" in combined or "1s" in combined: mod_type = "1 seater"
+        if carton_rects:
+            # Cộng thêm 150pt để giữ trọn dòng số kích thước đỏ (50 | 1080 | 910) ngay dưới đáy thùng,
+            # không làm cắt ngang nửa con số nhưng vẫn loại bỏ hoàn toàn phần Spec phóng to ở dưới.
+            true_bottom_y = max(r.y1 for r in carton_rects) + 150.0
+        else:
+            true_bottom_y = min(page.rect.height, 5650.0)
 
-        candidates = []
-        for oc, item in po_items_dict.items():
-            desc = (item.get('desc', '') + " " + item.get('cust_name', '')).lower()
-            score = 0
-            if fab_code and fab_code in desc:
-                score += 15
-            for ck in color_keys:
-                if ck in desc:
-                    score += 5
-            if mod_type:
-                if mod_type == "footrest" and ("footrest" in desc or "footstool" in desc): score += 10
-                elif mod_type == "corner" and "corner" in desc: score += 10
-                elif mod_type == "left" and "left" in desc: score += 10
-                elif mod_type == "right" and "right" in desc and "left" not in desc: score += 10
-                elif mod_type == "chaiselong" and ("chaiselong" in desc or "chaise" in desc): score += 10
-                elif mod_type == "1 seater" and ("1 seater" in desc or "1s" in desc) and not any(k in desc for k in ["left", "right", "corner", "chaise"]): score += 10
-
-            if score >= 15:
-                candidates.append((score, item))
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1] if candidates else None
+        return true_top_y, true_bottom_y
 
     def check_carton_pdf(self, pdf_path, po_items_dict, expected_fsc_code="C181124", output_dir=None):
         """
-        Checks a single carton drawing PDF against po_items_dict and expected_fsc_code.
-        Produces an annotated audited PDF and returns audit report dict.
-        Supports both digital text PDFs and outlined/curved vector drawings.
+        Kiểm tra bản vẽ Carton PDF đối chiếu với PO:
+        - Đọc trực tiếp từ Text Layer hoặc OCR thực tế trên bản vẽ (Zero Fake Data).
+        - Tuyệt đối không bao giờ lấy mã từ PO đắp ngược vào kết quả đọc PDF.
         """
         fitz = ensure_fitz()
         fname = os.path.basename(pdf_path)
@@ -2389,13 +2506,15 @@ class CartonAuditEngine:
 
         if not output_dir:
             output_dir = os.path.dirname(pdf_path)
+        os.makedirs(output_dir, exist_ok=True)
         out_pdf = os.path.join(output_dir, f"{base_name}_CHECKED_CARTON.pdf")
 
         doc = fitz.open(pdf_path)
         page = doc[0]
-        pdf_title = str(doc.metadata.get('title') or '')
 
-        # Audit finding trackers
+        drawings = page.get_drawings()
+        carton_top_y, carton_bottom_y = self._find_true_carton_bounds(page, drawings)
+
         findings = {
             "file": fname,
             "status": "PASS",
@@ -2403,10 +2522,10 @@ class CartonAuditEngine:
             "product_desc": "",
             "color_variant": "",
             "matched_po": None,
-            "barcode_found": None,
+            "barcode_found": "UNKNOWN",
             "barcode_valid": False,
             "fsc_logos": [],
-            "fsc_found": None,
+            "fsc_found": "UNKNOWN",
             "fsc_valid": False,
             "brand_ok": False,
             "icons_ok": False,
@@ -2415,146 +2534,141 @@ class CartonAuditEngine:
             "out_pdf": out_pdf
         }
 
-        # 1. Quét tìm mã Article No trên PDF
-        page_text = page.get_text()
-        found_articles = sorted(list(set(re.findall(r"\b(933\d{10})\b", page_text))))
-        if not found_articles:
-            found_articles = sorted(list(set(re.findall(r"\b(\d{10,14})\b", page_text))))
-        findings["article_codes"] = found_articles
+        # 1. Trích xuất các dòng văn bản từ PDF Text Layer (nếu có)
+        page_dict = page.get_text("dict")
+        all_lines = []
+        for block in page_dict.get("blocks", []):
+            if "lines" in block:
+                for line in block["lines"]:
+                    text = "".join(span["text"] for span in line["spans"]).strip()
+                    if text and line["bbox"][1] <= carton_bottom_y:
+                        all_lines.append((fitz.Rect(line["bbox"]), text))
 
+        full_text_on_carton = "\n".join(t for _, t in all_lines)
+        found_articles = sorted(list(set(re.findall(r"\b(933\d{10})\b", full_text_on_carton))))
+
+        # 2. Nếu bản vẽ bị Convert Outline (không có mã Article trong Text Layer), chạy OCR thật trên hình vẽ
+        if not found_articles:
+            findings["is_outline_drawing"] = True
+            ocr_lines = self._extract_lines_via_ocr(page, carton_bottom_y)
+            if ocr_lines:
+                all_lines.extend(ocr_lines)
+                full_text_on_carton = "\n".join(t for _, t in all_lines)
+                found_articles = sorted(list(set(re.findall(r"\b(933\d{10})\b", full_text_on_carton))))
+                if not found_articles:
+                    found_articles = sorted(list(set(re.findall(r"\b(\d{12,14})\b", full_text_on_carton))))
+            else:
+                findings["issues"].append(
+                    "Bản vẽ đã bị Convert Outline (mất lớp chữ) và máy chưa có thư viện OCR để đọc chữ trên hình."
+                )
+
+        findings["article_codes"] = found_articles
+        findings["barcode_found"] = ", ".join(found_articles) if found_articles else "KHÔNG ĐỌC ĐƯỢC"
+
+        # 3. Kiểm tra tính đồng nhất nội bộ trên thùng
+        if len(found_articles) > 1:
+            findings["issues"].append(
+                f"CẢNH BÁO NỘI BỘ: Trên cùng 1 bản vẽ thùng đang in nhiều mã khác nhau: {', '.join(found_articles)}"
+            )
+
+        # 4. Đối soát mã thực tế đọc được trên bản vẽ với danh mục PO Excel
         matched_po_info = None
         for art in found_articles:
             if art in po_items_dict:
                 matched_po_info = po_items_dict[art]
                 break
 
-        # 1b. Quét mã Barcode trên tem nhãn
-        found_barcodes = sorted(list(set(re.findall(r"\b(933\d{10})\b", page_text))))
-        if not found_barcodes:
-            found_barcodes = sorted(list(set(re.findall(r"\b(\d{10,14})\b", page_text))))
-        findings["barcode_found"] = ", ".join(found_barcodes) if found_barcodes else "UNKNOWN"
-
-        # 1c. SMART FALLBACK: Khi bản vẽ bị phá font (Illustrator CS6 Create Outlines), page_text sẽ rỗng.
-        # Hệ thống kích hoạt cơ chế đối soát thông minh dựa trên Tên file, Title & Cấu hình sản phẩm.
-        is_outline_drawing = False
-        if not matched_po_info:
-            matched_fallback = self._match_drawing_config_to_po(fname, pdf_title, po_items_dict)
-            if matched_fallback:
-                matched_po_info = matched_fallback
-                is_outline_drawing = True
-                findings["is_outline_drawing"] = True
-                if not findings["article_codes"]:
-                    findings["article_codes"] = [matched_po_info["oc"]]
-                if findings["barcode_found"] == "UNKNOWN":
-                    findings["barcode_found"] = f"{matched_po_info['oc']} (Khớp quy cách)"
-
         findings["matched_po"] = matched_po_info
 
-        # 1d. Đối soát Barcode
-        if matched_po_info:
-            expected_oc = matched_po_info.get("oc", "").strip()
-            if is_outline_drawing:
-                findings["barcode_valid"] = True
-            elif found_barcodes and any(expected_oc in b or b in expected_oc for b in found_barcodes):
-                findings["barcode_valid"] = True
-            elif not found_barcodes:
-                findings["barcode_valid"] = True
-                findings["issues"].append("Bản vẽ dạng đồ họa vector - Đối soát Barcode theo mã sản phẩm PO")
-            else:
-                findings["barcode_valid"] = False
-                findings["issues"].append(f"Mã Barcode trên tem ('{findings['barcode_found']}') KHÔNG KHỚP với đơn hàng PO ('{expected_oc}')")
+        if matched_po_info and len(found_articles) == 1:
+            findings["barcode_valid"] = True
+        elif matched_po_info and len(found_articles) > 1:
+            findings["barcode_valid"] = False
+            findings["issues"].append("Có mã khớp PO nhưng trên thùng tồn tại mã thứ 2 không đồng nhất.")
+        elif found_articles and not matched_po_info:
+            findings["barcode_valid"] = False
+            findings["issues"].append(
+                f"Mã Article/Barcode đọc trên thùng ({', '.join(found_articles)}) KHÔNG TỒN TẠI trong các file PO đã nạp!"
+            )
         else:
             findings["barcode_valid"] = False
+            findings["issues"].append("Không tìm thấy mã Article / Barcode hợp lệ nào trên mặt thùng carton.")
 
-        # 2. Trích xuất mô tả sản phẩm & màu sắc / biến thể
-        m_desc = re.search(r'((?:[A-Za-z0-9 ]+\n+)?(?:[A-Za-z0-9 ]+\([A-Za-z0-9 ]+\)))\s*\n+Article no\.:', page_text)
-        if m_desc:
-            raw_desc = ' '.join(m_desc.group(1).split())
-            raw_desc = re.sub(r'^(Vincent\s+)+Vincent\b', 'Vincent', raw_desc)
-            findings["product_desc"] = raw_desc
+        # 5. Trích xuất mô tả sản phẩm thực tế trên bản vẽ
+        desc_candidates = []
+        for r_l, t_l in all_lines:
+            if any(w in t_l for w in ["Outdoor", "Seater", "Corner", "Footstool", "Footrest", "Module", "Lounge", "Sofa", "Chair", "Table"]):
+                if "PRODUCT" not in t_l.upper() and "CUSTOMER" not in t_l.upper():
+                    desc_candidates.append(t_l)
+        if desc_candidates:
+            findings["product_desc"] = " | ".join(dict.fromkeys(desc_candidates[:2]))
         else:
-            m_hdr = re.search(r"PRODUCT(?:'S|’S|\s+)?NAME:\s*([^\n\r]+)", page_text, re.IGNORECASE)
-            if m_hdr:
-                findings["product_desc"] = m_hdr.group(1).strip()
-            elif matched_po_info and matched_po_info.get("cust_name"):
-                findings["product_desc"] = matched_po_info["cust_name"]
-            elif pdf_title:
-                findings["product_desc"] = pdf_title
-            else:
-                clean_fn = os.path.splitext(fname)[0]
-                findings["product_desc"] = clean_fn.split("_", 1)[-1] if "_" in clean_fn else clean_fn
+            m_hdr = re.search(r"PRODUCT(?:'S|’S|\s+)?NAME:\s*([^\n\r]+)", full_text_on_carton, re.IGNORECASE)
+            findings["product_desc"] = m_hdr.group(1).strip() if m_hdr else "(Chưa trích xuất được mô tả trên mặt thùng)"
 
         m_col = re.search(r'\(([^)]+)\)', findings["product_desc"])
         findings["color_variant"] = m_col.group(1).strip() if m_col else ""
 
-        # 3. Quét kiểm tra Brand & Slogan
-        if "DIRECTLY" in page_text or "SOFACOMPANY" in page_text.upper() or len(page.get_drawings()) > 400:
-            findings["brand_ok"] = True
-        else:
-            findings["brand_ok"] = True
+        # 6. Brand check thực tế (Không dùng True else True)
+        sofa_logos = [d['rect'] for d in drawings if 1000 < d['rect'].width < 2500 and 100 < d['rect'].height < 350 and 3100 < d['rect'].y0 < 3800]
+        has_brand_text = ("DIRECTLY" in full_text_on_carton.upper() or "SOFACOMPANY" in full_text_on_carton.upper() or bool(sofa_logos))
+        findings["brand_ok"] = has_brand_text
+        if not has_brand_text:
+            findings["issues"].append("Không phát hiện Logo SOFACOMPANY hoặc Slogan trên thùng carton.")
 
-        # 4. Quét kiểm tra Biểu tượng
-        drawings = page.get_drawings()
-        if len(drawings) > 100 or "GROSS" in page_text.upper():
-            findings["icons_ok"] = True
-        else:
-            findings["icons_ok"] = True
+        # 7. Icons check thực tế (Không dùng True else True)
+        symbols = [d['rect'] for d in drawings if 160 < d['rect'].width < 260 and 160 < d['rect'].height < 260 and 1500 < d['rect'].y0 < carton_bottom_y]
+        has_weight = "GROSS WEIGHT" in full_text_on_carton.upper() or "GROSS" in full_text_on_carton.upper()
+        findings["icons_ok"] = bool(symbols) and has_weight
+        if not findings["icons_ok"]:
+            findings["issues"].append("Thiếu biểu tượng xếp dỡ (Hook/Up) hoặc dòng thông tin trọng lượng Gross Weight.")
 
-        # 5. Kiểm tra mã FSC (Nhận diện toàn trang không giới hạn tọa độ)
-        clean_exp = expected_fsc_code.strip().upper()
-        detected_text_fsc = re.findall(r"(?:FSC[ -]*)?(C\d{6,7})", page_text, re.IGNORECASE)
-        fsc_results = self.find_all_fsc_codes(page)
+        # 8. FSC Check thực tế (Không gán cứng C181124)
+        clean_exp = expected_fsc_code.strip().upper() if expected_fsc_code else ""
+        fsc_results = self._detect_fsc_clusters_and_ocr(page, all_lines)
         findings["fsc_logos"] = fsc_results
-
-        detected_codes = list(set([r['code'] for r in fsc_results] + [c.upper() for c in detected_text_fsc]))
-        if detected_codes:
-            findings["fsc_found"] = ", ".join(detected_codes)
-            if any(clean_exp in c or c in clean_exp for c in detected_codes):
+        detected_fsc = [r['code'] for r in fsc_results if r['code'] not in ("UNREADABLE", "UNKNOWN")]
+        if detected_fsc:
+            findings["fsc_found"] = ", ".join(set(detected_fsc))
+            if clean_exp and any(clean_exp in c or c in clean_exp for c in detected_fsc):
+                findings["fsc_valid"] = True
+            elif not clean_exp:
                 findings["fsc_valid"] = True
             else:
                 findings["fsc_valid"] = False
                 findings["issues"].append(f"Mã FSC trên thùng là '{findings['fsc_found']}', không khớp nhà máy ('{clean_exp}')")
         else:
             findings["fsc_found"] = "UNKNOWN"
-            findings["fsc_valid"] = True if not clean_exp else False
-            if clean_exp:
-                findings["issues"].append("Không tìm thấy Logo / Mã chứng chỉ FSC trên bản vẽ thùng")
+            findings["fsc_valid"] = False
+            findings["issues"].append("Không đọc được mã chứng chỉ FSC trên tem logo.")
 
-        # 6. Đánh giá trạng thái chung linh động (3 cấp độ PASS - WARN - FAIL)
-        if matched_po_info:
-            if not findings["barcode_valid"]:
-                findings["status"] = "FAIL"
-            elif not findings["fsc_valid"]:
-                findings["status"] = "WARN"  # FSC sai lệch nhẹ -> cảnh báo WARN không chặn gắt
-            elif is_outline_drawing:
-                findings["status"] = "PASS"  # Khớp chuẩn theo cấu hình bản vẽ outline
-            else:
-                findings["status"] = "PASS"
+        # 9. Đánh giá trạng thái chung
+        if matched_po_info and findings["barcode_valid"] and findings["fsc_valid"] and findings["brand_ok"]:
+            findings["status"] = "PASS"
+        elif matched_po_info and findings["barcode_valid"]:
+            findings["status"] = "WARN"  # Khớp PO nhưng có lưu ý về FSC hoặc Icon
         else:
-            # Không tìm thấy trong PO đã nạp -> Đưa về WARN để tham khảo
-            findings["status"] = "WARN"
-            findings["issues"].append(f"Mã Article {', '.join(found_articles or ['chưa rõ'])} chưa có trong danh mục PO đã nạp (Thông tin tham khảo)")
+            findings["status"] = "FAIL"
 
-        # 7. Vẽ chú thích đồ họa và xuất file PDF
-        self._render_annotated_pdf(page, findings, matched_po_info, clean_exp)
-
-        # Crop bỏ nửa dưới chi tiết theo quy chuẩn (kèm khoảng trắng phía dưới chứa report card)
-        clip_box = fitz.Rect(0, 0, page.rect.width, 7450)
-        page.set_cropbox(clip_box)
+        # 10. Vẽ chú thích đồ họa động & Xuất ra trang PDF chuẩn kích thước
+        out_doc = self._render_annotated_pdf(
+            doc, page, findings, matched_po_info, clean_exp,
+            all_lines, carton_top_y, carton_bottom_y, drawings
+        )
 
         try:
-            doc.save(out_pdf)
+            out_doc.save(out_pdf)
         except Exception:
-            # File lock fallback: nếu file PDF đang mở, thêm timestamp để không bị lỗi Permission denied
             ts = datetime.datetime.now().strftime("%H%M%S")
             out_pdf = os.path.join(output_dir, f"{base_name}_CHECKED_CARTON_{ts}.pdf")
-            doc.save(out_pdf)
+            out_doc.save(out_pdf)
 
+        out_doc.close()
         doc.close()
         findings["out_pdf"] = out_pdf
         return findings
 
-    def _render_annotated_pdf(self, page, findings, matched_po_info, exp_fsc):
+    def _render_annotated_pdf(self, doc, page, findings, matched_po_info, exp_fsc, all_lines, carton_top_y, carton_bottom_y, drawings):
         fitz = ensure_fitz()
         RED_BG = (0.85, 0.15, 0.15)
         RED_BORDER = (0.75, 0.1, 0.1)
@@ -2566,24 +2680,7 @@ class CartonAuditEngine:
         BLUE_BORDER = (0.10, 0.35, 0.65)
         WHITE = (1, 1, 1)
 
-        def to_ascii(text):
-            t = re.sub(r'[àáạảãâầấậẩẫăằắặẳẵ]', 'a', str(text))
-            t = re.sub(r'[ÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴ]', 'A', t)
-            t = re.sub(r'[èéẹẻẽêềếệểễ]', 'e', t)
-            t = re.sub(r'[ÈÉẸẺẼÊỀẾỆỂỄ]', 'E', t)
-            t = re.sub(r'[ìíịỉĩ]', 'i', t)
-            t = re.sub(r'[ÌÍỊỈĨ]', 'I', t)
-            t = re.sub(r'[òóọỏõôồốộổỗơờớợởỡ]', 'o', t)
-            t = re.sub(r'[ÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠ]', 'O', t)
-            t = re.sub(r'[ùúụủũưừứựửữ]', 'u', t)
-            t = re.sub(r'[ÙÚỤỦŨƯỪỨỰỬỮ]', 'U', t)
-            t = re.sub(r'[ỳýỵỷỹ]', 'y', t)
-            t = re.sub(r'[ỲÝỴỶỸ]', 'Y', t)
-            t = re.sub(r'[đ]', 'd', t)
-            t = re.sub(r'[Đ]', 'D', t)
-            return t
-
-        def draw_line_item(target_rect, text_badge, status='PASS', fontsize=32):
+        def draw_line_item(target_rect, text_badge, status='PASS', fontsize=30):
             if status == 'FAIL':
                 bg, bd = RED_BG, RED_BORDER
             elif status == 'WARN':
@@ -2616,214 +2713,124 @@ class CartonAuditEngine:
             bg_shape.finish(color=bd, fill=bg, width=1.5)
             bg_shape.commit()
 
-            page.insert_text(fitz.Point(bx + 12, by + badge_h * 0.72), to_ascii(text_badge), fontsize=fontsize, color=WHITE, fontname='helv')
+            insert_unicode_text(page, fitz.Point(bx + 12, by + badge_h * 0.72), text_badge, fontsize, WHITE)
 
-        drawings = page.get_drawings()
-        page_dict = page.get_text('dict')
-        all_lines = []
-        for block in page_dict.get('blocks', []):
-            if 'lines' in block:
-                for line in block['lines']:
-                    text = "".join(span['text'] for span in line['spans']).strip()
-                    if text:
-                        all_lines.append((fitz.Rect(line['bbox']), text))
+        # 1. REQ. No. bản vẽ (Chỉ khoanh vùng khi tìm thấy chữ REQ thực tế từ Text hoặc OCR, không vẽ mù)
+        req_lines = [l for l in all_lines if 'REQ' in l[1].upper()]
+        if req_lines:
+            draw_line_item(req_lines[0][0], 'Checked OK', status='PASS')
 
-        # 1. REQ No ban ve
-        req_inst = page.search_for('REQ. No.:')
-        if req_inst:
-            draw_line_item(req_inst[0], 'Checked OK', status='PASS', fontsize=30)
-        else:
-            # Fallback cho ban ve outline khong co text
-            req_d = [d['rect'] for d in drawings if 880 < d['rect'].y0 < 1050 and 100 < d['rect'].x0 < 860]
-            if req_d:
-                r_req = fitz.Rect(req_d[0])
-                for x in req_d: r_req.include_rect(x)
-                draw_line_item(fitz.Rect(101.2, r_req.y0 - 45, 862.1, r_req.y1 + 18), 'Checked OK', status='PASS', fontsize=30)
-
-        # 2. Logo SOFACOMPANY mat truoc & mat sau
-        drawn_brands = set()
+        # 2. Logo SOFACOMPANY (Hỗ trợ cả thùng 1 tầng lẫn thùng 2 tầng dọc)
+        drawn_brands = []
         for d in drawings:
             r = fitz.Rect(d['rect'])
-            if 1000 < r.width < 2500 and 100 < r.height < 350 and 3100 < r.y0 < 3800:
-                cx = round(r.x0 / 500) * 500
-                if cx not in drawn_brands:
-                    drawn_brands.add(cx)
-                    draw_line_item(r, 'Checked OK', status='PASS', fontsize=30)
+            if 1000 < r.width < 2500 and 100 < r.height < 350 and r.y1 < carton_bottom_y:
+                if not any(abs(r.x0 - b.x0) < 400 and abs(r.y0 - b.y0) < 400 for b in drawn_brands):
+                    drawn_brands.append(r)
+                    draw_line_item(r, 'Checked OK', status='PASS')
 
-        # 3. Khoi thong tin chi tiet san pham tren mat thung
-        art_lines = [l for l in all_lines if 'Article no.' in l[1] and l[0].y0 < 5600]
-        if art_lines:
-            for art_l in art_lines:
-                cx0 = art_l[0].x0 - 250
-                cx1 = art_l[0].x1 + 450
-                cy0 = art_l[0].y0 - 550
-                cy1 = art_l[0].y1 + 600
+        # 3. Flap Marks (Vincent | Article no. trên nắp thùng ở mọi tầng)
+        drawn_flaps = []
+        for r_l, t_l in all_lines:
+            if 'VINCENT' in t_l.upper() and ('ARTICLE' in t_l.upper() or '933' in t_l) and r_l.y1 < carton_bottom_y:
+                if not any(abs(r_l.x0 - df.x0) < 150 and abs(r_l.y0 - df.y0) < 150 for df in drawn_flaps):
+                    drawn_flaps.append(r_l)
+                    draw_line_item(r_l, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS')
 
-                nearby_lines = [l for l in all_lines if cx0 <= l[0].x0 <= cx1 and cy0 <= l[0].y0 <= cy1 and l[0].y0 < 5600]
-                if not nearby_lines:
-                    continue
+        # 4. Barcodes trên nắp thùng (Gom cụm các vạch đứng của Barcode trong phạm vi carton_bottom_y)
+        bc_status = 'PASS' if findings.get('barcode_valid') else 'FAIL'
+        bc_badge_txt = 'Matched PO' if findings.get('barcode_valid') else 'Unmatched / Invalid'
 
-                nearby_lines = sorted(nearby_lines, key=lambda x: x[0].y0)
-                max_y = max(l[0].y1 for l in nearby_lines)
-                min_x = min(l[0].x0 for l in nearby_lines)
-                max_x = max(l[0].x1 for l in nearby_lines)
-
-                for l_rect, b_txt in nearby_lines:
-                    if l_rect.height > 100 and len(b_txt) < 30 and 'Vincent' in b_txt:
-                        draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
-                    elif 'Article no.:' in b_txt:
-                        stat = 'PASS' if matched_po_info else 'INFO'
-                        txt = 'Matched PO' if matched_po_info else 'Reference'
-                        draw_line_item(l_rect, txt, status=stat, fontsize=30)
-                    elif any(w in b_txt for w in ['Outdoor', 'Lounge', 'Sofa', 'Seater', 'Corner', 'Footstool', 'Module', 'Chair', 'Table', 'Pouf']):
-                        draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
-                    elif 'Gross weight:' in b_txt:
-                        draw_line_item(l_rect, 'Checked OK', status='PASS', fontsize=30)
-
-                # Bieu tuong phan loai rac / tai che ngay duoi thong tin
-                sym_drawings = [d for d in drawings if max_y <= d['rect'].y0 <= max_y + 350 and min_x - 50 <= d['rect'].x0 <= max_x + 50]
-                if sym_drawings:
-                    sym_r = fitz.Rect(sym_drawings[0]['rect'])
-                    for d in sym_drawings:
-                        sym_r.include_rect(fitz.Rect(d['rect']))
-                    draw_line_item(sym_r, 'Checked OK', status='PASS', fontsize=30)
-
-            # 4. Thong tin in tren mat hong (Side shipping marks)
-            drawn_side_marks = []
-            for l_rect, txt in all_lines:
-                if 'Article no.:' in txt and l_rect.y0 < 5600:
-                    if any(abs(l_rect.x0 - sm.x0) < 300 for sm in drawn_side_marks):
-                        continue
-                    drawn_side_marks.append(l_rect)
-                    draw_line_item(l_rect, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS', fontsize=30)
-
-            # 5. Barcode & Nhan tem
-            bc_num_lines = [l for l in all_lines if l[1].strip().isdigit() and len(l[1].strip()) >= 10 and l[0].y0 < 5600]
-            drawn_bc = []
-            for bcl, bctxt in bc_num_lines:
-                clean_bc = bctxt.strip()
-                bc_r = fitz.Rect(bcl.x0 - 10, bcl.y0 - 5, bcl.x1 + 10, bcl.y1 + 5)
-                if any(abs(bc_r.x0 - dbc.x0) < 50 and abs(bc_r.y0 - dbc.y0) < 50 for dbc in drawn_bc):
-                    continue
-                drawn_bc.append(bc_r)
-
-                if matched_po_info and clean_bc == matched_po_info.get('oc', '').strip():
-                    draw_line_item(bc_r, 'Matched PO', status='PASS', fontsize=30)
-                elif matched_po_info:
-                    draw_line_item(bc_r, 'NOT MATCHED PO', status='FAIL', fontsize=30)
-                else:
-                    draw_line_item(bc_r, 'Not in PO', status='FAIL', fontsize=30)
-
-        else:
-            # OUTLINE DRAWINGS FALLBACK: Tự động gom cụm nét vẽ theo hình học vector để khoanh đúng 100% thị giác chuẩn
-            # 4b. Flap marks (Mép nắp thùng 2 bên: Vincent | Article no.: ...)
-            for x0_min, x0_max in [(1900, 3350), (6600, 8000)]:
-                f_d = [d['rect'] for d in drawings if x0_min < d['rect'].x0 < x0_max and 2730 < d['rect'].y0 < 2870]
-                if f_d:
-                    r_flap = fitz.Rect(f_d[0])
-                    for x in f_d: r_flap.include_rect(x)
-                    draw_line_item(fitz.Rect(r_flap.x0, r_flap.y0 - 22, r_flap.x1 + 4, r_flap.y1 + 4), 'Matched PO', status='PASS', fontsize=30)
-
-            # 5b. Cụm 4 Barcode trên nắp thùng
-            bc_ds = [d['rect'] for d in drawings if 2960 < d['rect'].y0 < 2980 and 15 < d['rect'].height < 25]
-            bc_clusters = []
-            for d in sorted(bc_ds, key=lambda x: x.x0):
-                if not bc_clusters or d.x0 - bc_clusters[-1][-1].x1 >= 40:
-                    bc_clusters.append([d])
-                else:
-                    bc_clusters[-1].append(d)
-            for idx, c in enumerate(bc_clusters):
+        bc_ds = [
+            d['rect'] for d in drawings
+            if 40 < d['rect'].height < 220 and 0.5 < d['rect'].width < 18 and d['rect'].y1 < carton_bottom_y
+        ]
+        bc_clusters = []
+        for d in sorted(bc_ds, key=lambda x: (round(x.y0 / 60), x.x0)):
+            if not bc_clusters or abs(d.y0 - bc_clusters[-1][-1].y0) > 35 or d.x0 - bc_clusters[-1][-1].x1 >= 45:
+                bc_clusters.append([d])
+            else:
+                bc_clusters[-1].append(d)
+        for c in bc_clusters:
+            if len(c) >= 12: # Cụm vạch barcode thực thụ (>= 12 vạch đứng gần nhau)
                 r_bc = fitz.Rect(c[0])
-                for x in c: r_bc.include_rect(x)
-                badge_txt = 'Matched PO' if idx in (0, 2) else 'Checked OK'
-                draw_line_item(fitz.Rect(r_bc.x0 - 10, r_bc.y0 - 10, r_bc.x1 + 10, r_bc.y1 + 13), badge_txt, status='PASS', fontsize=30)
+                for x in c:
+                    r_bc.include_rect(x)
+                if 120 < r_bc.width < 650:
+                    draw_line_item(fitz.Rect(r_bc.x0 - 10, r_bc.y0 - 10, r_bc.x1 + 10, r_bc.y1 + 15), bc_badge_txt, status=bc_status)
 
-            # 6b. Khối thông tin chi tiết trên cả 2 mặt thùng (Mặt trước x ~ 3500..4650, Mặt sau x ~ 9600..10750)
-            for px_min, px_max, base_x0, base_x1, desc_w, gw_w in [
-                (3500, 4650, 3567.6, 4544.3, 4513.1, 4534.8),
-                (9600, 10750, 9695.6, 10672.3, 10641.1, 10662.8)
-            ]:
-                # Vincent
-                v_d = [d['rect'] for d in drawings if px_min < d['rect'].x0 < px_max and 3450 < d['rect'].y0 < 3880]
-                if v_d:
-                    rv = fitz.Rect(v_d[0])
-                    for x in v_d: rv.include_rect(x)
-                    draw_line_item(fitz.Rect(base_x0, rv.y0 - 90, base_x0 + 1039.0, rv.y1 + 70), 'Checked OK', status='PASS', fontsize=30)
+        # 5. Khối thông tin chi tiết sản phẩm trên các mặt thùng (Định vị động theo tọa độ thực)
+        art_lines = [l for l in all_lines if ('ARTICLE NO' in l[1].upper() or 'ARTICLENO' in l[1].upper() or 'ARTICLE N0' in l[1].upper()) and l[0].y0 > 3000]
+        for art_l in art_lines:
+            panel_cx = art_l[0].x0
+            panel_cy = art_l[0].y0
+            nearby = [l for l in all_lines if abs(l[0].x0 - panel_cx) < 400 and abs(l[0].y0 - panel_cy) < 700]
+            for r_sub, t_sub in nearby:
+                if 'VINCENT' in t_sub.upper() and len(t_sub) < 20:
+                    draw_line_item(r_sub, 'Checked OK', status='PASS')
+                elif any(k in t_sub.upper() for k in ['ARTICLE NO', 'ARTICLENO', 'ARTICLE N0']):
+                    stat = 'PASS' if matched_po_info else 'WARN'
+                    txt = 'Matched PO' if matched_po_info else 'Unmatched'
+                    draw_line_item(r_sub, txt, status=stat)
+                elif any(w in t_sub for w in ['Outdoor', 'Lounge', 'Sofa', 'Seater', 'Corner', 'Footstool', 'Footrest', 'Module']):
+                    draw_line_item(r_sub, 'Matched PO' if matched_po_info else 'Checked OK', status='PASS')
+                elif 'GROSS' in t_sub.upper() or 'WEIGHT' in t_sub.upper():
+                    draw_line_item(r_sub, 'Checked OK', status='PASS')
 
-                # Lines 1, 2, 3
-                panel_ds = [d['rect'] for d in drawings if px_min < d['rect'].x0 < px_max and 3850 < d['rect'].y0 < 4170 and d['rect'].height >= 30]
-                l1 = [d for d in panel_ds if 3850 <= d.y0 < 3960]
-                if l1:
-                    rl1 = fitz.Rect(l1[0])
-                    for x in l1: rl1.include_rect(x)
-                    draw_line_item(fitz.Rect(base_x0, rl1.y0 - 22, base_x1, rl1.y1 + 21), 'Matched PO', status='PASS', fontsize=30)
+            # Recycle symbol ngay dưới panel thông tin
+            max_y_panel = max(l[0].y1 for l in nearby)
+            min_x_panel = min(l[0].x0 for l in nearby)
+            max_x_panel = max(l[0].x1 for l in nearby)
+            sym_drawings = [d for d in drawings if max_y_panel <= d['rect'].y0 <= max_y_panel + 350 and min_x_panel - 50 <= d['rect'].x0 <= max_x_panel + 50]
+            if sym_drawings:
+                sym_r = fitz.Rect(sym_drawings[0]['rect'])
+                for d in sym_drawings:
+                    sym_r.include_rect(fitz.Rect(d['rect']))
+                draw_line_item(sym_r, 'Checked OK', status='PASS')
 
-                l2 = [d for d in panel_ds if 3960 <= d.y0 < 4050]
-                if l2:
-                    rl2 = fitz.Rect(l2[0])
-                    for x in l2: rl2.include_rect(x)
-                    draw_line_item(fitz.Rect(base_x0, rl2.y0 - 22, desc_w, rl2.y1 + 21), 'Checked OK', status='PASS', fontsize=30)
-
-                l3 = [d for d in panel_ds if 4050 <= d.y0 < 4160]
-                if l3:
-                    rl3 = fitz.Rect(l3[0])
-                    for x in l3: rl3.include_rect(x)
-                    draw_line_item(fitz.Rect(base_x0, rl3.y0 - 22, rl3.x1 + 3, rl3.y1 + 10), 'Matched PO', status='PASS', fontsize=30)
-
-                # Line 4 (Gross weight)
-                l4 = [d['rect'] for d in drawings if px_min < d['rect'].x0 < px_max + 100 and 4165 <= d['rect'].y0 <= 4225]
-                if l4:
-                    rl4 = fitz.Rect(l4[0])
-                    for x in l4: rl4.include_rect(x)
-                    draw_line_item(fitz.Rect(base_x0, rl4.y0 - 6, gw_w, rl4.y1 + 2), 'Checked OK', status='PASS', fontsize=30)
-
-                # Line 5 (Recycle)
-                l5 = [d['rect'] for d in drawings if px_min < d['rect'].x0 < px_max - 400 and 4230 < d['rect'].y0 < 4385]
-                if l5:
-                    rl5 = fitz.Rect(l5[0])
-                    for x in l5: rl5.include_rect(x)
-                    draw_line_item(rl5, 'Checked OK', status='PASS', fontsize=30)
-
-        # 6. Logo FSC
+        # 6. Logo FSC thực tế
         fsc_logos = findings.get('fsc_logos', [])
-        if fsc_logos:
-            for logo in fsc_logos:
-                fsc_rect = logo['logo_rect']
-                fsc_stat = 'PASS' if findings.get('fsc_valid') else 'WARN'
-                fsc_txt = 'Checked OK' if findings.get('fsc_valid') else 'FSC Note'
-                draw_line_item(fsc_rect, fsc_txt, status=fsc_stat, fontsize=30)
-        else:
-            fsc_carton = [d for d in drawings if 200 < d['rect'].width < 450 and 200 < d['rect'].height < 450 and 3800 < d['rect'].y0 < 5200]
-            if fsc_carton:
-                fsc_r = fitz.Rect(fsc_carton[0]['rect'])
-                draw_line_item(fsc_r, 'Checked OK', status='PASS', fontsize=30)
+        for logo in fsc_logos:
+            fsc_rect = logo['logo_rect']
+            fsc_stat = 'PASS' if findings.get('fsc_valid') else 'WARN'
+            fsc_txt = 'Checked OK' if findings.get('fsc_valid') else 'FSC Note'
+            draw_line_item(fsc_rect, fsc_txt, status=fsc_stat)
 
-        # 7. Bieu tuong van chuyen (Hook, Up tren mep thung)
+        # 7. Shipping symbols (Hook, Up trên mép thùng)
         symbol_boxes = []
         for d in drawings:
             r = fitz.Rect(d['rect'])
-            if 160 < r.width < 260 and 160 < r.height < 260 and 1500 < r.y0 < 5600:
-                if not (3450 < r.x0 < 4750 and 3450 < r.y0 < 3850) and not (9550 < r.x0 < 10850 and 3450 < r.y0 < 3850):
-                    if not any(abs(r.x0 - sb.x0) < 300 and abs(r.y0 - sb.y0) < 300 for sb in symbol_boxes):
-                        symbol_boxes.append(r)
-
+            if 160 < r.width < 260 and 160 < r.height < 260 and 1500 < r.y0 < carton_bottom_y:
+                if not any(abs(r.x0 - sb.x0) < 300 and abs(r.y0 - sb.y0) < 300 for sb in symbol_boxes):
+                    symbol_boxes.append(r)
         for sb in symbol_boxes[:2]:
-            draw_line_item(sb, 'Checked OK', status='PASS', fontsize=30)
+            draw_line_item(sb, 'Checked OK', status='PASS')
 
-        # 8. Khung tong ket trang tao phia duoi thung carton
-        y_white_top = 5680
-        y_white_bottom = 7450
+        # 8. Tạo trang PDF kết quả chuẩn kích thước (Giữ nguyên 100% đỉnh trang CUSTOMER
+        #    và không bao giờ cắt cụt bảng Report ở đáy trên mọi kích thước thùng)
+        report_h = 1250
+        y_white_top = carton_bottom_y + 40
+        y_white_bottom = y_white_top + report_h
+        final_page_height = y_white_bottom + 80
 
-        white_bg = page.new_shape()
-        white_bg.draw_rect(fitz.Rect(0, y_white_top, page.rect.width, y_white_bottom + 50))
+        out_doc = fitz.open()
+        out_page = out_doc.new_page(width=page.rect.width, height=final_page_height)
+
+        # Chép nguyên vẹn vùng bản vẽ thùng carton (từ y=0 đến carton_bottom_y) sang trang mới
+        carton_clip = fitz.Rect(0, 0, page.rect.width, carton_bottom_y)
+        out_page.show_pdf_page(carton_clip, doc, 0, clip=carton_clip)
+
+        # Vẽ nền trắng và khung Report Card trực tiếp trên out_page
+        white_bg = out_page.new_shape()
+        white_bg.draw_rect(fitz.Rect(0, carton_bottom_y, out_page.rect.width, final_page_height))
         white_bg.finish(color=None, fill=(1, 1, 1), width=0)
         white_bg.commit()
 
-        box_w = min(page.rect.width * 0.88, 7800)
-        bx0 = (page.rect.width - box_w) / 2
+        box_w = min(out_page.rect.width * 0.88, 7800)
+        bx0 = (out_page.rect.width - box_w) / 2
         bx1 = bx0 + box_w
-        by0 = y_white_top + 130
-        by1 = y_white_bottom - 130
+        by0 = y_white_top + 80
+        by1 = y_white_bottom - 40
         summary_rect = fitz.Rect(bx0, by0, bx1, by1)
 
         cur_status = findings.get('status', 'PASS')
@@ -2833,54 +2840,50 @@ class CartonAuditEngine:
             res_color = GREEN_BG
         elif cur_status == 'WARN':
             s_bd, s_bg = WARN_BORDER, (0.99, 0.98, 0.93)
-            res_text = 'APPROVED WITH REVIEW - THONG TIN QUY CACH HOP LE'
+            res_text = 'APPROVED WITH REVIEW - THÔNG TIN QUY CÁCH HỢP LỆ'
             res_color = WARN_BG
         else:
             s_bd, s_bg = RED_BORDER, (0.99, 0.95, 0.95)
-            res_text = 'REJECTED - THONG TIN IN TREN CARTON SAI LECH SO VOI DON HANG'
+            res_text = 'REJECTED - THÔNG TIN IN TRÊN CARTON SAI LỆCH SO VỚI ĐƠN HÀNG'
             res_color = RED_BG
 
-        s_shape = page.new_shape()
+        s_shape = out_page.new_shape()
         s_shape.draw_rect(summary_rect)
         s_shape.finish(color=s_bd, fill=s_bg, width=5)
         s_shape.commit()
 
-        po_label = matched_po_info['po_no'] if matched_po_info else '(THONG TIN THAM KHAO)'
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 170), to_ascii(f'CARTON AUDIT REPORT vs PO: {po_label}'), fontsize=85, color=s_bd, fontname='helv')
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 320), to_ascii(f'KET QUA: {res_text}'), fontsize=64, color=res_color, fontname='helv')
+        po_label = matched_po_info['po_no'] if matched_po_info else '(THÔNG TIN THAM KHẢO)'
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 170), f'CARTON AUDIT REPORT vs PO: {po_label}', 85, s_bd, bold=True)
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 320), f'KẾT QUẢ: {res_text}', 64, res_color, bold=True)
 
-        fsc_status_str = f"Logo FSC {findings.get('fsc_found', '')}: KHOP NHA MAY ({exp_fsc})" if findings.get('fsc_valid') else f"Logo FSC {findings.get('fsc_found', '')}: LUU Y (Yeu cau {exp_fsc})"
-
+        fsc_status_str = f"Logo FSC {findings.get('fsc_found', '')}: KHỚP NHÀ MÁY ({exp_fsc})" if findings.get('fsc_valid') else f"Logo FSC {findings.get('fsc_found', '')}: LƯU Ý (Yêu cầu {exp_fsc})"
         art_codes = findings.get('article_codes', [])
-        article_str = ', '.join(art_codes) if art_codes else ''
-        if findings.get('is_outline_drawing'):
-            note_art = '(KHOP QUY CACH DON HANG - BAN VE OUTLINE)'
-        elif matched_po_info:
-            note_art = '(KHOP DON HANG)'
-        else:
-            note_art = '(THONG TIN THAM KHAO)'
-        art_color = GREEN_BORDER if matched_po_info else WARN_BORDER
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 460), to_ascii(f"1. Article No: {article_str} {note_art}"), fontsize=48, color=art_color, fontname='helv')
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 570), to_ascii(f'2. FSC Certificate: {fsc_status_str}'), fontsize=48, color=(GREEN_BORDER if findings.get('fsc_valid') else WARN_BORDER), fontname='helv')
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 680), to_ascii('3. Logo SOFACOMPANY, Slogan, bieu tuong xep do (Hook, Up, Triman): DAY DU'), fontsize=48, color=GREEN_BORDER, fontname='helv')
+        article_str = ', '.join(art_codes) if art_codes else 'KHÔNG ĐỌC ĐƯỢC'
+        note_art = '(KHỚP ĐƠN HÀNG)' if matched_po_info else '(KHÔNG CÓ TRONG PO)'
+        art_color = GREEN_BORDER if matched_po_info else RED_BORDER
+
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 460), f"1. Article No: {article_str} {note_art}", 48, art_color)
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 570), f'2. Chứng chỉ FSC: {fsc_status_str}', 48, (GREEN_BORDER if findings.get('fsc_valid') else WARN_BORDER))
+
+        brand_icons_ok = findings.get('brand_ok') and findings.get('icons_ok')
+        item3_str = "3. Logo SOFACOMPANY, Slogan, biểu tượng xếp dỡ (Hook, Up, Triman): ĐẦY ĐỦ" if brand_icons_ok else "3. Logo SOFACOMPANY, Slogan, biểu tượng xếp dỡ (Hook, Up, Triman): THIẾU LOGO / ICON"
+        item3_col = GREEN_BORDER if brand_icons_ok else RED_BORDER
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 680), item3_str, 48, item3_col)
 
         desc_line = findings.get('product_desc', '')
-        po_desc = f"(Khop PO: {matched_po_info['cust_name']})" if (matched_po_info and matched_po_info.get('cust_name')) else '(Thong tin mau sac tham khao)'
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 790), to_ascii(f'4. Mo ta san pham / Mau sac in mat thung: {desc_line} {po_desc}'), fontsize=48, color=BLUE_BORDER, fontname='helv')
+        po_desc = f"(Khớp PO: {matched_po_info['cust_name']})" if (matched_po_info and matched_po_info.get('cust_name')) else '(Thông tin màu sắc tham khảo)'
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 790), f'4. Mô tả sản phẩm / Màu sắc in mặt thùng: {desc_line} {po_desc}', 48, BLUE_BORDER)
 
         bc_found_str = findings.get('barcode_found', '') or 'UNKNOWN'
-        if findings.get('is_outline_drawing'):
-            bc_stat_str = f"Barcode {bc_found_str}: KHOP QUY CACH PO ({po_label})"
-            bc_stat_col = GREEN_BORDER
-        elif findings.get('barcode_valid'):
-            bc_stat_str = f"Barcode {bc_found_str}: KHOP DON HANG ({po_label})"
+        if findings.get('barcode_valid'):
+            bc_stat_str = f"Barcode {bc_found_str}: KHỚP ĐƠN HÀNG ({po_label})"
             bc_stat_col = GREEN_BORDER
         else:
-            bc_stat_str = f"Barcode {bc_found_str}: SAI LECH / KHONG KHOP PO"
+            bc_stat_str = f"Barcode {bc_found_str}: SAI LỆCH / KHÔNG KHỚP PO"
             bc_stat_col = RED_BORDER
-        page.insert_text(fitz.Point(bx0 + 200, by0 + 900), to_ascii(f'5. Thong so Barcode & Tem nhan: {bc_stat_str}'), fontsize=48, color=bc_stat_col, fontname='helv')
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 900), f'5. Thông số Barcode & Tem nhãn: {bc_stat_str}', 48, bc_stat_col)
 
-        page.set_cropbox(fitz.Rect(0, 0, page.rect.width, y_white_bottom))
+        return out_doc
 
 # ==============================================================================
 # MAIN BORING TASK APPLICATION CORE
@@ -3286,6 +3289,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                             if raw_resp.status == 200:
                                 new_code = raw_resp.read()
                                 if len(new_code) > 1000 and (b"BoringTask" in new_code or b"ClaimHelper" in new_code):
+                                    # Kiểm tra cú pháp an toàn trước khi thay thế file đang chạy
+                                    compile(new_code.decode("utf-8"), "boring_task.pyw", "exec")
                                     tmp_file = curr_file + ".new"
                                     with open(tmp_file, "wb") as f:
                                         f.write(new_code)
@@ -3850,6 +3855,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.auditor_view.pack_forget()
         self.assortment_view.pack_forget()
         self.weekly_po_view.pack_forget()
+        if hasattr(self, 'carton_view') and self.carton_view:
+            self.carton_view.pack_forget()
         self.home_view.pack(fill="both", expand=True)
         self.current_view = self.home_view
         self.title("Boring Task")
@@ -5122,19 +5129,29 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     attempts += 1
                     try:
                         cell = ws.Cells(r, pic_col)
-                        cell.Select()
-                        pic = ws.Pictures().Insert(thumb)
-                        pic.Select()
-                        pic.Copy()
-                        pic.Delete()
-                        time.sleep(0.03)
-                        cell.PastePictureInCell()
-                        inserted += 1
-                        row_has_pic = True
-                    except Exception:
-                        # First few all failing => this Excel has no Place in Cell support
-                        if inserted == 0 and attempts >= 3:
+                        pasted_ok = False
+                        for retry_idx in range(3):
+                            try:
+                                cell.Select()
+                                pic = ws.Pictures().Insert(thumb)
+                                pic.Select()
+                                pic.Copy()
+                                pic.Delete()
+                                time.sleep(0.04)
+                                cell.PastePictureInCell()
+                                pasted_ok = True
+                                break
+                            except Exception:
+                                time.sleep(0.08)
+                        if pasted_ok:
+                            inserted += 1
+                            row_has_pic = True
+                        elif inserted == 0 and attempts >= 3:
                             raise RuntimeError("Excel trên máy chưa hỗ trợ Place in Cell. Cần Microsoft Excel 365 bản mới.")
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass
                 if row_has_pic:
                     ws.Rows(r).RowHeight = 65
 
@@ -6240,11 +6257,11 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def auditor_worker(self):
         try:
-            self.auditor_prog.set(0.3)
+            self.after(0, lambda: self.auditor_prog.set(0.3))
             po_doc = POParsedDoc(self.auditor_po_files)
-            self.auditor_prog.set(0.6)
+            self.after(0, lambda: self.auditor_prog.set(0.6))
             cust_catalog = CustomerCatalog(self.auditor_cust_file)
-            self.auditor_prog.set(0.85)
+            self.after(0, lambda: self.auditor_prog.set(0.85))
 
             results = self.auditor_engine.audit(po_doc, cust_catalog)
 
@@ -7128,7 +7145,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def _weekly_po_worker(self):
         try:
-            self.prog_bar_weekly_po.set(0.3)
+            self.after(0, lambda: self.prog_bar_weekly_po.set(0.3))
             # Load master cache if not loaded
             if not self.weekly_po_master_cache:
                 m_by_pi, m_all = weekly_load_master_overview_index(self.weekly_po_master_file)
@@ -7136,7 +7153,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             else:
                 m_by_pi, m_all = self.weekly_po_master_cache
 
-            self.prog_bar_weekly_po.set(0.5)
+            self.after(0, lambda: self.prog_bar_weekly_po.set(0.5))
 
             # Auto detect PI from files
             pi_detected = weekly_detect_pi_number(self.weekly_po_nhung_file)
@@ -7158,7 +7175,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
             # 1. Audit Factory if provided
             if has_factory:
-                self.prog_bar_weekly_po.set(0.65)
+                self.after(0, lambda: self.prog_bar_weekly_po.set(0.65))
                 out_fac, stats_fac, fac_sum = weekly_audit_file_generic(
                     self.weekly_po_factory_file,
                     master_dict,
@@ -7169,7 +7186,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 )
 
             # 2. Audit Nhung
-            self.prog_bar_weekly_po.set(0.85)
+            self.after(0, lambda: self.prog_bar_weekly_po.set(0.85))
             out_nhung, stats_nhung, nhung_sum = weekly_audit_file_generic(
                 self.weekly_po_nhung_file,
                 master_dict,
@@ -7179,7 +7196,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 other_role_name="NHAMAY"
             )
 
-            self.prog_bar_weekly_po.set(1.0)
+            self.after(0, lambda: self.prog_bar_weekly_po.set(1.0))
             self.after(0, lambda: self._weekly_po_success(pi_detected, out_nhung, stats_nhung, out_fac, stats_fac))
 
         except Exception as e:
@@ -7986,8 +8003,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     text_color=ROAST
                 ).pack(side="left", padx=(0, 6))
 
-                col_stat = MOSS if r.get("matched_po") else ("#1d4ed8" if "Martinique" in desc_info else DANGER)
-                po_extra = f"  ⇄  Đơn PO: {r['matched_po']['cust_name']}" if r.get("matched_po") and r['matched_po'].get("cust_name") else (" (Thông tin tham khảo - Không bắt lỗi)" if "Martinique" in desc_info else " (Không tìm thấy trong PO)")
+                col_stat = MOSS if r.get("matched_po") else DANGER
+                po_extra = f"  ⇄  Đơn PO: {r['matched_po']['cust_name']}" if r.get("matched_po") and r['matched_po'].get("cust_name") else " (Không tìm thấy trong PO)"
                 ctk.CTkLabel(
                     row_desc,
                     text=f"{desc_info}{po_extra}",
