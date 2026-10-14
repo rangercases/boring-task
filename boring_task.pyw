@@ -2174,10 +2174,10 @@ def get_ocr_engine():
 ARIAL_FONT_PATH = "C:/Windows/Fonts/arial.ttf" if os.path.exists("C:/Windows/Fonts/arial.ttf") else None
 ARIAL_BOLD_PATH = "C:/Windows/Fonts/arialbd.ttf" if os.path.exists("C:/Windows/Fonts/arialbd.ttf") else None
 
-def insert_unicode_text(page, point, text, fontsize, color, bold=False):
+def insert_unicode_text(page, point, text, fontsize, color, bold=False, fontname=None):
     """Vẽ chữ tiếng Việt có dấu chuẩn Unicode trên trang PDF, hỗ trợ font Arial hệ thống Windows."""
     fontfile = ARIAL_BOLD_PATH if bold and ARIAL_BOLD_PATH else ARIAL_FONT_PATH
-    font_tag = 'arial_b' if bold else 'arial_u'
+    font_tag = fontname or ('arial_b' if bold else 'arial_u')
     if fontfile:
         try:
             page.insert_font(fontname=font_tag, fontfile=fontfile)
@@ -2816,6 +2816,13 @@ class CartonAuditEngine:
         out_doc = fitz.open()
         out_page = out_doc.new_page(width=page.rect.width, height=final_page_height)
 
+        # Đăng ký trước font Arial hệ thống trực tiếp trên out_page bằng tên thẻ riêng biệt
+        # để đảm bảo 100% không bị xung đột tài nguyên font với bản vẽ Illustrator gốc
+        if ARIAL_FONT_PATH:
+            out_page.insert_font(fontname='report_arial_regular', fontfile=ARIAL_FONT_PATH)
+        if ARIAL_BOLD_PATH:
+            out_page.insert_font(fontname='report_arial_bold', fontfile=ARIAL_BOLD_PATH)
+
         # Chép nguyên vẹn vùng bản vẽ thùng carton (từ y=0 đến carton_bottom_y) sang trang mới
         carton_clip = fitz.Rect(0, 0, page.rect.width, carton_bottom_y)
         out_page.show_pdf_page(carton_clip, doc, 0, clip=carton_clip)
@@ -2853,8 +2860,8 @@ class CartonAuditEngine:
         s_shape.commit()
 
         po_label = matched_po_info['po_no'] if matched_po_info else '(THÔNG TIN THAM KHẢO)'
-        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 170), f'CARTON AUDIT REPORT vs PO: {po_label}', 85, s_bd, bold=True)
-        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 320), f'KẾT QUẢ: {res_text}', 64, res_color, bold=True)
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 170), f'CARTON AUDIT REPORT vs PO: {po_label}', 85, s_bd, bold=True, fontname='report_arial_bold')
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 320), f'KẾT QUẢ: {res_text}', 64, res_color, bold=True, fontname='report_arial_bold')
 
         fsc_status_str = f"Logo FSC {findings.get('fsc_found', '')}: KHỚP NHÀ MÁY ({exp_fsc})" if findings.get('fsc_valid') else f"Logo FSC {findings.get('fsc_found', '')}: LƯU Ý (Yêu cầu {exp_fsc})"
         art_codes = findings.get('article_codes', [])
@@ -2862,17 +2869,17 @@ class CartonAuditEngine:
         note_art = '(KHỚP ĐƠN HÀNG)' if matched_po_info else '(KHÔNG CÓ TRONG PO)'
         art_color = GREEN_BORDER if matched_po_info else RED_BORDER
 
-        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 460), f"1. Article No: {article_str} {note_art}", 48, art_color)
-        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 570), f'2. Chứng chỉ FSC: {fsc_status_str}', 48, (GREEN_BORDER if findings.get('fsc_valid') else WARN_BORDER))
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 460), f"1. Article No: {article_str} {note_art}", 48, art_color, fontname='report_arial_regular')
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 570), f'2. Chứng chỉ FSC: {fsc_status_str}', 48, (GREEN_BORDER if findings.get('fsc_valid') else WARN_BORDER), fontname='report_arial_regular')
 
         brand_icons_ok = findings.get('brand_ok') and findings.get('icons_ok')
         item3_str = "3. Logo SOFACOMPANY, Slogan, biểu tượng xếp dỡ (Hook, Up, Triman): ĐẦY ĐỦ" if brand_icons_ok else "3. Logo SOFACOMPANY, Slogan, biểu tượng xếp dỡ (Hook, Up, Triman): THIẾU LOGO / ICON"
         item3_col = GREEN_BORDER if brand_icons_ok else RED_BORDER
-        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 680), item3_str, 48, item3_col)
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 680), item3_str, 48, item3_col, fontname='report_arial_regular')
 
         desc_line = findings.get('product_desc', '')
         po_desc = f"(Khớp PO: {matched_po_info['cust_name']})" if (matched_po_info and matched_po_info.get('cust_name')) else '(Thông tin màu sắc tham khảo)'
-        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 790), f'4. Mô tả sản phẩm / Màu sắc in mặt thùng: {desc_line} {po_desc}', 48, BLUE_BORDER)
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 790), f'4. Mô tả sản phẩm / Màu sắc in mặt thùng: {desc_line} {po_desc}', 48, BLUE_BORDER, fontname='report_arial_regular')
 
         bc_found_str = findings.get('barcode_found', '') or 'UNKNOWN'
         if findings.get('barcode_valid'):
@@ -2881,7 +2888,7 @@ class CartonAuditEngine:
         else:
             bc_stat_str = f"Barcode {bc_found_str}: SAI LỆCH / KHÔNG KHỚP PO"
             bc_stat_col = RED_BORDER
-        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 900), f'5. Thông số Barcode & Tem nhãn: {bc_stat_str}', 48, bc_stat_col)
+        insert_unicode_text(out_page, fitz.Point(bx0 + 200, by0 + 900), f'5. Thông số Barcode & Tem nhãn: {bc_stat_str}', 48, bc_stat_col, fontname='report_arial_regular')
 
         return out_doc
 
