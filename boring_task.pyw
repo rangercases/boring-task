@@ -15,6 +15,7 @@ import zipfile
 import shutil
 import hashlib
 import urllib.parse
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import customtkinter as ctk
@@ -55,6 +56,29 @@ FILL_HEADER = PatternFill(start_color="F1EADB", end_color="F1EADB", fill_type="s
 
 THIN_BORDER_SIDE = Side(border_style="thin", color="E8E0D0")
 THIN_BORDER = Border(left=THIN_BORDER_SIDE, right=THIN_BORDER_SIDE, top=THIN_BORDER_SIDE, bottom=THIN_BORDER_SIDE)
+
+FILL_EMPTY = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
+FONT_EMPTY = Font(name="Segoe UI", size=10, bold=True, color="595959")
+
+ST_KHOP_CHUAN = "KHỚP CHUẨN"
+ST_KHAC_BIEU_GHI = "KHÁC BIỂU GHI (FR/R)"
+ST_TRUNG_QUY_TAC = "TRÙNG QUY TẮC"
+ST_KHONG_CO_QUY_TAC = "KHÔNG CÓ QUY TẮC"
+ST_LECH_MAU = "LỆCH MÀU"
+ST_LECH_MA = "LỆCH MÃ"
+ST_LECH_QUY_TAC = "LỆCH QUY TẮC"
+ST_THIEU_DU_LIEU = "THIẾU DỮ LIỆU"
+
+STYLE_MAP = {
+    ST_KHOP_CHUAN: (FILL_OK, FONT_OK),
+    ST_KHAC_BIEU_GHI: (FILL_OK, FONT_OK),
+    ST_TRUNG_QUY_TAC: (FILL_PARTIAL, FONT_PARTIAL),
+    ST_KHONG_CO_QUY_TAC: (FILL_PARTIAL, FONT_PARTIAL),
+    ST_LECH_MAU: (FILL_ERROR, FONT_ERROR),
+    ST_LECH_MA: (FILL_ERROR, FONT_ERROR),
+    ST_LECH_QUY_TAC: (FILL_ERROR, FONT_ERROR),
+    ST_THIEU_DU_LIEU: (FILL_EMPTY, FONT_EMPTY),
+}
 
 def load_workbook_safe(file_path, **kwargs):
     """
@@ -279,30 +303,205 @@ class FabricRuleManager:
         }
 
 
-def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_threshold=0.85, progress_callback=None):
+FABRIC_STOPWORDS = {"fabric", "vai", "vải", "textile", "leather", "da", "swatch"}
+FABRIC_MARKERS = {"fr", "r"}
+
+
+def normalize_fabric_text(text):
+    """Normalize for structural comparison: lowercase, strip Vietnamese diacritics, punctuation -> space."""
+    if text is None:
+        return ""
+    t = str(text).strip().lower()
+    if not t:
+        return ""
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    t = re.sub(r"[^\w\s]", " ", t)
+    return " ".join(t.split())
+
+
+def strip_parens(text):
+    return re.sub(r"\([^)]*\)", "", str(text or "")).strip()
+
+
+def split_fabric_segments(raw):
+    """Split multi-fabric cells on commas that are outside parentheses."""
+    parts = re.split(r",(?![^(]*\))", str(raw or ""))
+    res = []
+    for p in parts:
+        cleaned = strip_parens(p).strip()
+        if cleaned and not is_empty_fabric(cleaned):
+            res.append(p.strip())
+    return res
+
+
+def split_fabric_head_tail(name):
+    """Split a fabric name into HEAD (model/code) and TAIL (color/variant) at the last digit token."""
+    clean = strip_parens(name)
+    toks = [t for t in normalize_fabric_text(clean).split() if t not in FABRIC_STOPWORDS]
+    if not toks:
+        return "", ""
+    code_indices = [i for i, t in enumerate(toks) if any(c.isdigit() for c in t)]
+    if not code_indices:
+        return " ".join(toks[:-1]), toks[-1]
+    idx = code_indices[-1]
+    if idx < len(toks) - 1:
+        return " ".join(toks[:idx + 1]), " ".join(toks[idx + 1:])
+    return " ".join(toks[:idx]), toks[idx]
+
+
+def classify_single_segment(seg_text, chosen_rule, chosen_sk_score):
+    rule_fab = chosen_rule["supplier"]
+    h_ov, t_ov = split_fabric_head_tail(seg_text)
+    h_ru, t_ru = split_fabric_head_tail(rule_fab)
+    head_sim = SequenceMatcher(None, h_ov, h_ru).ratio() if h_ov and h_ru else 0.0
+    tail_match = (t_ov == t_ru)
+
+    toks_ov = set(normalize_fabric_text(strip_parens(seg_text)).split())
+    toks_ru = set(normalize_fabric_text(strip_parens(rule_fab)).split())
+    diff = (toks_ov ^ toks_ru) - FABRIC_STOPWORDS
+    is_marker_only = bool(diff and diff.issubset(FABRIC_MARKERS))
+
+    if is_marker_only and head_sim >= 0.85:
+        return {
+            "rank": 2, "status": ST_KHAC_BIEU_GHI, "code": "MARKER_DIFF",
+            "msg": f"Khác biểu ghi thuộc tính ({', '.join(sorted(diff)).upper()})"
+        }
+    if head_sim >= 0.90 and tail_match:
+        pct_info = "100%" if (head_sim >= 0.99 and chosen_sk_score >= 0.99) else f"{int((head_sim + chosen_sk_score) / 2 * 100)}%"
+        return {
+            "rank": 1, "status": ST_KHOP_CHUAN, "code": "OK",
+            "msg": f"Khớp chuẩn ({pct_info})"
+        }
+    if head_sim >= 0.90 and not tail_match:
+        return {
+            "rank": 3, "status": ST_LECH_MAU, "code": "COLOR_MISMATCH",
+            "msg": f"Sai màu: '{t_ov}' ≠ '{t_ru}' (chuẩn: '{rule_fab}')"
+        }
+    return {
+        "rank": 4, "status": ST_LECH_MA, "code": "CODE_MISMATCH",
+        "msg": f"Lệch mã vải: '{h_ov}' ≠ '{h_ru}' (chuẩn: '{rule_fab}')"
+    }
+
+
+def classify_fabric_row(raw_fabric, raw_item, rules, threshold=0.85):
+    fabric_empty = is_empty_fabric(raw_fabric)
+    item_empty = is_empty_fabric(raw_item)
+    if fabric_empty or item_empty:
+        if fabric_empty and item_empty:
+            kind, msg = "both", "Chưa điền cả tên vải và tên sản phẩm"
+        elif fabric_empty:
+            kind, msg = "fabric", "Chưa điền tên vải"
+        else:
+            kind, msg = "item", "Chưa điền tên sản phẩm"
+        return {"status": ST_THIEU_DU_LIEU, "code": "EMPTY", "empty_kind": kind,
+                "sk": "", "supp": "", "msg": msg}
+
+    segments = split_fabric_segments(raw_fabric)
+    if not segments:
+        return {"status": ST_THIEU_DU_LIEU, "code": "EMPTY", "empty_kind": "fabric",
+                "sk": "", "supp": "", "msg": "Tên vải không có nội dung hợp lệ"}
+
+    is_multi = len(segments) > 1
+    item_norm = normalize_fabric_text(strip_parens(str(raw_item)))
+    fab_norm = normalize_fabric_text(strip_parens(str(raw_fabric)))
+
+    best_sk_matches = []
+    best_sk_score = 0.0
+    best_fab_rule = None
+    best_fab_score = 0.0
+
+    for idx, r in enumerate(rules):
+        sk_score, _ = best_substring_ratio(r["sk_norm"], item_norm)
+        fab_score, _ = best_substring_ratio(r["supp_norm"], fab_norm)
+
+        if sk_score > best_sk_score:
+            best_sk_score = sk_score
+            best_sk_matches = [(idx, r, sk_score, fab_score)]
+        elif abs(sk_score - best_sk_score) < 1e-4 and sk_score >= threshold:
+            best_sk_matches.append((idx, r, sk_score, fab_score))
+
+        if fab_score > best_fab_score:
+            best_fab_score = fab_score
+            best_fab_rule = r
+
+    if best_sk_score < threshold:
+        closest_note = ""
+        if best_fab_rule and best_fab_score >= 0.5:
+            closest_note = f" (gần nhất: '{best_fab_rule['supplier']}' {int(best_fab_score * 100)}%)"
+        return {
+            "status": ST_KHONG_CO_QUY_TAC, "code": "NO_RULE", "empty_kind": "",
+            "sk": "", "supp": "",
+            "msg": f"Không tìm thấy quy tắc khớp cho sản phẩm ({int(best_sk_score * 100)}%){closest_note}"
+        }
+
+    best_sk_matches.sort(key=lambda x: (-x[3], x[0]))
+    chosen_rule = best_sk_matches[0][1]
+    chosen_sk_score = best_sk_matches[0][2]
+
+    distinct_suppliers = {m[1]["supp_norm"] for m in best_sk_matches}
+    if len(distinct_suppliers) > 1:
+        return {
+            "status": ST_TRUNG_QUY_TAC, "code": "DUPLICATE_RULE", "empty_kind": "",
+            "sk": chosen_rule["sk"], "supp": chosen_rule["supplier"],
+            "msg": f"Tên SK '{chosen_rule['sk']}' khớp nhiều quy tắc có nhà cung cấp khác nhau"
+        }
+
+    if not is_multi and best_fab_rule and best_fab_score >= threshold:
+        if best_fab_rule["supp_norm"] != chosen_rule["supp_norm"]:
+            return {
+                "status": ST_LECH_QUY_TAC, "code": "RULE_MISMATCH", "empty_kind": "",
+                "sk": chosen_rule["sk"], "supp": chosen_rule["supplier"],
+                "msg": f"Lệch chéo: SK khớp '{chosen_rule['sk']}' nhưng vải khớp '{best_fab_rule['supplier']}'"
+            }
+
+    seg_results = [classify_single_segment(seg, chosen_rule, chosen_sk_score) for seg in segments]
+    seg_results.sort(key=lambda x: x["rank"])
+    best_seg = seg_results[0]
+
+    return {
+        "status": best_seg["status"],
+        "code": best_seg["code"],
+        "empty_kind": "",
+        "sk": chosen_rule["sk"],
+        "supp": chosen_rule["supplier"],
+        "msg": best_seg["msg"] + (" (ô nhiều vải)" if is_multi else "")
+    }
+
+
+def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_threshold=0.85,
+                        progress_callback=None, cancel_event=None):
     """
-    Main function to process Overview.xlsx file:
-    - Col S (19) = Fabric type
-    - Col T (20) = Customer item name
-    - Checks U-X. If has data, insert 4 columns right after T.
-    - Matches with rules using fuzzy logic.
-    - Formats status cells with colors.
-    - Returns summary statistics and saved file path.
+    Kiểm tra khớp vải cho file Overview.
+    - Col S (19) = Fabric type, Col T (20) = Customer item name.
+    - Ghi 4 cột kết quả vào U-X (21-24); nếu U-X đã có dữ liệu thì chèn 4 cột mới.
+    - Phân loại 8 nhãn theo cấu trúc HEAD/TAIL, hỗ trợ ô nhiều vải và biểu ghi FR/R.
     """
     if not os.path.exists(overview_path):
         raise FileNotFoundError(f"Không tìm thấy file: {overview_path}")
 
-    rules = rule_manager.rules
+    rules = rule_manager.rules if hasattr(rule_manager, "rules") else rule_manager
     if not rules:
         raise ValueError("Chưa có quy tắc vải nào được lưu. Vui lòng nạp file Fabric_name.xlsx trước.")
 
+    file_size_mb = os.path.getsize(overview_path) / (1024 * 1024)
+
+    def _notify(curr, total, msg=""):
+        if not progress_callback:
+            return
+        try:
+            progress_callback(curr, total, msg)
+        except TypeError:
+            progress_callback(curr, total)
+
+    stage_msg = "Đang nạp file (lưu ý đóng Excel nếu file lớn)..." if file_size_mb > 20 else "Đang nạp file Excel..."
+    _notify(5, 100, stage_msg)
+
     wb = load_workbook_safe(overview_path)
-    
-    # Sheet selection
+
     if selected_sheet and selected_sheet in wb.sheetnames:
         ws = wb[selected_sheet]
     else:
-        # Look for sheet named "Overview", or first sheet with Overview in name, or active
         ws = None
         for name in wb.sheetnames:
             if name.strip().lower() == "overview":
@@ -317,34 +516,32 @@ def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_
             ws = wb.active
 
     max_r = ws.max_row
-    max_c = ws.max_column
     if max_r < 2:
         wb.close()
         raise ValueError("File Excel không có dòng dữ liệu nào để kiểm tra.")
 
-    # 1. Check whether columns U, V, W, X (cols 21, 22, 23, 24) have data
-    cols_have_data = False
-    for r in range(1, min(max_r + 1, 50)): # sample check
-        for c in range(21, 25):
-            val = ws.cell(row=r, column=c).value
-            if val is not None and str(val).strip() != "":
-                cols_have_data = True
+    target_col_start = 21
+    first_cell_val = ws.cell(row=1, column=21).value
+    is_already_checked = first_cell_val is not None and str(first_cell_val).strip() == "Fabric Check status"
+
+    if not is_already_checked:
+        cols_have_data = False
+        for r in range(1, min(max_r + 1, 50)):
+            for c in range(21, 25):
+                val = ws.cell(row=r, column=c).value
+                if val is not None and str(val).strip() != "":
+                    cols_have_data = True
+                    break
+            if cols_have_data:
                 break
         if cols_have_data:
-            break
+            ws.insert_cols(21, 4)
 
-    target_col_start = 21
-    if cols_have_data:
-        # Insert 4 columns right after Column T (col 20)
-        ws.insert_cols(21, 4)
-        target_col_start = 21
-
-    # Write headers
     headers = [
         "Fabric Check status",
         "Matched SK Name",
         "Matched Supplier Name",
-        "Detail message"
+        "Fabric Check Detail"
     ]
     for idx, h_text in enumerate(headers):
         c_cell = ws.cell(row=1, column=target_col_start + idx)
@@ -354,187 +551,79 @@ def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_
         c_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         c_cell.border = THIN_BORDER
 
-    # Set column widths
-    ws.column_dimensions[get_column_letter(target_col_start)].width = 22
+    ws.column_dimensions[get_column_letter(target_col_start)].width = 24
     ws.column_dimensions[get_column_letter(target_col_start + 1)].width = 24
     ws.column_dimensions[get_column_letter(target_col_start + 2)].width = 24
     ws.column_dimensions[get_column_letter(target_col_start + 3)].width = 45
 
-    # 2. Iterate and match each row
+    total_data_rows = max_r - 1
     stats = {
-        "total_rows": max_r - 1,
+        "total_rows": total_data_rows,
         "ok": 0,
         "partial": 0,
         "error": 0,
         "empty_fabric": 0,
-        "real_error": 0,
-        "missing_fabrics": Counter()
+        "empty_item": 0,
+        "no_rule": 0,
+        "missing_fabrics": Counter(),
+        "status_counts": Counter()
     }
 
-    # Pre-normalize rules for speed
     parsed_rules = []
     for r in rules:
         parsed_rules.append({
             "sk": r.get("sk", ""),
             "supplier": r.get("supplier", ""),
-            "sk_norm": r.get("sk_norm") or normalize_text(r.get("sk", "")),
-            "supp_norm": r.get("supp_norm") or normalize_text(r.get("supplier", ""))
+            "sk_norm": normalize_fabric_text(r.get("sk", "")),
+            "supp_norm": normalize_fabric_text(r.get("supplier", ""))
         })
 
+    _notify(15, 100, "Đang phân loại và đối soát cấu trúc vải...")
+
     for row_idx in range(2, max_r + 1):
-        # Progress report
-        if progress_callback and (row_idx % 20 == 0 or row_idx == max_r):
-            progress_callback(row_idx - 1, max_r - 1)
+        if cancel_event is not None and cancel_event.is_set():
+            wb.close()
+            raise InterruptedError("Người dùng đã huỷ thao tác kiểm tra.")
 
-        raw_fabric = ws.cell(row=row_idx, column=19).value # Col S
-        raw_item_name = ws.cell(row=row_idx, column=20).value # Col T
+        if row_idx % 200 == 0 or row_idx == max_r:
+            curr_pct = 15 + int(65 * ((row_idx - 1) / total_data_rows))
+            _notify(curr_pct, 100, f"Đang kiểm tra dòng {row_idx - 1:,}/{total_data_rows:,}...")
 
-        fabric_disp = clean_display_text(raw_fabric)
-        item_disp = clean_display_text(raw_item_name)
-        
-        fabric_norm = normalize_text(raw_fabric)
-        item_norm = normalize_text(raw_item_name)
+        raw_fabric = ws.cell(row=row_idx, column=19).value
+        raw_item_name = ws.cell(row=row_idx, column=20).value
 
-        # Check for empty fabric
-        if is_empty_fabric(raw_fabric):
-            status = "✗ ERROR"
-            sk_out = ""
-            supp_out = ""
-            msg = "Chưa điền tên vải (- hoặc để trống)"
-            stats["error"] += 1
-            stats["empty_fabric"] += 1
-            
-            # Write to cells
-            c1 = ws.cell(row=row_idx, column=target_col_start, value=status)
-            c1.fill, c1.font = FILL_ERROR, FONT_ERROR
-            c1.alignment = Alignment(horizontal="center", vertical="center")
-            ws.cell(row=row_idx, column=target_col_start + 1, value=sk_out)
-            ws.cell(row=row_idx, column=target_col_start + 2, value=supp_out)
-            ws.cell(row=row_idx, column=target_col_start + 3, value=msg)
-            continue
+        res = classify_fabric_row(raw_fabric, raw_item_name, parsed_rules, threshold=fuzzy_threshold)
+        status_label = res["status"]
+        stats["status_counts"][status_label] += 1
 
-        # Matching logic
-        best_consistent_pair = None
-        best_consistent_score = 0.0
-
-        best_supp_overall = None
-        best_supp_ratio = 0.0
-        best_supp_sub = ""
-
-        best_sk_overall = None
-        best_sk_ratio = 0.0
-        best_sk_sub = ""
-
-        # First pass: check for consistent pair matches
-        for r in parsed_rules:
-            s_norm = r["supp_norm"]
-            sk_n = r["sk_norm"]
-
-            # Substring match ratios
-            s_ratio, s_sub = best_substring_ratio(s_norm, fabric_norm)
-            k_ratio, k_sub = best_substring_ratio(sk_n, item_norm)
-
-            # Track overall best supplier match
-            if s_ratio > best_supp_ratio:
-                best_supp_ratio = s_ratio
-                best_supp_overall = r["supplier"]
-                best_supp_sub = s_sub
-
-            # Track overall best SK match
-            if k_ratio > best_sk_ratio:
-                best_sk_ratio = k_ratio
-                best_sk_overall = r["sk"]
-                best_sk_sub = k_sub
-
-            # Consistent pair condition: both sides meet fuzzy_threshold
-            if s_ratio >= fuzzy_threshold and k_ratio >= fuzzy_threshold:
-                pair_score = (s_ratio + k_ratio) / 2.0
-                if pair_score > best_consistent_score:
-                    best_consistent_score = pair_score
-                    best_consistent_pair = (r, s_ratio, s_sub, k_ratio, k_sub)
-                    if pair_score >= 0.99: # Exact match found, can stop searching
-                        break
-
-        # Determine classification
-        if best_consistent_pair:
-            r_matched, s_r, s_sub, k_r, k_sub = best_consistent_pair
-            status = "✓ OK"
-            sk_out = r_matched["sk"]
-            supp_out = r_matched["supplier"]
-
-            if s_r >= 0.99 and k_r >= 0.99:
-                msg = f"Khớp chính xác (100%): SK '{sk_out}' ↔ Supplier '{supp_out}'"
-            else:
-                s_pct = int(round(s_r * 100))
-                k_pct = int(round(k_r * 100))
-                msg = f"Khớp mờ: SK '{sk_out}' ({k_pct}%) ↔ Supplier '{supp_out}' ({s_pct}%)"
-
+        if status_label in (ST_KHOP_CHUAN, ST_KHAC_BIEU_GHI):
             stats["ok"] += 1
-            cell_fill, cell_font = FILL_OK, FONT_OK
-
+        elif status_label in (ST_LECH_MAU, ST_LECH_MA, ST_LECH_QUY_TAC):
+            stats["error"] += 1
+        elif status_label in (ST_TRUNG_QUY_TAC, ST_KHONG_CO_QUY_TAC):
+            stats["partial"] += 1
+            if status_label == ST_KHONG_CO_QUY_TAC:
+                stats["no_rule"] += 1
+                fab_key = str(raw_fabric).strip() if raw_fabric is not None else ""
+                if fab_key and not is_empty_fabric(fab_key):
+                    stats["missing_fabrics"][fab_key] += 1
         else:
-            # Check Partial conditions
-            has_good_supp = (best_supp_ratio >= fuzzy_threshold)
-            has_good_sk = (best_sk_ratio >= fuzzy_threshold)
-            
-            # Suspicious range (70% - threshold)
-            is_suspicious_supp = (0.70 <= best_supp_ratio < fuzzy_threshold)
-
-            if has_good_supp and has_good_sk:
-                # Both matched good, but NOT consistent (from different pairs)
-                status = "⚠ PARTIAL"
-                sk_out = best_sk_overall or ""
-                supp_out = best_supp_overall or ""
-                msg = f"Không nhất quán: Khớp Supplier '{supp_out}' ({int(best_supp_ratio*100)}%) nhưng SK '{sk_out}' ({int(best_sk_ratio*100)}%) thuộc cặp khác"
-                stats["partial"] += 1
-                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
-
-            elif has_good_supp and not has_good_sk:
-                status = "⚠ PARTIAL"
-                sk_out = ""
-                supp_out = best_supp_overall or ""
-                msg = f"Chỉ khớp Supplier '{supp_out}' ({int(best_supp_ratio*100)}%), không khớp SK nào trong tên sản phẩm"
-                stats["partial"] += 1
-                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
-
-            elif has_good_sk and not has_good_supp:
-                status = "⚠ PARTIAL"
-                sk_out = best_sk_overall or ""
-                supp_out = ""
-                msg = f"Chỉ khớp SK '{sk_out}' ({int(best_sk_ratio*100)}%), không khớp Supplier nào với tên vải '{fabric_disp}'"
-                stats["partial"] += 1
-                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
-
-            elif is_suspicious_supp:
-                status = "⚠ PARTIAL"
-                sk_out = ""
-                supp_out = best_supp_overall or ""
-                msg = f"Nghi vấn lỗi chính tả: Vải '{fabric_disp}' gần giống '{supp_out}' ({int(best_supp_ratio*100)}%) [Cần kiểm tra]"
-                stats["partial"] += 1
-                cell_fill, cell_font = FILL_PARTIAL, FONT_PARTIAL
-
+            if res.get("empty_kind") == "item":
+                stats["empty_item"] += 1
             else:
-                # True ERROR
-                status = "✗ ERROR"
-                sk_out = ""
-                supp_out = ""
-                closest_info = f" (gần nhất: '{best_supp_overall}' {int(best_supp_ratio*100)}%)" if best_supp_overall and best_supp_ratio > 0.4 else ""
-                msg = f"Không tìm thấy trong bảng mapping{closest_info}"
-                stats["error"] += 1
-                stats["real_error"] += 1
-                stats["missing_fabrics"][fabric_disp] += 1
-                cell_fill, cell_font = FILL_ERROR, FONT_ERROR
+                stats["empty_fabric"] += 1
 
-        # Write result to row
-        c1 = ws.cell(row=row_idx, column=target_col_start, value=status)
-        c1.fill, c1.font = cell_fill, cell_font
+        c_fill, c_font = STYLE_MAP.get(status_label, (FILL_ERROR, FONT_ERROR))
+        c1 = ws.cell(row=row_idx, column=target_col_start, value=status_label)
+        c1.fill, c1.font = c_fill, c_font
         c1.alignment = Alignment(horizontal="center", vertical="center")
 
-        ws.cell(row=row_idx, column=target_col_start + 1, value=sk_out)
-        ws.cell(row=row_idx, column=target_col_start + 2, value=supp_out)
-        ws.cell(row=row_idx, column=target_col_start + 3, value=msg)
+        ws.cell(row=row_idx, column=target_col_start + 1, value=res["sk"])
+        ws.cell(row=row_idx, column=target_col_start + 2, value=res["supp"])
+        ws.cell(row=row_idx, column=target_col_start + 3, value=res["msg"])
 
-    # Save output file
+    _notify(85, 100, "Đang lưu file kết quả Excel...")
+
     dir_name = os.path.dirname(overview_path)
     base_name, ext = os.path.splitext(os.path.basename(overview_path))
     if base_name.endswith("_checked"):
@@ -542,11 +631,16 @@ def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_
     else:
         out_path = os.path.join(dir_name, f"{base_name}_checked{ext}")
 
-    wb.save(out_path)
+    try:
+        wb.save(out_path)
+    except PermissionError:
+        wb.close()
+        raise ValueError(f"Không ghi được file '{os.path.basename(out_path)}'. File đang mở trong Excel, vui lòng đóng rồi thử lại.")
     wb.close()
 
+    _notify(100, 100, "Hoàn tất kiểm tra!")
+
     stats["output_file"] = os.path.abspath(out_path)
-    # Calculate percentages
     tot = stats["total_rows"]
     if tot > 0:
         stats["ok_pct"] = (stats["ok"] / tot) * 100
@@ -556,6 +650,7 @@ def check_overview_file(overview_path, rule_manager, selected_sheet=None, fuzzy_
         stats["ok_pct"] = stats["partial_pct"] = stats["error_pct"] = 0.0
 
     return stats
+
 
 # ==============================================================================
 # EMBEDDED MODULE 2: ORDER AUDITOR (order_auditor)
@@ -2130,17 +2225,33 @@ def save_fsc_factories(mapping):
     except Exception as e:
         print(f"Error saving fsc factories: {e}")
 
+def _safe_pip_install(*packages):
+    """
+    Cài đặt ngầm gói Python an toàn trên Windows:
+    - Tự chuyển sang python.exe nếu app đang chạy ngầm bằng pythonw.exe
+    - Thêm cờ --user chống lỗi PermissionError máy công ty
+    - Thêm CREATE_NO_WINDOW chống treo/hiện cửa sổ CMD
+    """
+    import subprocess, sys, os
+    py_exe = sys.executable
+    if py_exe.lower().endswith("pythonw.exe"):
+        candidate = os.path.join(os.path.dirname(py_exe), "python.exe")
+        if os.path.exists(candidate):
+            py_exe = candidate
+    cflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    cmd = [py_exe, "-m", "pip", "install", "--user"] + list(packages) + ["--disable-pip-version-check", "--quiet"]
+    return subprocess.check_call(cmd, creationflags=cflags)
+
 def ensure_fitz():
     try:
         import fitz
         return fitz
     except ImportError:
-        import subprocess, sys
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "PyMuPDF", "--disable-pip-version-check", "--quiet"])
+            _safe_pip_install("PyMuPDF>=1.23.0")
             import fitz
             return fitz
-        except Exception as e:
+        except Exception:
             raise RuntimeError("Máy tính chưa cài đặt thư viện 'PyMuPDF' để xử lý file PDF.\n"
                                "Vui lòng chạy lệnh: pip install PyMuPDF (hoặc kết nối Internet để tự động tải).")
 
@@ -2160,11 +2271,7 @@ def get_ocr_engine():
         return _GLOBAL_OCR_ENGINE
     except ImportError:
         try:
-            import subprocess, sys
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install",
-                "rapidocr_onnxruntime", "--disable-pip-version-check", "--quiet"
-            ])
+            _safe_pip_install("rapidocr-onnxruntime>=1.2.3,<2.0")
             from rapidocr_onnxruntime import RapidOCR
             _GLOBAL_OCR_ENGINE = RapidOCR()
             return _GLOBAL_OCR_ENGINE
@@ -2895,7 +3002,7 @@ class CartonAuditEngine:
 # ==============================================================================
 # MAIN BORING TASK APPLICATION CORE
 # ==============================================================================
-APP_VERSION = "v1.2"
+APP_VERSION = "v1.3"
 GITHUB_REPO = "rangercases/boring-task"
 CACHE_FILE_NAME = ".overview_cache.pkl"
 STATE_FILE_NAME = ".app_state.json"
@@ -3094,6 +3201,89 @@ def com_rows(value):
         return value
     return ((value,),)
 
+class InlineBanner(ctk.CTkFrame):
+    """
+    Apple HIG Inline Toast / Banner component:
+    - Nền mềm mại, bo góc 10px, tự động biến mất sau duration ms.
+    - Quản lý timer qua after_cancel chống xếp chồng thông báo.
+    - 3 trạng thái:
+        - "ok": Nền MOSS_SOFT, viền MOSS, icon "✓", chữ MOSS
+        - "warn": Nền SAND, viền CARAMEL, icon "⚠", chữ CARAMEL
+        - "error": Nền "#f5e3dd", viền DANGER, icon "✗", chữ DANGER
+    - Tích hợp nút đóng nhanh [✕] thanh thoát.
+    """
+    def __init__(self, master, **kwargs):
+        super().__init__(master, corner_radius=10, border_width=1, **kwargs)
+        self._after_id = None
+        self._visible = False
+        
+        self.icon_label = ctk.CTkLabel(
+            self, text="", font=ctk.CTkFont(family=FONT_SANS, size=13, weight="bold"),
+            width=20
+        )
+        self.icon_label.pack(side="left", padx=(12, 6), pady=6)
+
+        self.msg_label = ctk.CTkLabel(
+            self, text="", font=ctk.CTkFont(family=FONT_SANS, size=12),
+            anchor="w", justify="left"
+        )
+        self.msg_label.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
+
+        self.btn_close = ctk.CTkButton(
+            self, text="✕", width=22, height=22, corner_radius=11,
+            fg_color="transparent", hover_color="#e0d8cc", text_color=ROAST,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.hide
+        )
+        self.btn_close.pack(side="right", padx=(4, 10), pady=6)
+
+    def show(self, message: str, kind: str = "ok", duration: int = 4000):
+        if self._after_id:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+        kind = kind.lower().strip()
+        if kind == "ok":
+            bg = MOSS_SOFT
+            border = MOSS
+            fg = MOSS
+            icon = "✓ "
+        elif kind == "warn":
+            bg = SAND
+            border = CARAMEL
+            fg = CARAMEL
+            icon = "⚠ "
+        else: # error
+            bg = "#f5e3dd"
+            border = DANGER
+            fg = DANGER
+            icon = "✗ "
+
+        self.configure(fg_color=bg, border_color=border)
+        self.icon_label.configure(text=icon, text_color=fg)
+        self.msg_label.configure(text=str(message), text_color=fg)
+        
+        if not self._visible:
+            self.pack(fill="x", padx=36, pady=(0, 10))
+            self._visible = True
+
+        if duration and duration > 0:
+            self._after_id = self.after(duration, self.hide)
+
+    def hide(self):
+        if self._after_id:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        if self._visible:
+            self.pack_forget()
+            self._visible = False
+
 class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
@@ -3134,6 +3324,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.fabric_rule_mgr = FabricRuleManager(curr_dir) if FabricRuleManager else None
         self.fabric_overview_file = ""
         self.fabric_running = False
+        self.fabric_cancel_evt = None
 
         # Order Auditor state
         self.auditor_engine = OrderAuditEngine()
@@ -3831,7 +4022,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def build_feature_nav(self, view, title):
         nav = ctk.CTkFrame(view, fg_color="transparent", height=34)
-        nav.pack(fill="x", padx=36, pady=(2, 12))
+        nav.pack(fill="x", padx=36, pady=(2, 8))
         nav.pack_propagate(False)
 
         ctk.CTkButton(
@@ -3854,6 +4045,31 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             font=ctk.CTkFont(family=FONT_SERIF, size=14, weight="bold"),
             text_color=ROAST
         ).place(relx=0.5, rely=0.5, anchor="center")
+
+        # Slot chứa Banner cố định ngay dưới nav (giữ vị trí trên cùng, không bị nội dung đẩy xuống đáy)
+        banner_slot = ctk.CTkFrame(view, fg_color="transparent")
+        banner_slot.pack(fill="x")
+        banner = InlineBanner(banner_slot)
+        if not hasattr(self, 'view_banners'):
+            self.view_banners = {}
+        self.view_banners[view] = banner
+
+    def notify(self, message: str, kind: str = "ok", duration: int = 4000):
+        """
+        Hiển thị Banner thông báo nội tuyến chuẩn Apple UI trên view hiện tại:
+        - kind: 'ok' (xanh rêu), 'warn' (kem cát), 'error' (đỏ dịu)
+        - Tự ẩn sau duration ms (mặc định 4s), không chặn cửa sổ thao tác.
+        """
+        banner = getattr(self, 'view_banners', {}).get(getattr(self, 'current_view', None))
+        if banner:
+            banner.show(message, kind=kind, duration=duration)
+        else:
+            if kind == "error":
+                messagebox.showerror("Thông báo", message)
+            elif kind == "warn":
+                messagebox.showwarning("Thông báo", message)
+            else:
+                messagebox.showinfo("Thông báo", message)
 
     def show_home(self):
         self.claim_view.pack_forget()
@@ -4269,7 +4485,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def force_reload_master(self):
         if not self.overview_path or not os.path.exists(self.overview_path):
-            messagebox.showwarning("Cảnh báo", "Vui lòng chọn file Master Overview trước!")
+            self.notify("Vui lòng chọn file Master Overview trước!", kind="warn")
             return
         
         c_path = get_cache_path()
@@ -4279,7 +4495,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             except Exception:
                 pass
         self.render_overview_display()
-        messagebox.showinfo("Thông báo", "Đã xóa bộ nhớ ghi nhớ! Lần chạy tới sẽ đọc lại file Master từ đầu.")
+        self.notify("Đã xóa bộ nhớ ghi nhớ! Lần chạy tới sẽ đọc lại file Master từ đầu.", kind="ok")
 
     # ----------------------------------------------------
     # Thread-Safe Results Feed Updates
@@ -4363,10 +4579,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
     # ----------------------------------------------------
     def start_processing(self):
         if not self.overview_path or not os.path.isfile(self.overview_path):
-            messagebox.showerror("Thiếu thông tin", "Vui lòng chọn hoặc kéo thả file Master Overview (.xlsx)!")
+            self.notify("Vui lòng chọn hoặc kéo thả file Master Overview (.xlsx)!", kind="error")
             return
         if not self.claim_files:
-            messagebox.showerror("Thiếu thông tin", "Danh sách file Claim đang trống. Vui lòng chọn hoặc kéo thả ít nhất 1 file Claim Versus!")
+            self.notify("Danh sách file Claim đang trống. Vui lòng chọn hoặc kéo thả ít nhất 1 file Claim Versus!", kind="error")
             return
 
         self.btn_run.configure(state="disabled", fg_color=FAINT, text="Đang xử lý dữ liệu...")
@@ -4975,7 +5191,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
             return
         name = os.path.basename(path)
         if not os.path.isfile(path) or name.startswith("~$") or os.path.splitext(path)[1].lower() not in IMG_EXTENSIONS:
-            messagebox.showwarning("Định dạng không hợp lệ", "Vui lòng chọn file Excel (.xlsx, .xlsm hoặc .xls).")
+            self.notify("Vui lòng chọn file Excel (.xlsx, .xlsm hoặc .xls).", kind="warn")
             return
         self.img_file = os.path.abspath(path)
         self.img_render_file()
@@ -5011,7 +5227,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if self.img_running:
             return
         if not self.img_file or not os.path.exists(self.img_file):
-            messagebox.showwarning("Thông báo", "Vui lòng chọn file Excel trước khi bắt đầu.")
+            self.notify("Vui lòng chọn file Excel trước khi bắt đầu.", kind="warn")
             return
 
         self.img_running = True
@@ -5420,6 +5636,20 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         )
         self.fabric_btn_run.pack(fill="x")
 
+        self.fabric_btn_cancel = ctk.CTkButton(
+            act,
+            text="Huỷ Kiểm Tra",
+            font=ctk.CTkFont(family=FONT_SANS, size=12, weight="bold"),
+            fg_color=CARD,
+            hover_color=SAND,
+            text_color=DANGER,
+            border_width=1,
+            border_color=LINE,
+            corner_radius=20,
+            height=34,
+            command=self.fabric_cancel_check
+        )
+
         self.fabric_prog = ctk.CTkProgressBar(scroll, progress_color=MOSS, fg_color=LINE, height=3, corner_radius=2)
         self.fabric_prog.set(0)
         self.fabric_prog.pack(fill="x", pady=(0, 20))
@@ -5541,14 +5771,14 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def fabric_load_rule_file(self, path):
         if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in (".xlsx", ".xlsm"):
-            messagebox.showwarning("Định dạng không hợp lệ", "Vui lòng chọn file Excel quy tắc (.xlsx hoặc .xlsm).")
+            self.notify("Vui lòng chọn file Excel quy tắc (.xlsx hoặc .xlsm).", kind="warn")
             return
         try:
             delta = self.fabric_rule_mgr.import_rule_file(path)
             self.fabric_render_rule_status(delta_info=delta)
             self.fabric_set_status("Đã cập nhật quy tắc", MOSS, MOSS_SOFT)
         except Exception as e:
-            messagebox.showerror("Lỗi đọc file quy tắc", f"Không thể đọc file quy tắc:\n{e}")
+            self.notify(f"Không thể đọc file quy tắc: {e}", kind="error")
 
     def fabric_clear_rule_file(self):
         if self.fabric_running:
@@ -5636,7 +5866,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if self.fabric_running:
             return
         if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in (".xlsx", ".xlsm"):
-            messagebox.showwarning("Định dạng không hợp lệ", "Vui lòng chọn file Excel (.xlsx hoặc .xlsm).")
+            self.notify("Vui lòng chọn file Excel (.xlsx hoặc .xlsm).", kind="warn")
             return
         self.fabric_overview_file = os.path.abspath(path)
         self.fabric_render_overview_file()
@@ -5680,14 +5910,17 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if self.fabric_running:
             return
         if not self.fabric_overview_file or not os.path.exists(self.fabric_overview_file):
-            messagebox.showwarning("Thiếu file Overview", "Vui lòng chọn hoặc kéo thả file Overview.xlsx trước.")
+            self.notify("Vui lòng chọn hoặc kéo thả file Overview.xlsx trước khi kiểm tra!", kind="warn")
             return
         if not self.fabric_rule_mgr.rules:
-            messagebox.showwarning("Thiếu quy tắc vải", "Chưa có quy tắc vải nào được nạp. Vui lòng nạp file Fabric_name.xlsx trước.")
+            self.notify("Chưa có quy tắc vải nào được nạp. Vui lòng nạp file Fabric name v2.xlsx trước!", kind="warn")
             return
 
         self.fabric_running = True
+        self.fabric_cancel_evt = threading.Event()
         self.fabric_btn_run.configure(state="disabled", text="Đang So Khớp Dữ Liệu Vải...")
+        self.fabric_btn_cancel.configure(state="normal", text="Huỷ Kiểm Tra")
+        self.fabric_btn_cancel.pack(fill="x", pady=(6, 0))
         self.btn_pick_fabric_ov.configure(state="disabled")
         self.btn_clear_fabric_ov.configure(state="disabled")
         self.btn_pick_rule.configure(state="disabled")
@@ -5707,20 +5940,30 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         threading.Thread(target=self.fabric_worker, daemon=True).start()
 
+    def fabric_cancel_check(self):
+        if self.fabric_running and self.fabric_cancel_evt is not None:
+            self.fabric_cancel_evt.set()
+            self.fabric_btn_cancel.configure(state="disabled", text="Đang huỷ...")
+
     def fabric_worker(self):
         try:
-            def on_progress(current, total):
+            def on_progress(current, total, msg=""):
                 if total > 0:
                     pct = 0.05 + 0.90 * (current / total)
-                    self.after(0, self.fabric_prog.set, pct)
+                    self.after(0, self.fabric_prog.set, min(pct, 0.95))
+                if msg:
+                    self.after(0, self.fabric_set_status, msg, MOSS)
 
             stats = check_overview_file(
                 overview_path=self.fabric_overview_file,
                 rule_manager=self.fabric_rule_mgr,
                 fuzzy_threshold=0.85,
-                progress_callback=on_progress
+                progress_callback=on_progress,
+                cancel_event=self.fabric_cancel_evt
             )
             self.after(0, self.fabric_finish, stats, "")
+        except InterruptedError:
+            self.after(0, self.fabric_finish, {}, "__CANCELLED__")
         except PermissionError:
             self.after(0, self.fabric_finish, {}, "File Overview đang mở trong Excel hoặc ứng dụng khác. Vui lòng đóng file rồi thử lại.")
         except Exception as e:
@@ -5728,6 +5971,8 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
     def fabric_finish(self, stats, err_msg=""):
         self.fabric_running = False
+        self.fabric_cancel_evt = None
+        self.fabric_btn_cancel.pack_forget()
         self.fabric_btn_run.configure(state="normal", text="Bắt Đầu Kiểm Tra Khớp Vải (Tạo File _checked)")
         self.btn_pick_fabric_ov.configure(state="normal")
         self.btn_clear_fabric_ov.configure(state="normal")
@@ -5736,6 +5981,17 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         for child in self.fabric_feed.winfo_children():
             child.destroy()
+
+        if err_msg == "__CANCELLED__":
+            self.fabric_prog.set(0)
+            self.fabric_set_status("Đã huỷ kiểm tra", BROWN)
+            ctk.CTkLabel(
+                self.fabric_feed,
+                text="Đã huỷ kiểm tra. File Overview gốc không bị thay đổi.",
+                font=ctk.CTkFont(family=FONT_SANS, size=12),
+                text_color=BROWN, pady=24
+            ).pack(fill="both", expand=True)
+            return
 
         if err_msg:
             self.fabric_prog.set(0)
@@ -5772,21 +6028,21 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         ctk.CTkLabel(
             pills_box,
-            text=f"  ✓ OK: {stats['ok']} ({stats['ok_pct']:.1f}%)  ",
+            text=f"  ✓ KHỚP: {stats['ok']} ({stats['ok_pct']:.1f}%)  ",
             font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
             fg_color="#c6efce", text_color="#006100", corner_radius=10
         ).pack(side="left", padx=3)
 
         ctk.CTkLabel(
             pills_box,
-            text=f"  ⚠ PARTIAL: {stats['partial']} ({stats['partial_pct']:.1f}%)  ",
+            text=f"  ⚠ CẦN XEM: {stats['partial']} ({stats['partial_pct']:.1f}%)  ",
             font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
             fg_color="#ffeb9c", text_color="#9c6500", corner_radius=10
         ).pack(side="left", padx=3)
 
         ctk.CTkLabel(
             pills_box,
-            text=f"  ✗ ERROR: {stats['error']} ({stats['error_pct']:.1f}%)  ",
+            text=f"  ✗ LỖI: {stats['error']} ({stats['error_pct']:.1f}%)  ",
             font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
             fg_color="#ffc7ce", text_color="#9c0006", corner_radius=10
         ).pack(side="left", padx=3)
@@ -5803,9 +6059,13 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
         ctk.CTkLabel(
             b_info,
-            text=f"• Chưa điền tên vải (- / trống): {stats['empty_fabric']} dòng\n• ERROR thật sự (có vải nhưng không khớp): {stats['real_error']} dòng",
+            text=(
+                f"• Cần xem (ô vàng): {stats['partial']} dòng — trùng quy tắc: {stats['status_counts'].get(ST_TRUNG_QUY_TAC, 0)}, chưa có quy tắc: {stats['no_rule']}\n"
+                f"• Lỗi thật sự (ô đỏ): {stats['error']} dòng — lệch màu / lệch mã / lệch quy tắc\n"
+                f"• Thiếu dữ liệu (ô xám): {stats['empty_fabric'] + stats['empty_item']} dòng — chưa điền tên vải: {stats['empty_fabric']}, chưa điền tên sản phẩm: {stats['empty_item']}"
+            ),
             font=ctk.CTkFont(family=FONT_SANS, size=11),
-            text_color=BROWN, justify="left", anchor="w"
+            text_color=BROWN, justify="left", anchor="w", wraplength=560
         ).pack(anchor="w")
 
         out_f = stats.get("output_file", "")
@@ -5841,9 +6101,9 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
 
             ctk.CTkLabel(
                 miss_head,
-                text="DANH SÁCH TÊN VẢI LỖI THẬT SỰ (CẦN BỔ SUNG VÀO QUY TẮC)",
+                text="DANH SÁCH TÊN VẢI CHƯA CÓ TRONG MAPPING (CẦN BỔ SUNG QUY TẮC)",
                 font=ctk.CTkFont(family=FONT_SANS, size=10, weight="bold"),
-                text_color=DANGER
+                text_color=CARAMEL
             ).pack(side="left")
 
             ctk.CTkLabel(
@@ -6225,9 +6485,9 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if path:
             try:
                 count = self.auditor_engine.model_kb.import_models_from_excel(path)
-                messagebox.showinfo("Thành công", f"Đã nạp thêm {count} models vào cơ sở dữ liệu kiểm toán!")
+                self.notify(f"Đã nạp thêm {count} models vào cơ sở dữ liệu kiểm toán!", kind="ok")
             except Exception as e:
-                messagebox.showerror("Lỗi", f"Không thể đọc file Model List: {e}")
+                self.notify(f"Không thể đọc file Model List: {e}", kind="error")
 
     def auditor_on_drop_po(self, event):
         paths = [p for p in parse_drop_paths(event.data) if os.path.isfile(p)]
@@ -6245,10 +6505,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if self.auditor_running:
             return
         if not hasattr(self, 'auditor_po_files') or not self.auditor_po_files or not all(os.path.exists(p) for p in self.auditor_po_files):
-            messagebox.showwarning("Thiếu file", "Vui lòng chọn File Purchase Order (PO) cần kiểm toán.")
+            self.notify("Vui lòng chọn File Purchase Order (PO) cần kiểm toán.", kind="warn")
             return
         if not self.auditor_cust_file or not os.path.exists(self.auditor_cust_file):
-            messagebox.showwarning("Thiếu file", "Vui lòng chọn File Đơn hàng gốc của khách.")
+            self.notify("Vui lòng chọn File Đơn hàng gốc của khách.", kind="warn")
             return
 
         self.auditor_running = True
@@ -6582,7 +6842,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 self.assortment_file = os.path.abspath(path)
                 self.assortment_render_file_status()
             except Exception as e:
-                messagebox.showerror("File không hợp lệ", str(e))
+                self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def assortment_clear_file(self):
         self.assortment_file = ""
@@ -6598,13 +6858,13 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     self.assortment_render_file_status()
                     break
                 except Exception as e:
-                    messagebox.showerror("File không hợp lệ", str(e))
+                    self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def assortment_start_processing(self):
         if self.assortment_running:
             return
         if not self.assortment_file or not os.path.exists(self.assortment_file):
-            messagebox.showwarning("Thiếu dữ liệu", "Vui lòng chọn file Excel Assortment trước khi phân tích.")
+            self.notify("Vui lòng chọn file Excel Assortment trước khi phân tích.", kind="warn")
             return
 
         self.assortment_running = True
@@ -7031,7 +7291,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 self.save_state()
                 self.weekly_po_render_master_status()
             except Exception as e:
-                messagebox.showerror("File không hợp lệ", str(e))
+                self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def weekly_po_browse_nhung(self):
         path = filedialog.askopenfilename(
@@ -7044,7 +7304,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 self.weekly_po_nhung_file = os.path.abspath(path)
                 self.weekly_po_render_nhung_status()
             except Exception as e:
-                messagebox.showerror("File không hợp lệ", str(e))
+                self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def weekly_po_clear_nhung(self):
         self.weekly_po_nhung_file = ""
@@ -7061,7 +7321,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                 self.weekly_po_factory_file = os.path.abspath(path)
                 self.weekly_po_render_factory_status()
             except Exception as e:
-                messagebox.showerror("File không hợp lệ", str(e))
+                self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def weekly_po_clear_factory(self):
         self.weekly_po_factory_file = ""
@@ -7079,7 +7339,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     self.weekly_po_render_master_status()
                     break
                 except Exception as e:
-                    messagebox.showerror("File không hợp lệ", str(e))
+                    self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def weekly_po_on_drop_nhung(self, event):
         paths = parse_drop_paths(event.data)
@@ -7091,7 +7351,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     self.weekly_po_render_nhung_status()
                     break
                 except Exception as e:
-                    messagebox.showerror("File không hợp lệ", str(e))
+                    self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def weekly_po_on_drop_factory(self, event):
         paths = parse_drop_paths(event.data)
@@ -7103,7 +7363,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
                     self.weekly_po_render_factory_status()
                     break
                 except Exception as e:
-                    messagebox.showerror("File không hợp lệ", str(e))
+                    self.notify(f"File không hợp lệ: {e}", kind="error")
 
     def weekly_po_on_drop_generic(self, event):
         paths = parse_drop_paths(event.data)
@@ -7126,10 +7386,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if self.weekly_po_running:
             return
         if not self.weekly_po_master_file or not os.path.exists(self.weekly_po_master_file):
-            messagebox.showwarning("Thiếu Master", "Vui lòng chọn hoặc kéo thả file Master Overview trước khi đối soát.")
+            self.notify("Vui lòng chọn hoặc kéo thả file Master Overview trước khi đối soát.", kind="warn")
             return
         if not self.weekly_po_nhung_file or not os.path.exists(self.weekly_po_nhung_file):
-            messagebox.showwarning("Thiếu đơn hàng", "Vui lòng chọn file đơn hàng gửi đi (file của Nhung) trước khi đối soát.")
+            self.notify("Vui lòng chọn file đơn hàng gửi đi (file của Nhung) trước khi đối soát.", kind="warn")
             return
 
         self.weekly_po_running = True
@@ -7623,20 +7883,20 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         name = self.entry_carton_fac_name.get().strip()
         code = self.entry_carton_fsc_code.get().strip()
         if not name or not code:
-            messagebox.showwarning("Thiếu thông tin", "Vui lòng nhập tên nhà máy và mã FSC!")
+            self.notify("Vui lòng nhập tên nhà máy và mã FSC!", kind="warn")
             return
         self.carton_factories[name] = code
         save_fsc_factories(self.carton_factories)
         names = list(self.carton_factories.keys())
         self.combo_carton_fac.configure(values=names)
         self.combo_carton_fac.set(name)
-        messagebox.showinfo("Đã lưu", f"Đã lưu nhà máy '{name}' với mã FSC '{code}'!")
+        self.notify(f"Đã lưu nhà máy '{name}' với mã FSC '{code}'!", kind="ok")
 
     def _del_carton_factory(self):
         curr = self.combo_carton_fac.get()
         if curr in self.carton_factories:
             if len(self.carton_factories) <= 1:
-                messagebox.showwarning("Không thể xóa", "Cần giữ lại ít nhất 1 nhà máy trong danh sách!")
+                self.notify("Cần giữ lại ít nhất 1 nhà máy trong danh sách!", kind="warn")
                 return
             del self.carton_factories[curr]
             save_fsc_factories(self.carton_factories)
@@ -7850,10 +8110,10 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         if self.carton_running:
             return
         if not self.carton_po_files:
-            messagebox.showwarning("Chưa chọn PO", "Vui lòng nạp ít nhất 1 file Excel đơn hàng PO!")
+            self.notify("Vui lòng nạp ít nhất 1 file Excel đơn hàng PO!", kind="warn")
             return
         if not self.carton_pdf_files:
-            messagebox.showwarning("Chưa chọn PDF", "Vui lòng nạp ít nhất 1 file PDF bản vẽ carton!")
+            self.notify("Vui lòng nạp ít nhất 1 file PDF bản vẽ carton!", kind="warn")
             return
 
         expected_fsc = self.entry_carton_fsc_code.get().strip() or "C181124"
@@ -8082,7 +8342,7 @@ class BoringTaskApp(ctk.CTk, tkdnd.TkinterDnD.DnDWrapper):
         self.carton_running = False
         self.btn_run_carton.configure(state="normal", text="Bắt Đầu Kiểm Tra Carton (Xuất PDF Báo Cáo)")
         self.prog_bar_carton.set(0)
-        messagebox.showerror("Lỗi đối soát Carton", f"Đã có lỗi xảy ra:\n{err}")
+        self.notify(f"Lỗi đối soát Carton: {err}", kind="error")
 
 if __name__ == "__main__":
     app = BoringTaskApp()
